@@ -1,0 +1,3 @@
+persistent-custom exit=101
+cublas-gemm exit=101
+cuvs-bruteforce exit=2

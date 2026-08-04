@@ -1,0 +1,30 @@
+PiPNN D1 child start: idx=0 total=1500 run_len=10776 replayed_len=10776 unique_len=10776 extents=3 seed=4627646829992996787 extent_chain=[109285464:4096,243683472:4096,307497528:2584] backend=Cuda assignment_backend=persistent-wmma-tf32 leaf_topk_backend=persistent-wmma-tf32
+PiPNN D1 child done: idx=0 run_len=10776 compact_batches=128 compact_rows=32328 leaves=128 assignment_passes=1 max_active_points=0
+PiPNN D1 child start: idx=1 total=1500 run_len=10934 replayed_len=10934 unique_len=10934 extents=3 seed=18401975443881789962 extent_chain=[85107264:4096,200310240:4096,307507872:2742] backend=Cuda assignment_backend=persistent-wmma-tf32 leaf_topk_backend=persistent-wmma-tf32
+PiPNN D1 child done: idx=1 run_len=10934 compact_batches=128 compact_rows=32802 leaves=128 assignment_passes=1 max_active_points=0
+PiPNN D1 child start: idx=2 total=1500 run_len=11250 replayed_len=11250 unique_len=11250 extents=3 seed=4505915869908182209 extent_chain=[93237696:4096,217243176:4096,307518848:3058] backend=Cuda assignment_backend=persistent-wmma-tf32 leaf_topk_backend=persistent-wmma-tf32
+Error: Index { err: "gpu-subtree D1+ child 2/1500 failed: run_len=11250 replayed_len=11250 unique_len=11250 extents=3 backend=Cuda assignment_backend=persistent-wmma-tf32 leaf_topk_backend=persistent-wmma-tf32: IndexError: CUDA stream synchronize after persistent subtree failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")" }
+Command exited with non-zero status 1
+	Command being timed: "target/release/build_pipnn_index --data-type float --dist-fn l2 --data-path /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin --index-path-prefix /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260617_114254_diag_per_warp_leaf_wmma_current_default/index --overwrite --oom-enable --oom-memory-budget-gb 200 --oom-temp-dir /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260617_114254_diag_per_warp_leaf_wmma_current_default/oom --oom-profile-json /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260617_114254_diag_per_warp_leaf_wmma_current_default/profile.json --max-degree 64 --lbuild 100 --num-threads 8 --leaf-size-min 256 --leaf-size-max 1280 --leaf-knn 2 --max-leaders 1500 --psamp-fraction 0.05 --fanout-top 8 --fanout-second 3 --root-risk-candidate-rs 1,2,4,8 --seed 42 --partitioner gpu-subtree --gpu-subtree-root-assignment-backend cpu --gpu-subtree-assignment-backend persistent-wmma-tf32 --gpu-subtree-leaf-topk-backend persistent-wmma-tf32 --pipnn-backend cuda --pipnn-gpu-device 0 --pipnn-gpu-workspace-budget-gb 16"
+	User time (seconds): 457.90
+	System time (seconds): 76.47
+	Percent of CPU this job got: 545%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:38.00
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9448408
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 22260785
+	Voluntary context switches: 15299
+	Involuntary context switches: 4021
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 1894920
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1

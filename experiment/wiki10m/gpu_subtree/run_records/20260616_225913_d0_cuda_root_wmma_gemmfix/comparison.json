@@ -1,0 +1,149 @@
+{
+  "baseline": {
+    "gpu": {
+      "assignment_backend": "persistent-wmma-tf32",
+      "async_flush_ms": 46114,
+      "d0_child_max_len": 1378181,
+      "d0_child_p50_len": 543772,
+      "d0_child_p95_len": 1221235,
+      "d0_child_p99_len": 1378181,
+      "d0_child_points": 40000000,
+      "d0_child_run_count": 64,
+      "d0_wall_ms": 20884,
+      "d1plus_backend_ms": 197699,
+      "d1plus_producer_ms": 203273,
+      "leaf_topk_backend": "persistent-wmma-tf32",
+      "persistent_large_node_max_rows": 1378181,
+      "persistent_large_node_splits": 32471,
+      "persistent_leaf_pushes": 1284523,
+      "persistent_leaf_size_max": 640,
+      "persistent_partition_claims": 32471,
+      "persistent_partition_pops": 32471,
+      "persistent_queue_overflow_flags": 0,
+      "persistent_success_count": 64,
+      "persistent_topk_claims": 1284523,
+      "persistent_topk_pops": 1284523,
+      "persistent_total_ms": 55831,
+      "root_assignment_backend": "cpu",
+      "subtree_assignment_backend": "persistent-wmma-tf32",
+      "topk_kernel_ms": 55830,
+      "total_ms": 185348,
+      "workspace_budget_bytes": 17179869184,
+      "workspace_peak_bytes": 257119784
+    },
+    "max_rss_kb": 15120892,
+    "mem_index_bytes": 901620340,
+    "memory_budget_bytes": 214748364800,
+    "partitioner_kind": "gpu-subtree",
+    "run_id": "20260616_185933_staged_async_wmma",
+    "search": {
+      "qps": 2548.5,
+      "queries": 10000,
+      "recall_at_10": 0.8406,
+      "search_sec": 3.92
+    },
+    "wall_raw": "4:31.25",
+    "wall_sec": 271.25
+  },
+  "current": {
+    "gpu": {
+      "assignment_backend": "persistent-wmma-tf32",
+      "async_flush_ms": 45851,
+      "d0_child_max_len": 1378182,
+      "d0_child_p50_len": 543772,
+      "d0_child_p95_len": 1221231,
+      "d0_child_p99_len": 1378182,
+      "d0_child_points": 40000000,
+      "d0_child_run_count": 64,
+      "d0_wall_ms": 33612,
+      "d1plus_backend_ms": 197931,
+      "d1plus_producer_ms": 203529,
+      "leaf_topk_backend": "persistent-wmma-tf32",
+      "persistent_large_node_max_rows": 1378182,
+      "persistent_large_node_splits": 32437,
+      "persistent_leaf_pushes": 1284201,
+      "persistent_leaf_size_max": 640,
+      "persistent_partition_claims": 32437,
+      "persistent_partition_pops": 32437,
+      "persistent_queue_overflow_flags": 0,
+      "persistent_success_count": 64,
+      "persistent_topk_claims": 1284201,
+      "persistent_topk_pops": 1284201,
+      "persistent_total_ms": 55714,
+      "root_assignment_backend": "cuda",
+      "subtree_assignment_backend": "persistent-wmma-tf32",
+      "topk_kernel_ms": 55713,
+      "total_ms": 185239,
+      "workspace_budget_bytes": 17179869184,
+      "workspace_peak_bytes": 257119960
+    },
+    "max_rss_kb": 15310984,
+    "mem_index_bytes": 901823264,
+    "memory_budget_bytes": 214748364800,
+    "partitioner_kind": "gpu-subtree",
+    "run_id": "20260616_225913_d0_cuda_root_wmma_gemmfix",
+    "search": {
+      "qps": 2620.7,
+      "queries": 10000,
+      "recall_at_10": 0.8367,
+      "search_sec": 3.82
+    },
+    "wall_raw": "4:44.30",
+    "wall_sec": 284.3
+  },
+  "deltas": {
+    "async_flush_ms": {
+      "baseline": 46114,
+      "current": 45851,
+      "delta": -263,
+      "pct": -0.5703257145335473
+    },
+    "d0_wall_ms": {
+      "baseline": 20884,
+      "current": 33612,
+      "delta": 12728,
+      "pct": 60.94617889293239
+    },
+    "d1plus_backend_ms": {
+      "baseline": 197699,
+      "current": 197931,
+      "delta": 232,
+      "pct": 0.11735011305064771
+    },
+    "d1plus_producer_ms": {
+      "baseline": 203273,
+      "current": 203529,
+      "delta": 256,
+      "pct": 0.1259390081319211
+    },
+    "persistent_total_ms": {
+      "baseline": 55831,
+      "current": 55714,
+      "delta": -117,
+      "pct": -0.2095609965789615
+    },
+    "qps": {
+      "baseline": 2548.5,
+      "current": 2620.7,
+      "delta": 72.19999999999982,
+      "pct": 2.833039042574056
+    },
+    "recall_at_10": {
+      "baseline": 0.8406,
+      "current": 0.8367,
+      "delta": -0.0039000000000000146
+    },
+    "topk_kernel_ms": {
+      "baseline": 55830,
+      "current": 55713,
+      "delta": -117,
+      "pct": -0.2095647501343364
+    },
+    "wall_sec": {
+      "baseline": 271.25,
+      "current": 284.3,
+      "delta": 13.050000000000011,
+      "pct": 4.811059907834105
+    }
+  }
+}

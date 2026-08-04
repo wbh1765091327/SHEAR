@@ -1,0 +1,114 @@
+End init graph pool
+End read
+Cluster num after being adjusted:10
+4
+5
+6
+7
+8
+9
+Waiting to merge No.0
+Begin to construct batch
+Device:0; Points num:1338 has been move to GPU
+Device:0; ep:1585
+Device:0; Waiting for transfering No.0 to CPU
+Device:0; No.0 has been transfered to CPU
+Device:0; No.0 has been mapped
+Begin to construct batch
+Device:0; Points num:2122 has been move to GPU
+Device:0; ep:1272
+Device:0; Waiting for transfering No.1 to CPU
+Device:0; No.1 has been transfered to CPU
+Device:0; No.1 has been mapped
+Begin to construct batch
+Device:0; Points num:1768 has been move to GPU
+Device:0; ep:7318
+Device:0; Waiting for transfering No.2 to CPU
+Device:0; No.2 has been transfered to CPU
+Device:0; No.2 has been mapped
+Begin to construct batch
+Device:0; Points num:2107 has been move to GPU
+Begin to merge No.0
+End to merge No.0
+Waiting to merge No.1
+Begin to merge No.1
+Device:0; ep:5037
+Device:0; Waiting for transfering No.3 to CPU
+Device:0; No.3 has been transfered to CPU
+Buffer:0,5,4294967295,4294967295,
+End to merge No.1
+Waiting to merge No.2
+Begin to merge No.2
+Device:0; No.3 has been mapped
+Begin to construct batch
+Buffer:0,5,6,4294967295,
+End to merge No.2
+Waiting to merge No.3
+Begin to merge No.3
+Device:0; Points num:2392 has been move to GPU
+Device:0; ep:5585
+Device:0; Waiting for transfering No.4 to CPU
+Buffer:0,5,6,4,
+End to merge No.3
+Waiting to merge No.4
+Device:0; No.4 has been transfered to CPU
+Device:0; No.4 has been mapped
+Begin to construct batch
+Device:0; Points num:1735 has been move to GPU
+Begin to merge No.4
+Device:0; ep:1426
+Device:0; Waiting for transfering No.5 to CPU
+Buffer:0,5,7,4,
+End to merge No.4
+Waiting to merge No.5
+Device:0; No.5 has been transfered to CPU
+Device:0; No.5 has been mapped
+Begin to construct batch
+Device:0; Points num:3613 has been move to GPU
+Device:0; ep:9535
+Device:0; Waiting for transfering No.6 to CPU
+Begin to merge No.5
+Buffer:8,5,7,4,
+End to merge No.5
+Waiting to merge No.6
+Device:0; No.6 has been transfered to CPU
+Device:0; No.6 has been mapped
+Begin to construct batch
+Device:0; Points num:2660 has been move to GPU
+Device:0; ep:8050
+Device:0; Waiting for transfering No.7 to CPU
+Begin to merge No.6
+Buffer:8,3,7,4,
+End to merge No.6
+Waiting to merge No.7
+Device:0; No.7 has been transfered to CPU
+Device:0; No.7 has been mapped
+Begin to construct batch
+Device:0; Points num:1316 has been move to GPU
+Device:0; ep:9078
+Device:0; Waiting for transfering No.8 to CPU
+Begin to merge No.7
+Buffer:2,3,7,4,
+End to merge No.7
+Waiting to merge No.8
+Device:0; No.8 has been transfered to CPU
+Device:0; No.8 has been mapped
+Begin to construct batch
+Device:0; Points num:949 has been move to GPU
+Device:0; ep:2639
+Device:0; Waiting for transfering No.9 to CPU
+Begin to merge No.8
+Buffer:9,3,7,4,
+End to merge No.8
+Waiting to merge No.9
+Device:0; No.9 has been transfered to CPU
+Device:0; No.9 has been mapped
+Begin to merge No.9
+Buffer:9,3,7,1,
+End to merge No.9
+8086,0
+Begin to merge
+
+Index size:1193604
+time of largeIndex: 1.76505s
+SMOKE_PARTITION_TAGORE_SECONDS=1.765137

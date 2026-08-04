@@ -1,0 +1,8 @@
+export RUN_ID=20260615_175248_wiki10m_largeindex32
+export RUN_ROOT=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32
+export WIKI10M_BASE=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
+export DISKANN_PREFIX=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/diskann_part/wiki10m
+export TAGORE_INPUT=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_input
+export CUDA_HOME=/usr/local/cuda-13.0
+export TAGORE_BUILD=/data_staging/wbh/tagore_wiki10m_measurement/build
+export TAGORE_VENV=/data_staging/wbh/tagore_wiki10m_measurement/venv

@@ -1,0 +1,34 @@
+DELOANN_PIPNN_PROFILE=1 \
+DELOANN_PIPNN_PHASE_MONITOR=1 \
+DELOANN_PIPNN_PERSISTENT_LEAF_HISTOGRAM_OUT="/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_132312_wmma_hist_per_warp_b/leaf_histogram.jsonl" \
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+/usr/bin/time -v -o "/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_132312_wmma_hist_per_warp_b/time.log" \
+target/release/build_pipnn_index \
+  --data-type float \
+  --dist-fn l2 \
+  --data-path "/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin" \
+  --index-path-prefix "/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_132312_wmma_hist_per_warp_b/index" \
+  --overwrite \
+  --oom-enable \
+  --oom-memory-budget-gb 200 \
+  --oom-temp-dir "/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_132312_wmma_hist_per_warp_b/oom" \
+  --oom-profile-json "/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_132312_wmma_hist_per_warp_b/profile.json" \
+  --max-degree 64 \
+  --lbuild 100 \
+  --num-threads 8 \
+  --leaf-size-min 140 \
+  --leaf-size-max 640 \
+  --leaf-knn 2 \
+  --max-leaders 64 \
+  --psamp-fraction 0.05 \
+  --fanout-top 4 \
+  --fanout-second 2 \
+  --root-risk-candidate-rs 1,2,4 \
+  --seed 42 \
+  --partitioner gpu-subtree \
+  --gpu-subtree-leaf-topk-backend persistent-wmma-tf32 \
+  --pipnn-backend cuda \
+  --pipnn-gpu-device 0 \
+  --pipnn-gpu-workspace-budget-gb 16 \
+  > "/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_132312_wmma_hist_per_warp_b/stdout.log" \
+  2> "/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_132312_wmma_hist_per_warp_b/stderr.log"

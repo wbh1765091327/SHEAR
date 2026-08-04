@@ -1,0 +1,3 @@
+error: invalid value 'cuvs-bruteforce' for '--gpu-subtree-leaf-topk-backend <GPU_SUBTREE_LEAF_TOPK_BACKEND>': Unsupported GPU subtree leaf top-k backend 'cuvs-bruteforce', expected one of: persistent-custom, cublas-gemm
+
+For more information, try '--help'.

@@ -1,0 +1,17 @@
+export DATA_ROOT=/data_nvme_kioxia/tyj/data
+export STAGING_ROOT=/data_staging/wbh
+export WIKI35M_DIR=/data_nvme_kioxia/tyj/data/wiki-1024-35M
+export WIKI10M_DATA_DIR=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data
+export WIKI10M_BASE=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
+export WIKI10M_QUERY_PATH=/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
+export WIKI10M_GT_PATH=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
+export RUN_ID=20260613_085307
+export RUN_ROOT=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307
+export INDEX_DIR=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/index
+export OOM_DIR=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/oom
+export PROFILE_JSON=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/profile.json
+export BUILD_STDOUT=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/stdout.log
+export BUILD_STDERR=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/stderr.log
+export TIME_LOG=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/time.log
+export SEARCH_LOG=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/search.log
+export SEARCH_RESULTS=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260613_085307/search_results.fbin

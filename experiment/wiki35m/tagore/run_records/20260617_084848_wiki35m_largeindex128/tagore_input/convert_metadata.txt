@@ -1,0 +1,10 @@
+diskann_prefix=/data_staging/wbh/tagore_wiki35m_measurement/runs/20260617_084848_wiki35m_largeindex128/diskann_part/wiki35m
+tagore_out=/data_staging/wbh/tagore_wiki35m_measurement/runs/20260617_084848_wiki35m_largeindex128/tagore_input
+num_points=35000000
+dim=1024
+clusters=128
+min_cluster_count=49886
+max_cluster_count=914637
+total_cluster_points=70000000
+centers_path=/data_staging/wbh/tagore_wiki35m_measurement/runs/20260617_084848_wiki35m_largeindex128/tagore_input/centers.bin
+cluster_prefix=/data_staging/wbh/tagore_wiki35m_measurement/runs/20260617_084848_wiki35m_largeindex128/tagore_input/clusters/cluster_

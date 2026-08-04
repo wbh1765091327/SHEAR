@@ -1,0 +1,11 @@
+/target/
+**/target/
+.rustc_info.json
+perf.data*
+*.out
+*.output
+.worktrees/
+.codegraph/
+.codebase-memory/
+__pycache__/
+*.py[cod]

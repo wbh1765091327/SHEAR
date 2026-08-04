@@ -1,0 +1,361 @@
+TAGORE_PARAMS_START
+devicelist=[0]
+dim=1024
+k=64
+cluster_num=32
+max_points=1200000
+data_path_prefix=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_input/clusters/cluster_
+local_index_path_prefix=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_run/local_index/local_
+index_store_path=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_run/index/wiki10m.tagore.vamana
+max_degree=32
+buffer_size=16
+num=10000000
+centers_path=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_input/centers.bin
+threshold=1.2
+final_degree=32
+topm=64
+TAGORE_PARAMS_END
+End init graph pool
+End read
+Cluster num after being adjusted:32
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+Begin to construct batch
+Waiting to merge No.0
+Device:0; Points num:712411 has been move to GPU
+Device:0; ep:9244936
+Device:0; Waiting for transfering No.0 to CPU
+Device:0; No.0 has been transfered to CPU
+Device:0; No.0 has been mapped
+Begin to construct batch
+Begin to merge No.0
+End to merge No.0
+Waiting to merge No.1
+Device:0; Points num:561341 has been move to GPU
+Device:0; ep:3776316
+Device:0; Waiting for transfering No.1 to CPU
+Device:0; No.1 has been transfered to CPU
+Device:0; No.1 has been mapped
+Begin to construct batch
+Begin to merge No.1
+Buffer:0,20,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.1
+Waiting to merge No.2
+Device:0; Points num:982213 has been move to GPU
+Device:0; ep:4157088
+Device:0; Waiting for transfering No.2 to CPU
+Device:0; No.2 has been transfered to CPU
+Device:0; No.2 has been mapped
+Begin to construct batch
+Begin to merge No.2
+Buffer:0,20,19,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.2
+Waiting to merge No.3
+Device:0; Points num:562692 has been move to GPU
+Device:0; ep:1182404
+Device:0; Waiting for transfering No.3 to CPU
+Device:0; No.3 has been transfered to CPU
+Device:0; No.3 has been mapped
+Begin to construct batch
+Begin to merge No.3
+Buffer:0,20,19,28,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.3
+Waiting to merge No.4
+Device:0; Points num:908770 has been move to GPU
+Device:0; ep:7249116
+Device:0; Waiting for transfering No.4 to CPU
+Device:0; No.4 has been transfered to CPU
+Device:0; No.4 has been mapped
+Begin to construct batch
+Begin to merge No.4
+Buffer:0,20,19,28,26,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.4
+Waiting to merge No.5
+Device:0; Points num:1013489 has been move to GPU
+Device:0; ep:5922653
+Device:0; Waiting for transfering No.5 to CPU
+Device:0; No.5 has been transfered to CPU
+Device:0; No.5 has been mapped
+Begin to construct batch
+Begin to merge No.5
+Device:0; Points num:597085 has been move to GPU
+Buffer:0,20,19,28,26,3,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.5
+Waiting to merge No.6
+Device:0; ep:2636321
+Device:0; Waiting for transfering No.6 to CPU
+Device:0; No.6 has been transfered to CPU
+Device:0; No.6 has been mapped
+Begin to construct batch
+Begin to merge No.6
+Buffer:0,20,19,28,26,3,12,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.6
+Waiting to merge No.7
+Device:0; Points num:822614 has been move to GPU
+Device:0; ep:8446638
+Device:0; Waiting for transfering No.7 to CPU
+Device:0; No.7 has been transfered to CPU
+Device:0; No.7 has been mapped
+Begin to construct batch
+Begin to merge No.7
+Device:0; Points num:686295 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.7
+Waiting to merge No.8
+Device:0; ep:1569965
+Device:0; Waiting for transfering No.8 to CPU
+Device:0; No.8 has been transfered to CPU
+Device:0; No.8 has been mapped
+Begin to construct batch
+Begin to merge No.8
+Device:0; Points num:609711 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,17,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.8
+Waiting to merge No.9
+Device:0; ep:4678559
+Device:0; Waiting for transfering No.9 to CPU
+Device:0; No.9 has been transfered to CPU
+Device:0; No.9 has been mapped
+Begin to construct batch
+Begin to merge No.9
+Device:0; Points num:429065 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,17,9,4294967295,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.9
+Waiting to merge No.10
+Device:0; ep:1590959
+Device:0; Waiting for transfering No.10 to CPU
+Device:0; No.10 has been transfered to CPU
+Device:0; No.10 has been mapped
+Begin to construct batch
+Begin to merge No.10
+Buffer:0,20,19,28,26,3,12,27,17,9,7,4294967295,4294967295,4294967295,4294967295,4294967295,
+End to merge No.10
+Waiting to merge No.11
+Device:0; Points num:848584 has been move to GPU
+Device:0; ep:2745178
+Device:0; Waiting for transfering No.11 to CPU
+Device:0; No.11 has been transfered to CPU
+Device:0; No.11 has been mapped
+Begin to construct batch
+Begin to merge No.11
+Device:0; Points num:607133 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,17,9,7,2,4294967295,4294967295,4294967295,4294967295,
+End to merge No.11
+Waiting to merge No.12
+Device:0; ep:6681319
+Device:0; Waiting for transfering No.12 to CPU
+Device:0; No.12 has been transfered to CPU
+Device:0; No.12 has been mapped
+Begin to construct batch
+Begin to merge No.12
+Device:0; Points num:611741 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,17,9,7,2,14,4294967295,4294967295,4294967295,
+End to merge No.12
+Waiting to merge No.13
+Device:0; ep:787484
+Device:0; Waiting for transfering No.13 to CPU
+Device:0; No.13 has been transfered to CPU
+Device:0; No.13 has been mapped
+Begin to construct batch
+Begin to merge No.13
+Device:0; Points num:741742 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,17,9,7,2,14,11,4294967295,4294967295,
+End to merge No.13
+Waiting to merge No.14
+Device:0; ep:9848574
+Device:0; Waiting for transfering No.14 to CPU
+Device:0; No.14 has been transfered to CPU
+Device:0; No.14 has been mapped
+Begin to construct batch
+Begin to merge No.14
+Device:0; Points num:576731 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,17,9,7,2,14,11,22,4294967295,
+End to merge No.14
+Waiting to merge No.15
+Device:0; ep:8984880
+Device:0; Waiting for transfering No.15 to CPU
+Device:0; No.15 has been transfered to CPU
+Device:0; No.15 has been mapped
+Begin to construct batch
+Begin to merge No.15
+Device:0; Points num:409582 has been move to GPU
+Buffer:0,20,19,28,26,3,12,27,17,9,7,2,14,11,22,15,
+End to merge No.15
+Waiting to merge No.16
+Device:0; ep:9848574
+Device:0; Waiting for transfering No.16 to CPU
+Device:0; No.16 has been transfered to CPU
+Device:0; No.16 has been mapped
+Begin to construct batch
+Begin to merge No.16
+Device:0; Points num:732623 has been move to GPU
+Buffer:0,20,19,24,26,3,12,27,17,9,7,2,14,11,22,15,
+End to merge No.16
+Waiting to merge No.17
+Device:0; ep:8857677
+Device:0; Waiting for transfering No.17 to CPU
+Device:0; No.17 has been transfered to CPU
+Device:0; No.17 has been mapped
+Begin to construct batch
+Begin to merge No.17
+Device:0; Points num:375865 has been move to GPU
+Buffer:0,20,19,24,26,3,16,27,17,9,7,2,14,11,22,15,
+End to merge No.17
+Waiting to merge No.18
+Device:0; ep:1458689
+Device:0; Waiting for transfering No.18 to CPU
+Device:0; No.18 has been transfered to CPU
+Device:0; No.18 has been mapped
+Begin to construct batch
+Begin to merge No.18
+Device:0; Points num:316022 has been move to GPU
+Buffer:0,20,19,24,26,3,16,27,17,9,18,2,14,11,22,15,
+End to merge No.18
+Waiting to merge No.19
+Device:0; ep:2069162
+Device:0; Waiting for transfering No.19 to CPU
+Device:0; No.19 has been transfered to CPU
+Device:0; No.19 has been mapped
+Begin to construct batch
+Begin to merge No.19
+Buffer:0,20,19,24,26,3,16,27,17,9,6,2,14,11,22,15,
+End to merge No.19
+Waiting to merge No.20
+Device:0; Points num:822249 has been move to GPU
+Device:0; ep:7678930
+Device:0; Waiting for transfering No.20 to CPU
+Device:0; No.20 has been transfered to CPU
+Device:0; No.20 has been mapped
+Begin to construct batch
+Begin to merge No.20
+Device:0; Points num:512121 has been move to GPU
+Buffer:0,20,19,5,26,3,16,27,17,9,6,2,14,11,22,15,
+End to merge No.20
+Waiting to merge No.21
+Device:0; ep:1467922
+Device:0; Waiting for transfering No.21 to CPU
+Device:0; No.21 has been transfered to CPU
+Device:0; No.21 has been mapped
+Begin to construct batch
+Begin to merge No.21
+Device:0; Points num:726218 has been move to GPU
+Buffer:0,20,19,5,26,3,16,27,17,9,6,2,14,10,22,15,
+End to merge No.21
+Waiting to merge No.22
+Device:0; ep:8551032
+Device:0; Waiting for transfering No.22 to CPU
+Device:0; No.22 has been transfered to CPU
+Device:0; No.22 has been mapped
+Begin to construct batch
+Begin to merge No.22
+Device:0; Points num:544793 has been move to GPU
+Buffer:0,20,19,5,26,3,16,27,17,9,23,2,14,10,22,15,
+End to merge No.22
+Waiting to merge No.23
+Device:0; ep:236184
+Device:0; Waiting for transfering No.23 to CPU
+Device:0; No.23 has been transfered to CPU
+Device:0; No.23 has been mapped
+Begin to construct batch
+Begin to merge No.23
+Device:0; Points num:340573 has been move to GPU
+Buffer:29,20,19,5,26,3,16,27,17,9,23,2,14,10,22,15,
+End to merge No.23
+Waiting to merge No.24
+Device:0; ep:5332099
+Device:0; Waiting for transfering No.24 to CPU
+Device:0; No.24 has been transfered to CPU
+Device:0; No.24 has been mapped
+Begin to construct batch
+Begin to merge No.24
+Device:0; Points num:376696 has been move to GPU
+Buffer:29,20,19,5,26,3,16,31,17,9,23,2,14,10,22,15,
+End to merge No.24
+Waiting to merge No.25
+Device:0; ep:6866019
+Device:0; Waiting for transfering No.25 to CPU
+Device:0; No.25 has been transfered to CPU
+Device:0; No.25 has been mapped
+Begin to construct batch
+Begin to merge No.25
+Device:0; Points num:499991 has been move to GPU
+Buffer:29,20,19,5,26,3,16,31,17,9,23,2,14,1,22,15,
+End to merge No.25
+Waiting to merge No.26
+Device:0; ep:1228968
+Device:0; Waiting for transfering No.26 to CPU
+Device:0; No.26 has been transfered to CPU
+Device:0; No.26 has been mapped
+Begin to construct batch
+Begin to merge No.26
+Buffer:4,20,19,5,26,3,16,31,17,9,23,2,14,1,22,15,
+End to merge No.26
+Waiting to merge No.27
+Device:0; Points num:391656 has been move to GPU
+Device:0; ep:1187674
+Device:0; Waiting for transfering No.27 to CPU
+Device:0; No.27 has been transfered to CPU
+Device:0; No.27 has been mapped
+Begin to construct batch
+Begin to merge No.27
+Buffer:4,20,19,5,26,3,16,25,17,9,23,2,14,1,22,15,
+End to merge No.27
+Waiting to merge No.28
+Device:0; Points num:1131034 has been move to GPU
+Device:0; ep:6738515
+Device:0; Waiting for transfering No.28 to CPU
+Device:0; No.28 has been transfered to CPU
+Device:0; No.28 has been mapped
+Begin to construct batch
+Begin to merge No.28
+Buffer:4,20,19,5,26,3,16,25,17,9,23,2,21,1,22,15,
+End to merge No.28
+Waiting to merge No.29
+Device:0; Points num:1134094 has been move to GPU
+Device:0; ep:6128550
+Device:0; Waiting for transfering No.29 to CPU
+Device:0; No.29 has been transfered to CPU
+Device:0; No.29 has been mapped
+Begin to construct batch
+Begin to merge No.29
+Device:0; Points num:224045 has been move to GPU
+Device:0; ep:7932297
+Device:0; Waiting for transfering No.30 to CPU
+Buffer:4,20,19,5,26,3,16,13,17,9,23,2,21,1,22,15,
+End to merge No.29
+Waiting to merge No.30
+Device:0; No.30 has been transfered to CPU
+Device:0; No.30 has been mapped
+Begin to construct batch
+Begin to merge No.30
+Buffer:4,20,19,5,26,3,16,13,17,9,23,2,30,1,22,15,
+End to merge No.30
+Waiting to merge No.31
+Device:0; Points num:190821 has been move to GPU
+Device:0; ep:7932297
+Device:0; Waiting for transfering No.31 to CPU
+Device:0; No.31 has been transfered to CPU
+Device:0; No.31 has been mapped
+Begin to merge No.31
+Buffer:4,20,19,5,26,3,16,13,17,9,23,2,30,8,22,15,
+End to merge No.31
+9468085,0
+Begin to merge
+
+Index size:1314573804
+time of largeIndex: 472.249s
+TAGORE_LARGEINDEX_SECONDS=472.548936

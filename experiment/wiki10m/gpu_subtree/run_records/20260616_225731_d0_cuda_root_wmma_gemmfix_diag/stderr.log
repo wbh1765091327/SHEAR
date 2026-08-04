@@ -1,0 +1,7 @@
+error: unexpected argument '--gpu-subtree-output' found
+
+  tip: a similar argument exists: '--gpu-subtree-leaf-topk-backend'
+
+Usage: build_pipnn_index --data-type <DATA_TYPE> --dist-fn <DIST_FN> --data-path <DATA_PATH> --index-path-prefix <INDEX_PATH_PREFIX> --overwrite --oom-enable --oom-memory-budget-gb <OOM_MEMORY_BUDGET_GB> --oom-temp-dir <OOM_TEMP_DIR> --oom-profile-json <OOM_PROFILE_JSON> --max-degree <MAX_DEGREE> --lbuild <LBUILD> --num-threads <NUM_THREADS> --leaf-size-min <LEAF_SIZE_MIN> --leaf-size-max <LEAF_SIZE_MAX> --leaf-knn <LEAF_KNN> --max-leaders <MAX_LEADERS> --psamp-fraction <PSAMP_FRACTION> --fanout-top <FANOUT_TOP> --fanout-second <FANOUT_SECOND> --root-risk-candidate-rs <ROOT_RISK_CANDIDATE_RS> --seed <SEED> --partitioner <PARTITIONER> --gpu-subtree-leaf-topk-backend <GPU_SUBTREE_LEAF_TOPK_BACKEND>
+
+For more information, try '--help'.

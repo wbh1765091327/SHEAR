@@ -1,0 +1,688 @@
+diff -ruN '--exclude=build' '--exclude=bin' base/CMakeLists.txt work/CMakeLists.txt
+--- base/CMakeLists.txt	2025-09-06 22:25:34.000000000 +0800
++++ work/CMakeLists.txt	2026-07-25 23:48:02.379629455 +0800
+@@ -32,8 +32,10 @@
+ endif()
+ 
+ add_executable(main main.cc)
++add_executable(hnsw_flash_benchmark benchmark_main.cc)
+ 
+ if (APPLE)
+ else()
+     target_link_libraries(main PRIVATE stdc++fs)
+-endif()
+\ No newline at end of file
++    target_link_libraries(hnsw_flash_benchmark PRIVATE stdc++fs)
++endif()
+diff -ruN '--exclude=build' '--exclude=bin' base/benchmark_main.cc work/benchmark_main.cc
+--- base/benchmark_main.cc	1970-01-01 08:00:00.000000000 +0800
++++ work/benchmark_main.cc	2026-07-25 23:49:20.650878631 +0800
+@@ -0,0 +1,112 @@
++#include "third_party/eigen/Eigen/Dense"
++#include <omp.h>
++#include "include/benchmark/flat_binary.h"
++#include "include/benchmark/flash_benchmark.h"
++
++#include <filesystem>
++#include <fstream>
++
++namespace {
++
++std::string required(const std::map<std::string, std::string>& args, const std::string& name) {
++    auto it = args.find(name);
++    if (it == args.end() || it->second.empty()) {
++        throw std::runtime_error("missing required option --" + name);
++    }
++    return it->second;
++}
++
++void write_metric(const std::string& path, const std::map<std::string, std::string>& values) {
++    std::filesystem::create_directories(std::filesystem::path(path).parent_path());
++    std::ofstream out(path);
++    out << "field\tvalue\n";
++    for (const auto& [key, value] : values) {
++        out << key << '\t' << value << '\n';
++    }
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    try {
++        if (argc < 2) {
++            throw std::runtime_error("usage: hnsw_flash_benchmark <build|validate|search> [options]");
++        }
++        const std::string mode = argv[1];
++        std::map<std::string, std::string> args;
++        for (int i = 2; i < argc; ++i) {
++            const std::string key = argv[i];
++            if (key.rfind("--", 0) != 0 || i + 1 >= argc) {
++                throw std::runtime_error("options must be --name value pairs");
++            }
++            args[key.substr(2)] = argv[++i];
++        }
++        const std::string base = required(args, "base");
++        const std::string codebook = required(args, "codebook");
++        const std::string index = required(args, "index");
++        const std::string metrics = required(args, "metrics");
++        if (args.count("threads")) {
++            NUM_THREADS = std::stoi(args["threads"]);
++        }
++
++        const auto started = std::chrono::steady_clock::now();
++        if (mode == "build") {
++            uint32_t rows = 0;
++            uint32_t dim = 0;
++            ReadDataHeader<float>(base, rows, dim);
++            setenv("HNSW_FLASH_BUILD_ONLY", "1", 1);
++            benchmark::FlashBenchmark strategy(base, "", codebook, index);
++            strategy.solve();
++            const auto ended = std::chrono::steady_clock::now();
++            write_metric(metrics, {
++                {"mode", mode},
++                {"rows", std::to_string(rows)},
++                {"dim", std::to_string(dim)},
++                {"seed", args.count("seed") ? args["seed"] : "42"},
++                {"internal_e2e_seconds", std::to_string(std::chrono::duration<double>(ended - started).count())},
++            });
++        } else if (mode == "validate") {
++            uint32_t rows = 0;
++            uint32_t dim = 0;
++            ReadDataHeader<float>(base, rows, dim);
++            if (args.count("expected-rows") && rows != std::stoul(args["expected-rows"])) {
++                throw std::runtime_error("base row count does not match --expected-rows");
++            }
++            if (!std::filesystem::is_regular_file(index) || !std::filesystem::is_regular_file(codebook)) {
++                throw std::runtime_error("index or codebook artifact is missing");
++            }
++            write_metric(metrics, {
++                {"mode", mode},
++                {"rows", std::to_string(rows)},
++                {"dim", std::to_string(dim)},
++                {"index_bytes", std::to_string(std::filesystem::file_size(index))},
++                {"codebook_bytes", std::to_string(std::filesystem::file_size(codebook))},
++            });
++        } else if (mode == "search") {
++            const std::string query = required(args, "query");
++            const std::string ground_truth = required(args, "ground-truth");
++            const std::string output = required(args, "output");
++            const std::string ef = required(args, "ef-search");
++            setenv("HNSW_FLASH_SEARCH_ONLY", "1", 1);
++            setenv("HNSW_FLASH_EF_SEARCH", ef.c_str(), 1);
++            benchmark::FlashBenchmark strategy(base, query, codebook, index);
++            strategy.solve();
++            strategy.save_knn(output);
++            const double recall = strategy.recall_at_k(ground_truth);
++            const auto ended = std::chrono::steady_clock::now();
++            write_metric(metrics, {
++                {"mode", mode},
++                {"ef_search", ef},
++                {"recall_at_10", std::to_string(recall)},
++                {"internal_e2e_seconds", std::to_string(std::chrono::duration<double>(ended - started).count())},
++            });
++            std::cout << "METRIC recall_at_10 " << recall << '\n';
++        } else {
++            throw std::runtime_error("unknown mode: " + mode);
++        }
++        return 0;
++    } catch (const std::exception& error) {
++        std::cerr << "ERROR: " << error.what() << '\n';
++        return 2;
++    }
++}
+diff -ruN '--exclude=build' '--exclude=bin' base/include/benchmark/flash_benchmark.h work/include/benchmark/flash_benchmark.h
+--- base/include/benchmark/flash_benchmark.h	1970-01-01 08:00:00.000000000 +0800
++++ work/include/benchmark/flash_benchmark.h	2026-07-25 23:49:20.650878631 +0800
+@@ -0,0 +1,9 @@
++#pragma once
++
++#include "../strategy/flash_strategy.h"
++
++namespace benchmark {
++
++using FlashBenchmark = FlashStrategy;
++
++}  // namespace benchmark
+diff -ruN '--exclude=build' '--exclude=bin' base/include/benchmark/flat_binary.h work/include/benchmark/flat_binary.h
+--- base/include/benchmark/flat_binary.h	1970-01-01 08:00:00.000000000 +0800
++++ work/include/benchmark/flat_binary.h	2026-07-25 23:49:20.650878631 +0800
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "../util.h"
++
++namespace benchmark {
++
++struct BinaryShape {
++    uint32_t rows;
++    uint32_t dimensions;
++};
++
++template <typename T>
++BinaryShape read_binary_shape(const std::string& path) {
++    BinaryShape shape{};
++    ReadDataHeader<T>(path, shape.rows, shape.dimensions);
++    return shape;
++}
++
++}  // namespace benchmark
+diff -ruN '--exclude=build' '--exclude=bin' base/include/core.h work/include/core.h
+--- base/include/core.h	2025-09-06 22:25:34.000000000 +0800
++++ work/include/core.h	2026-07-25 23:46:19.572670785 +0800
+@@ -26,7 +26,7 @@
+ #include <unordered_map>
+ #include <vector>
+ 
+-const size_t K = 1;					// top-k knns
++const size_t K = 10;					// top-k knns
+ const size_t M = 32;					// neighbor's number, should be times of 16
+ const size_t EF_CONSTRUCTION = 1024;		// maximum number of candidate neighbors considered during index construction.
+ const size_t EF_SEARCH = 64;			// maximum number of candidates retained during the search phase.
+@@ -36,7 +36,7 @@
+ const size_t CLUSTER_NUM = 16;			// cluster numbers of each subvector
+ const size_t MAX_ITERATIONS = 12;		// k-means iteration times
+ const size_t SAMPLE_NUM = 100000;			// sample number in generating codebooks
+-int NUM_THREADS = 24;					// set num_threads
++int NUM_THREADS = 64;					// set num_threads
+ 
+ const size_t VECTORS_PER_BLOCK = 16;	// calculate multiple neighbor distance at the same time.
+ 										// This parameter cannot be modified due to the restrict of SIMD shuffle
+@@ -55,7 +55,7 @@
+ #define PQLINK_CALC						// calculate neighbor data at once
+ #define USE_PCA							// use PCA to tallor dimensions
+ // #define USE_PCA_OPTIMAL				// use cumulative variance to group subvectors in PCA
+-#define RERANK							// search 2k points to rerank
++// #define RERANK						// search 2k points to rerank
+ // #define SAVE_MEMORY					// not save distance table while using SDC to calculate distance
+ #define ALL_POSITIVE_NUMBER				// modify hnswalg to make all operated number positive
+ 
+diff -ruN '--exclude=build' '--exclude=bin' base/include/strategy/flash_strategy.h work/include/strategy/flash_strategy.h
+--- base/include/strategy/flash_strategy.h	2025-09-06 22:25:34.000000000 +0800
++++ work/include/strategy/flash_strategy.h	2026-07-25 23:48:11.080879632 +0800
+@@ -3,6 +3,9 @@
+ #include "solve_strategy.h"
+ #include "../space/space_flash.h"
+ #include "../../third_party/hnswlib/hnswalg_flash.h"
++#if defined(__GLIBC__)
++#include <malloc.h>
++#endif
+ 
+ using Eigen::MatrixXf;
+ using Eigen::VectorXf;
+@@ -15,6 +18,8 @@
+         subvector_num_ = SUBVECTOR_NUM;
+         sample_num_ = std::min(SAMPLE_NUM, (size_t)data_num_);
+         ori_dim = data_dim_;
++        qmin = 0;
++        qmax = 0;
+         pre_length_ = (size_t *)malloc(subvector_num_ * sizeof(size_t));
+         subvector_length_ = (size_t *)malloc(subvector_num_ * sizeof(size_t));
+     }
+@@ -23,6 +28,7 @@
+     }
+ 
+     void solve() {
++        const bool search_only = std::getenv("HNSW_FLASH_SEARCH_ONLY") != nullptr;
+         // With PQ CLUSTER_NUM set to 16, each cluster can be represented using 4 bits.  
+         // This allows storing two subvectors in a single byte, effectively saving space.
+         byte_num_ = subvector_num_ >> 1;
+@@ -46,6 +52,7 @@
+         // Save the distance table if SAVE_MEMORY is not enabled.
+         // If the distance table is not saved, the SDC will be used to compute the distance between points.
+ #if !defined(SAVE_MEMORY)
++        if (!search_only) {
+         auto& data_dist_table = hnswlib::flash_data_dist_table_;
+ #if defined(RUN_WITH_AVX)
+         data_dist_table = (data_t *)aligned_alloc(32, data_num_ * SUBVECTOR_NUM * CLUSTER_NUM * sizeof(data_t));
+@@ -54,6 +61,7 @@
+ #else 
+         data_dist_table = (data_t *)malloc(data_num_ * SUBVECTOR_NUM * CLUSTER_NUM * sizeof(data_t));
+ #endif
++        }
+ #endif
+         // Create index
+         // If the index is already saved, load it from the file system
+@@ -102,11 +110,20 @@
+         } else {
+ #if defined(USE_PCA)
+             // Generate the PCA matrix and encode the data to reduce the dimension to PRINCIPAL_DIM
+-            auto s_encode_data_pca = std::chrono::system_clock::now();
++            auto s_pca_fit = std::chrono::system_clock::now();
+             generate_matrix(data_set_, sample_num_);
++            auto e_pca_fit = std::chrono::system_clock::now();
++            std::cout << "METRIC pca_fit_seconds "
++                      << time_cost(s_pca_fit, e_pca_fit) / 1000.0 << "\n";
++            auto s_encode_data_pca = std::chrono::system_clock::now();
+             pcaEncode(data_set_);
++#if defined(__GLIBC__)
++            malloc_trim(0);
++#endif
+             data_dim_ = PRINCIPAL_DIM;
+             auto e_encode_data_pca = std::chrono::system_clock::now();
++            std::cout << "METRIC pca_encode_base_seconds "
++                      << time_cost(s_encode_data_pca, e_encode_data_pca) / 1000.0 << "\n";
+             std::cout << "pca encode data cost: " << time_cost(s_encode_data_pca, e_encode_data_pca) << " (ms)\n";
+ #else
+             // If PCA is not used, simply initialize these variables
+@@ -121,10 +138,11 @@
+             generate_codebooks(data_set_, sample_num_);
+             auto e_gen = std::chrono::system_clock::now();
+             std::cout << "generate codebooks cost: " << time_cost(s_gen, e_gen) << " (ms)\n";
++            std::cout << "METRIC pq_train_seconds " << time_cost(s_gen, e_gen) / 1000.0 << "\n";
+ 
+             // Build index
+             auto s_build = std::chrono::system_clock::now();
+-            hnsw = new hnswlib::HierarchicalNSWFlash<data_t>(&flash_space, data_num_, M_, ef_construction_);
++            hnsw = new hnswlib::HierarchicalNSWFlash<data_t>(&flash_space, data_num_, M_, ef_construction_, 42);
+             // Encode data with PQ and SQ and add point
+ #pragma omp parallel for schedule(dynamic) num_threads(NUM_THREADS)
+             for (size_t i = 0; i < data_num_; ++i) {
+@@ -136,6 +154,7 @@
+             }
+             auto e_build = std::chrono::system_clock::now();
+             std::cout << "build cost: " << time_cost(s_build, e_build) << " (ms)\n";
++            std::cout << "METRIC hnsw_insert_seconds " << time_cost(s_build, e_build) / 1000.0 << "\n";
+ 
+             // Save Index
+             {
+@@ -168,10 +187,28 @@
+                         out.write(reinterpret_cast<char*>(&codebooks[ptr]), sizeof(float));
+                     }
+                 }
++                auto s_serialize = std::chrono::system_clock::now();
+                 hnsw->saveIndex(index_path_);
++                auto e_serialize = std::chrono::system_clock::now();
++                std::cout << "METRIC artifact_serialize_seconds "
++                          << time_cost(s_serialize, e_serialize) / 1000.0 << "\n";
+             }
+         }
+ 
++        if (std::getenv("HNSW_FLASH_BUILD_ONLY")) {
++            std::cout << "build only: skip search" << std::endl;
++            for (int i = 0; i < NUM_THREADS; ++i) {
++                free(thread_encoded_vector[i]);
++            }
++            free(pre_length_);
++            free(subvector_length_);
++            free(thread_encoded_vector);
++            free(hnswlib::flash_codebooks_);
++            free(hnswlib::flash_dist_);
++            free(hnswlib::flash_data_dist_table_);
++            return;
++        }
++
+         // search 
+         auto s_solve = std::chrono::system_clock::now();
+ #if defined(ADSAMPLING)
+@@ -180,7 +217,11 @@
+ #if defined(USE_PCA)
+         pcaEncode(query_set_);
+ #endif
+-        hnsw->setEf(EF_SEARCH);
++        size_t runtime_ef = EF_SEARCH;
++        if (const char* value = std::getenv("HNSW_FLASH_EF_SEARCH")) {
++            runtime_ef = std::stoull(value);
++        }
++        hnsw->setEf(runtime_ef);
+ #pragma omp parallel for schedule(dynamic) num_threads(NUM_THREADS)
+         for (size_t i = 0; i < query_num_; ++i) {
+             // Encode query with PQ
+@@ -203,7 +244,7 @@
+                 tmp.pop();
+             }
+ #else
+-            std::priority_queue<std::pair<data_t, hnswlib::labeltype>> result = hnsw.searchKnn(encoded_query, K);
++            std::priority_queue<std::pair<data_t, hnswlib::labeltype>> result = hnsw->searchKnn(encoded_query, K);
+ #endif
+             while (!result.empty() && knn_results_[i].size() < K) {
+                 knn_results_[i].emplace_back(result.top().second);
+@@ -215,6 +256,7 @@
+         }
+         auto e_solve = std::chrono::system_clock::now();
+         std::cout << "solve cost: " << time_cost(s_solve, e_solve) << " (ms)" << std::endl;
++        std::cout << "METRIC search_seconds " << time_cost(s_solve, e_solve) / 1000.0 << "\n";
+ 
+         for (int i = 0; i < NUM_THREADS; ++i) {
+             free(thread_encoded_vector[i]);
+@@ -237,9 +279,7 @@
+     void generate_codebooks(std::vector<std::vector<float>>& data_set_, size_t sample_num) {
+         // Sample sample_num data points from the range [0, data_num_)
+         std::vector<size_t> subset_data(sample_num_);
+-        std::random_device rd;
+-        std::mt19937 g(rd());
+-        // std::mt19937 g(19260817);
++        std::mt19937 g(42);
+         std::uniform_int_distribution<size_t> dis(0, data_num_ - 1);
+         for (size_t i = 0; i < sample_num; ++i) {
+             subset_data[i] = dis(g);
+@@ -271,6 +311,7 @@
+         float *fdist = (float *)malloc(SUBVECTOR_NUM * CLUSTER_NUM * CLUSTER_NUM * sizeof(float));
+         float *fdist_ptr = fdist;
+         qmin = FLT_MAX;
++        qmax = 0;
+         for (size_t i = 0; i < subvector_num_; ++i) {
+             float max_dist = 0;
+             for (size_t j1 = 0; j1 < CLUSTER_NUM; ++j1) {
+@@ -317,9 +358,7 @@
+         size_t data_num = data_set.rows();
+         size_t data_dim = data_set.cols();
+         MatrixXf centroids(cluster_num, data_dim);
+-        std::random_device rd;
+-        std::mt19937 gen(rd());
+-        // std::mt19937 gen(114514);
++        std::mt19937 gen(42);
+         std::uniform_int_distribution<> dis(0, data_num - 1);
+         for (size_t i = 0; i < cluster_num; ++i) {
+             centroids.row(i) = data_set.row(dis(gen));
+@@ -485,16 +524,18 @@
+     * @param sample_num Number of sampled data points
+     */
+     void generate_matrix(std::vector<std::vector<float>>& data_set, size_t sample_num) {
+-        std::random_device rd;
+-        std::mt19937 g(rd());
+-        // std::mt19937 g(19260817);
++        std::mt19937 g(42);
+         std::uniform_int_distribution<size_t> dis(0, data_num_ - 1);
+ 
+         size_t data_dim = data_set_[0].size();
+         Eigen::MatrixXf data(sample_num, data_dim);
++        std::vector<size_t> sample_indices(sample_num);
++        for (size_t i = 0; i < sample_num; ++i) {
++            sample_indices[i] = dis(g);
++        }
+ #pragma omp parallel for schedule(dynamic) num_threads(NUM_THREADS)
+         for (int i = 0; i < sample_num; ++i) {
+-            size_t idx = dis(g);
++            size_t idx = sample_indices[i];
+             Eigen::Map<Eigen::VectorXf> row(data_set[idx].data(), data_dim);
+             data.row(i) = row.transpose();
+         }
+@@ -567,22 +608,15 @@
+         size_t data_num = data_set.size();
+         size_t data_dim = data_set[0].size();
+ 
+-        Eigen::MatrixXf data(data_num, data_dim);
+-#pragma omp parallel for schedule(dynamic) num_threads(NUM_THREADS)
+-        for (size_t i = 0; i < data_num; ++i) {
+-            Eigen::VectorXf row = Eigen::Map<Eigen::VectorXf>(data_set[i].data(), data_dim);
+-            // Center the data
+-            data.row(i) = row - data_mean_;
+-        }
+-        // PCA 
+-        data = data * principal_components;
+-
+-        std::vector<std::vector<float>>(data_num, std::vector<float>(PRINCIPAL_DIM)).swap(data_set);
+ #pragma omp parallel for schedule(dynamic) num_threads(NUM_THREADS)
+         for (size_t i = 0; i < data_num; ++i) {
+-            for (size_t j = 0; j < PRINCIPAL_DIM; j++) {
+-                data_set[i][j] = data(i, j);
++            Eigen::Map<const Eigen::VectorXf> row(data_set[i].data(), data_dim);
++            Eigen::RowVectorXf encoded = (row - data_mean_).transpose() * principal_components;
++            std::vector<float> compact(PRINCIPAL_DIM);
++            for (size_t j = 0; j < PRINCIPAL_DIM; ++j) {
++                compact[j] = encoded(j);
+             }
++            data_set[i].swap(compact);
+         }
+     }
+ 
+diff -ruN '--exclude=build' '--exclude=bin' base/include/strategy/nsg_flash_strategy.h work/include/strategy/nsg_flash_strategy.h
+--- base/include/strategy/nsg_flash_strategy.h	2025-09-06 22:25:34.000000000 +0800
++++ work/include/strategy/nsg_flash_strategy.h	2026-07-25 23:46:19.572670785 +0800
+@@ -223,7 +223,7 @@
+                 tmp.pop();
+             }
+ #else
+-            std::priority_queue<std::pair<data_t, hnswlib::labeltype>> result = hnsw.searchKnn(encoded_query, K);
++            std::priority_queue<std::pair<data_t, hnswlib::labeltype>> result = nsg->searchKnn(encoded_query, K);
+ #endif
+             while (!result.empty() && knn_results_[i].size() < K) {
+                 knn_results_[i].emplace_back(result.top().second);
+diff -ruN '--exclude=build' '--exclude=bin' base/include/strategy/solve_strategy.h work/include/strategy/solve_strategy.h
+--- base/include/strategy/solve_strategy.h	2025-09-06 22:25:34.000000000 +0800
++++ work/include/strategy/solve_strategy.h	2026-07-26 00:30:58.350584245 +0800
+@@ -8,15 +8,26 @@
+ public:
+     SolveStrategy(std::string source_path, std::string query_path, std::string codebooks_path, std::string index_path) {
+         // Read data and query
+-        ReadData(source_path, data_set_, data_num_, data_dim_);
+-        ReadData(query_path, query_set_, query_num_, query_dim_);
++        if (std::getenv("HNSW_FLASH_SEARCH_ONLY")) {
++            ReadDataHeader<float>(source_path, data_num_, data_dim_);
++        } else {
++            const auto base_load_started = std::chrono::steady_clock::now();
++            ReadData(source_path, data_set_, data_num_, data_dim_);
++            const auto base_load_ended = std::chrono::steady_clock::now();
++            std::cout << "METRIC base_load_seconds "
++                      << std::chrono::duration<double>(base_load_ended - base_load_started).count() << "\n";
++        }
++        if (!query_path.empty()) {
++            ReadData(query_path, query_set_, query_num_, query_dim_);
++        } else {
++            query_num_ = 0;
++            query_dim_ = data_dim_;
++        }
+         knn_results_.resize(query_num_);
+         M_ = M;
+         ef_construction_ = EF_CONSTRUCTION;
+         ef_search_ = EF_SEARCH;
+         K_ = K;
+-        org_data_set_ = data_set_;
+-        org_query_set_ = query_set_;
+         org_dim_ = data_dim_;
+ 
+         codebooks_path_ = codebooks_path;
+@@ -38,25 +49,17 @@
+         // Read ground truth
+         uint32_t gt_num, gt_dim;
+         std::vector<std::vector<uint32_t>> gt_set;
+-        ReadData(gt_path, gt_set, gt_num, gt_dim);
++        ReadGroundTruth(gt_path, gt_set, gt_num, gt_dim);
+ 
+         // Calculate recall
+         int hit = 0;
+         size_t dim = org_dim_;
+         for (int i = 0; i < query_num_; ++i) {
+             auto& knn = knn_results_[i];
+-            // auto& truth_knn = gt_set[i];
+             std::vector<uint32_t> truth_knn;
+ 
+-            // fetch the top-K ground truth
+-            std::vector<std::pair<float, uint32_t>> knn_with_dist;
+-            for (auto gt : gt_set[i]) {
+-                knn_with_dist.emplace_back(std::make_pair(hnswlib::L2Sqr(org_query_set_[i].data(), org_data_set_[gt].data(), &dim), gt));
+-            }
+-            sort(knn_with_dist.begin(), knn_with_dist.end());
+-            truth_knn.clear();
+             for (int j = 0; j < K; ++j) {
+-                truth_knn.emplace_back(knn_with_dist[j].second);
++                truth_knn.emplace_back(gt_set[i][j]);
+             }
+ 
+             std::sort(knn.begin(), knn.end());
+@@ -71,6 +74,23 @@
+         std::cout << "Recall: " << recall << std::endl;
+     }
+ 
++    double recall_at_k(std::string gt_path) {
++        uint32_t gt_num, gt_dim;
++        std::vector<std::vector<uint32_t>> gt_set;
++        ReadGroundTruth(gt_path, gt_set, gt_num, gt_dim);
++        if (gt_num < query_num_ || gt_dim < K_) {
++            throw std::runtime_error("ground truth is smaller than the query workload");
++        }
++        size_t hit = 0;
++        for (size_t i = 0; i < query_num_; ++i) {
++            std::set<uint32_t> truth(gt_set[i].begin(), gt_set[i].begin() + K_);
++            for (uint32_t id : knn_results_[i]) {
++                hit += truth.count(id);
++            }
++        }
++        return static_cast<double>(hit) / static_cast<double>(query_num_ * K_);
++    }
++
+ protected:
+     // data
+     std::vector<std::vector<float>> data_set_;
+diff -ruN '--exclude=build' '--exclude=bin' base/include/strategy/taumg_flash_strategy.h work/include/strategy/taumg_flash_strategy.h
+--- base/include/strategy/taumg_flash_strategy.h	2025-09-06 22:25:34.000000000 +0800
++++ work/include/strategy/taumg_flash_strategy.h	2026-07-25 23:46:19.572670785 +0800
+@@ -217,7 +217,7 @@
+                 tmp.pop();
+             }
+ #else
+-            std::priority_queue<std::pair<data_t, hnswlib::labeltype>> result = hnsw.searchKnn(encoded_query, K);
++            std::priority_queue<std::pair<data_t, hnswlib::labeltype>> result = taumg->searchKnn(encoded_query, K);
+ #endif
+             while (!result.empty() && knn_results_[i].size() < K) {
+                 knn_results_[i].emplace_back(result.top().second);
+diff -ruN '--exclude=build' '--exclude=bin' base/include/util.h work/include/util.h
+--- base/include/util.h	2025-09-06 22:25:34.000000000 +0800
++++ work/include/util.h	2026-07-26 00:31:15.235060797 +0800
+@@ -2,6 +2,70 @@
+ 
+ #include "core.h"
+ 
++template <typename T>
++void ReadData(const std::string& file_path,
++              std::vector<std::vector<T>>& results,
++              uint32_t& num,
++              uint32_t& dim);
++
++template <typename T>
++void ReadDataHeader(const std::string& file_path, uint32_t& num, uint32_t& dim) {
++    std::ifstream in(file_path, std::ios::binary);
++    if (!in.is_open()) {
++        throw std::runtime_error("cannot open data file: " + file_path);
++    }
++    in.seekg(0, std::ios::end);
++    const size_t file_size = static_cast<size_t>(in.tellg());
++    uint32_t first = 0;
++    uint32_t second = 0;
++    in.seekg(0, std::ios::beg);
++    in.read(reinterpret_cast<char*>(&first), sizeof(first));
++    in.read(reinterpret_cast<char*>(&second), sizeof(second));
++    const size_t binary_size = 8ULL + static_cast<size_t>(first) * second * sizeof(T);
++    if (first > 0 && second > 0 && binary_size == file_size) {
++        num = first;
++        dim = second;
++        return;
++    }
++    dim = first;
++    const size_t row_size = (static_cast<size_t>(dim) + 1) * sizeof(T);
++    if (dim == 0 || row_size == 0 || file_size % row_size != 0) {
++        throw std::runtime_error("unsupported or truncated vector file: " + file_path);
++    }
++    num = static_cast<uint32_t>(file_size / row_size);
++}
++
++void ReadGroundTruth(const std::string& file_path,
++                     std::vector<std::vector<uint32_t>>& results,
++                     uint32_t& num,
++                     uint32_t& dim) {
++    std::ifstream in(file_path, std::ios::binary);
++    if (!in.is_open()) {
++        throw std::runtime_error("cannot open ground-truth file: " + file_path);
++    }
++    in.seekg(0, std::ios::end);
++    const size_t file_size = static_cast<size_t>(in.tellg());
++    uint32_t rows = 0;
++    uint32_t columns = 0;
++    in.seekg(0, std::ios::beg);
++    in.read(reinterpret_cast<char*>(&rows), sizeof(rows));
++    in.read(reinterpret_cast<char*>(&columns), sizeof(columns));
++    const size_t ids_only = 8ULL + static_cast<size_t>(rows) * columns * sizeof(uint32_t);
++    const size_t ids_and_distances =
++        8ULL + static_cast<size_t>(rows) * columns * (sizeof(uint32_t) + sizeof(float));
++    if (rows > 0 && columns > 0 && (file_size == ids_only || file_size == ids_and_distances)) {
++        num = rows;
++        dim = columns;
++        results.assign(num, std::vector<uint32_t>(dim));
++        for (auto& row : results) {
++            in.read(reinterpret_cast<char*>(row.data()), dim * sizeof(uint32_t));
++        }
++        return;
++    }
++    in.close();
++    ReadData(file_path, results, num, dim);
++}
++
+ int64_t time_cost(const std::chrono::system_clock::time_point &st, const std::chrono::system_clock::time_point &en) {
+     return std::chrono::duration_cast<std::chrono::milliseconds>(en - st).count();
+ }
+@@ -44,19 +108,41 @@
+         std::cout << "open file error" << std::endl;
+         exit(-1);
+     }
+-    in.read((char *)&dim, 4);
+     in.seekg(0, std::ios::end);
+     std::ios::pos_type ss = in.tellg();
+     size_t fsize = (size_t)ss;
+-    num = (uint32_t)(fsize / (dim + 1) / 4);
++
++    uint32_t first = 0;
++    uint32_t second = 0;
++    in.seekg(0, std::ios::beg);
++    in.read((char *)&first, 4);
++    in.read((char *)&second, 4);
++
++    bool default_binary = false;
++    if (first > 0 && second > 0) {
++        size_t expected = 8ULL + (size_t)first * second * sizeof(T);
++        default_binary = (expected == fsize);
++    }
++
++    size_t row_gap = 0;
++    if (default_binary) {
++        num = first;
++        dim = second;
++        in.seekg(8, std::ios::beg);
++    } else {
++        dim = first;
++        num = (uint32_t)(fsize / (dim + 1) / 4);
++        row_gap = 4;
++        in.seekg(0, std::ios::beg);
++    }
++
+     results.resize(num);
+     for (uint32_t i = 0; i < num; ++i) {
+         results[i].resize(dim);
+     }
+ 
+-    in.seekg(0, std::ios::beg);
+     for (size_t i = 0; i < num; ++i) {
+-        in.seekg(4, std::ios::cur);
++        if (row_gap) in.seekg(row_gap, std::ios::cur);
+         in.read((char *)results[i].data(), dim * 4);
+     }
+     in.close();
+diff -ruN '--exclude=build' '--exclude=bin' base/main.cc work/main.cc
+--- base/main.cc	2025-09-06 22:25:34.000000000 +0800
++++ work/main.cc	2026-07-25 23:46:19.572670785 +0800
+@@ -3,8 +3,16 @@
+ #include "include/strategy_include.h"
+ 
+ int main(int argc, char** argv) {
++    if (argc < 3) {
++        std::cout << "Usage: " << argv[0] << " <dataset> <strategy> [build-only]" << std::endl;
++        return 1;
++    }
+     std::string dataset = argv[1];
+     std::string solve_strategy = argv[2];
++    bool build_only = argc > 3 && std::string(argv[3]) == "build-only";
++    if (build_only) {
++        setenv("HNSW_FLASH_BUILD_ONLY", "1", 1);
++    }
+ 
+     // Initialization
+     std::string source_path;
+@@ -81,6 +89,9 @@
+ 
+     // Processing
+     strategy->solve();
++    if (build_only) {
++        return 0;
++    }
+     strategy->save_knn(knn_path);
+     strategy->recall(gt_path);
+     return 0;

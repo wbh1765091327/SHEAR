@@ -1,0 +1,4 @@
+
+thread 'main' (3849622) panicked at cmd_drivers/build_pipnn_index/src/main.rs:988:73:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

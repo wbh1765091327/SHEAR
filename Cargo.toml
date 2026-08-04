@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "shear-core",
+  "local-sync",
+  "apps/build_shear_index",
+  "apps/tessa_operator_replay",
+  "apps/search_shear_index",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+overflow-checks = false
+
+[workspace.dependencies]
+monoio = { git = "https://github.com/bytedance/monoio" }
+io-uring = "0.6"

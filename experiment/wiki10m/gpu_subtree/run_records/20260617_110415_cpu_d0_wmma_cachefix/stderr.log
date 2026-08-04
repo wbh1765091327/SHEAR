@@ -1,0 +1,1 @@
+Error: Index { err: "gpu-subtree D1+ child 2/1500 failed: run_len=11250 replayed_len=11250 unique_len=11250 extents=3 backend=Cuda assignment_backend=persistent-wmma-tf32 leaf_topk_backend=persistent-wmma-tf32: IndexError: CUDA stream synchronize after persistent subtree failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")" }

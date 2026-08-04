@@ -1,0 +1,17 @@
+[package]
+name = "search_shear_index"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shear_core = { path = "../../shear-core" }
+clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3" }
+byteorder = "1.5"
+bytemuck = "1.13"
+anyhow = "1"
+memmap2 = "0.5"
+
+[dev-dependencies]
+tempfile = "3.20"

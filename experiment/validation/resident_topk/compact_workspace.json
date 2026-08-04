@@ -1,0 +1,49 @@
+{
+  "mode": "compact_workspace",
+  "shape": {
+    "rows": 16775,
+    "dim": 1024,
+    "k": 2,
+    "leaves": 36,
+    "leaf_size_min": 140,
+    "leaf_size_max": 640,
+    "leaf_layout": "balanced",
+    "seed": 42
+  },
+  "repeat": 20,
+  "warmup": 3,
+  "device_id": 0,
+  "transfer_bytes_per_batch": {
+    "h2d_bytes": 68845176,
+    "dtoh_bytes": 268400
+  },
+  "transfer_bytes_total": {
+    "h2d_bytes": 1376903520,
+    "dtoh_bytes": 5368000
+  },
+  "leaf_layout": {
+    "min_leaf_size": 431,
+    "max_leaf_size": 510,
+    "avg_leaf_size": 465.97222222222223,
+    "sum_leaf_size_squared": 7829729,
+    "estimated_dot_products": 7812954,
+    "estimated_mul_adds": 8000464896
+  },
+  "timing_ms": {
+    "total_wall_ms": 1081,
+    "gpu_h2d_submit_wall_ms": 60,
+    "gpu_kernel_launch_wall_ms": 0,
+    "gpu_kernel_elapsed_ms": 1018,
+    "gpu_d2h_submit_wall_ms": 1019,
+    "gpu_post_d2h_sync_wall_ms": 0,
+    "gpu_stream_total_elapsed_ms": 1080
+  },
+  "throughput": {
+    "rows_per_second": 310298.5689408278,
+    "stream_rows_per_second": 310648.14814814815,
+    "kernel_rows_per_second": 329567.77996070724,
+    "batches_per_second": 18.497679221509856
+  },
+  "gpu_workspace_peak_bytes": 69113576,
+  "gpu_workspace_budget_bytes": 0
+}

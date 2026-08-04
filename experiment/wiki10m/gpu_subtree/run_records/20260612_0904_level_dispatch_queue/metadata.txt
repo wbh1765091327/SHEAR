@@ -1,0 +1,153 @@
+Run ID: 20260612_0904_level_dispatch_queue
+Run root: /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_0904_level_dispatch_queue
+Timestamp recorded: 2026-06-12T09:44:26+08:00
+Host: ccyilong
+Kernel: 6.8.0-111-generic
+GPU: NVIDIA GeForce RTX 4090
+GPU driver: 580.105.08
+GPU memory.total: 24564 MiB
+
+Git:
+- Commit: 90d4de0b5669adb0e5f9b50e670966d0f9c23194
+- Commit short: 90d4de0
+- Branch: gpu-next-tasks-2026-06-09
+- Worktree status: dirty, 70 changed/untracked entries at record time
+
+Implementation under validation:
+- GPU resident recursive queue large-node kernels are dispatched by current level node index.
+- The host no longer performs the mid-pass large-node-count D2H before launching large-node count/emit/scatter.
+- Large scratch reservation is node-indexed, so max_large_nodes equals max_queue_nodes.
+- C_CURRENT_MAX_NODE_ROWS and C_NEXT_MAX_NODE_ROWS are used to decide whether a level needs large-node kernels without a mid-pass status download.
+
+Baseline:
+- Run: /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_025458_two_tier_queue_admission_fix
+- Build wall: 32:51.76
+- Recall@10: 0.8560
+- QPS: 2571.5
+- queue_kernel_ms: 1133958
+- queue_status_d2h_ms: 1133637
+- workspace_peak_bytes: 294345040
+- queue_large_node_passes: 64
+- queue_large_node_count: 4177
+- queue_large_node_rows: 120602261
+
+Inputs:
+- Base: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
+  Header: 10000000 1024
+- Query: /data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
+  Header: 10000 1024
+- GT: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
+  Header: 10000 100
+  Size: 8000008 bytes
+  Max id: 9999985
+  Note: max id is computed over the first n*d u32 ids, matching search_mem_index::load_gt. The trailing distance payload is not used by search_mem_index recall.
+
+Build:
+- Binary: target/release/build_pipnn_index
+- Key args: --partitioner gpu-subtree --gpu-subtree-output compact-topk --pipnn-backend cuda --pipnn-gpu-device 0 --pipnn-gpu-workspace-budget-gb 16 --max-degree 64 --lbuild 100 --num-threads 8 --leaf-size-min 140 --leaf-size-max 640 --leaf-knn 2 --max-leaders 64 --psamp-fraction 0.05 --fanout-top 4 --fanout-second 2 --root-risk-candidate-rs 1,2,4 --seed 42
+- Exit status: 0
+- Wall time: 33:12.44
+- Max RSS: 15124916 kbytes
+- Mem index: /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_0904_level_dispatch_queue/index/_mem.index
+- Mem index bytes: 880638172
+- Profile: /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_0904_level_dispatch_queue/profile.json
+- Profile bytes: 7423
+- stderr.log bytes: 0
+
+Search:
+- Binary: target/release/search_mem_index
+- Key args: --index-path-prefix <run>/index --data-path /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin --query-file /data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin --gt-file /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin --result-path <run>/search_results.fbin --recall-at 10 --search-list-size 100 --num-threads 8
+- Exit status: 0
+- Wall time: 0:45.51
+- Max RSS: 79999488 kbytes
+- App search: 10000 queries in 3.96s
+- QPS: 2526.0
+- Recall@10: 0.8554
+- Search result bytes: 400008
+
+Profile pass/fail gates:
+- queue_passes > 0: pass (193)
+- queue_large_node_count > 0: pass (4183)
+- queue_large_node_passes > 1: pass (150)
+- queue_overflow_count == 0: pass
+- queue_overflow_flags == 0: pass
+- queue_fallback_reason_flags == 0: pass
+- resident_topk_metadata_h2d_bytes == 0: pass
+- cpu_cluster_merge_ms == 0: pass
+- cpu_leaf_global_to_local_ms == 0: pass
+- cpu_fallbacks == 0: pass
+- compact_unsupported_count == 0: pass
+- compact_unsupported_points == 0: pass
+
+Profile telemetry:
+- root_assignment_backend: cpu
+- subtree_assignment_backend: cuda
+- leaf_topk_backend: cuda
+- child_count: 64
+- child_points: 40000000
+- assignment_passes: 10596
+- leaf_count: 325548
+- compact_topk_batches: 325548
+- compact_topk_rows: 80000000
+- h2d_bytes: 164160000000
+- d2h_bytes: 1280000000
+- resident_h2d_bytes: 164160000000
+- resident_topk_metadata_h2d_bytes: 0
+- resident_topk_kernel_event_ms: 593149
+- resident_topk_d2h_submit_ms: 593208
+- topk_kernel_ms: 593149
+- topk_d2h_ms: 593208
+- total_ms: 1870878
+- queue_kernel_ms: 1152536
+- queue_status_d2h_ms: 1152209
+- queue_passes: 193
+- queue_peak_nodes: 524
+- queue_peak_rows: 2756362
+- queue_peak_leaf_rows: 2756362
+- queue_large_node_passes: 150
+- queue_large_node_count: 4183
+- queue_large_node_rows: 120587916
+- queue_small_node_passes: 64
+- queue_small_node_count: 6413
+- queue_small_node_rows: 12077196
+- queue_emitted_leaf_count: 325548
+- queue_emitted_leaf_rows: 80000000
+- queue_max_node_rows: 1378181
+- queue_global_row_capacity: 5512724
+- queue_small_node_limit: 4096
+- queue_admission_required_bytes: 368585040
+- queue_admission_budget_bytes: 17179869184
+- workspace_peak_bytes: 368585040
+- workspace_budget_bytes: 17179869184
+- host_control_ms: 114944
+- cpu_compact_flush_ms: 41723
+
+Stage and memory summary:
+- stage_ms.sketch_persist: 15440
+- stage_ms.streaming: 1946132
+- stage_ms.d0_ads_assignment: 20311
+- stage_ms.d1_materialize: 564
+- stage_ms.d2_replay: 227
+- stage_ms.emit: 1650
+- stage_ms.total: 1966231
+- memory.rss_hwm_kb: 15124916
+- memory.vm_peak_kb: 83891392
+
+Comparison vs baseline:
+- Build wall: 33:12.44 vs 32:51.76, delta +20.68s (+1.05%)
+- Search wall: 0:45.51 vs 0:45.69, delta -0.18s (-0.39%)
+- Recall@10: 0.8554 vs 0.8560, delta -0.0006
+- QPS: 2526.0 vs 2571.5, delta -45.5 (-1.77%)
+- queue_kernel_ms: 1152536 vs 1133958, delta +18578 (+1.64%)
+- queue_status_d2h_ms: 1152209 vs 1133637, delta +18572 (+1.64%)
+- workspace_peak_bytes: 368585040 vs 294345040, delta +74240000 (+25.22%)
+- queue_large_node_passes: 150 vs 64, delta +86 (+134.38%)
+- queue_large_node_count: 4183 vs 4177, delta +6 (+0.14%)
+- queue_large_node_rows: 120587916 vs 120602261, delta -14345 (-0.01%)
+
+Interpretation:
+- Correctness gates pass and Recall@10 remains within -0.0006 absolute of the baseline.
+- Build wall regressed by 20.68s.
+- queue_status_d2h_ms did not drop. The current telemetry still includes the blocking wait for prior GPU work when the host reads pass-boundary counters, so this field is not a pure PCIe D2H copy cost.
+- Workspace peak increased because node-indexed large scratch reserves by max_queue_nodes rather than compact large-node count capacity.
+- queue_large_node_passes increased because the host now launches large-node kernels for every level whose max node rows exceeds the small-node limit; the device filters non-large nodes inside those kernels.

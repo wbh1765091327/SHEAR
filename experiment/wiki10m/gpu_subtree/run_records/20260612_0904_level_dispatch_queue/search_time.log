@@ -1,0 +1,23 @@
+	Command being timed: "target/release/search_mem_index --index-path-prefix /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_0904_level_dispatch_queue/index --data-path /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin --query-file /data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin --gt-file /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin --result-path /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_0904_level_dispatch_queue/search_results.fbin --recall-at 10 --search-list-size 100 --num-threads 8"
+	User time (seconds): 35.64
+	System time (seconds): 36.35
+	Percent of CPU this job got: 158%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:45.51
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 79999488
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 20368014
+	Voluntary context switches: 126
+	Involuntary context switches: 388
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 808
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

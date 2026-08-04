@@ -1,0 +1,116 @@
+date=2026-06-14T05:50:26+08:00
+host=ccyilong
+cwd=/home/wbh/cppwork/PiPGANN
+git_commit=90d4de0b5669adb0e5f9b50e670966d0f9c23194
+git_status_short_begin
+ M AGENTS.md
+ M Cargo.lock
+ M Cargo.toml
+ M DeloANN/Cargo.toml
+ M DeloANN/benches/kmeans_bench.rs
+ M DeloANN/benches/neighbor_bench.rs
+ M DeloANN/src/algorithm/pipnn/compute_backend.rs
+ M DeloANN/src/algorithm/pipnn/direct_io.rs
+ M DeloANN/src/algorithm/pipnn/external_store.rs
+ M DeloANN/src/algorithm/pipnn/hash_prune.rs
+ M DeloANN/src/algorithm/pipnn/leaf_build.rs
+ M DeloANN/src/algorithm/pipnn/mod.rs
+ M DeloANN/src/algorithm/pipnn/params.rs
+ M DeloANN/src/algorithm/pipnn/point_store.rs
+ M DeloANN/src/algorithm/pipnn/rbc_partition.rs
+ M DeloANN/src/algorithm/pipnn/scheduler.rs
+ M DeloANN/src/algorithm/pipnn/spill_hashprune.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/assign.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/builder.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/manifest.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/point_store.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/reduce.rs
+ M DeloANN/src/buffer_pool/mmcache.rs
+ M DeloANN/src/index/evolve_index/evolve_builder.rs
+ M DeloANN/src/index/inmem_index/inmem_index_storage.rs
+ M DeloANN/src/index/inmem_index/mod.rs
+ M DeloANN/src/index/inmem_index/pipnn_oom_writer.rs
+ M DeloANN/src/index/mod.rs
+ M DeloANN/src/model/data_store/inmem_dataset.rs
+ M DeloANN/src/model/rabitq/rabitq_construct.rs
+ M DeloANN/tests/pipnn_oom_build_test.rs
+ M DeloANN/tests/rabitq_test.rs
+ M DeloANN/tests/topo_em_test.rs
+ M DeloANN/tests/velocache_test.rs
+ M README.md
+ M cmd_drivers/build_pipnn_index/Cargo.toml
+ M cmd_drivers/build_pipnn_index/src/main.rs
+ M cmd_drivers/build_topoem_index/src/main.rs
+ M cmd_drivers/eval_topoem_recall/src/main.rs
+ M cmd_drivers/search_disk_index/src/search_index_utils.rs
+ M docs/README.md
+ M docs/ROADMAP.md
+ M docs/pipnn_fanout_math.md
+AM docs/superpowers/specs/2026-06-10-gpu-subtree-compact-topk-design.md
+AM docs/superpowers/specs/2026-06-11-gpu-subtree-device-pipeline-optimization-design.md
+AM docs/superpowers/specs/2026-06-11-gpu-subtree-two-tier-recursive-queue-design.md
+A  docs/superpowers/specs/2026-06-13-gpu-persistent-large-node-recursive-split-design.md
+ M experiment/pipeline_runtime_baseline_2026_06_08/run_pipeline_runtime_baseline.py
+ M experiment/pipeline_runtime_baseline_2026_06_08/summary.json
+ M experiment/pipeline_runtime_baseline_2026_06_08/summary.md
+?? DeloANN/src/algorithm/pipnn/compact_replay.rs
+?? DeloANN/src/algorithm/pipnn/kmeans_partition.rs
+?? cmd_drivers/pipnn_cuda_compact_microbench/
+?? docs/forgeann_benchmark_handoff.md
+?? docs/forgeann_bottleneck.md
+?? docs/gpu/
+?? docs/pdf/
+?? docs/problem/
+?? docs/record/
+?? docs/runbooks/
+?? docs/superpowers/plans/2026-06-08-pipnn-profile-boundary-patch.md
+?? docs/superpowers/plans/2026-06-09-pipnn-kmeans-partition-channel.md
+?? docs/superpowers/plans/2026-06-09-pipnn-pipeline-profile-detail.md
+?? docs/superpowers/plans/2026-06-10-gpu-subtree-compact-topk.md
+?? docs/superpowers/plans/2026-06-11-gpu-resident-queue-oracle.md
+?? docs/superpowers/plans/2026-06-11-gpu-subtree-device-pipeline-optimization.md
+?? docs/superpowers/plans/2026-06-11-gpu-subtree-full-device-recursive-queue.md
+?? docs/superpowers/plans/2026-06-11-gpu-subtree-two-tier-recursive-queue.md
+?? docs/superpowers/plans/2026-06-12-gpu-subtree-persistent-depth-aware-fanout.md
+?? docs/superpowers/plans/2026-06-12-gpu-subtree-persistent-device-queue.md
+?? docs/superpowers/plans/2026-06-12-gpu-subtree-persistent-multi-cta-worker-pool.md
+?? docs/superpowers/plans/2026-06-12-gpu-subtree-persistent-strict-default.md
+?? docs/superpowers/plans/2026-06-13-gpu-persistent-large-node-recursive-split.md
+?? docs/superpowers/specs/2026-06-11-gpu-subtree-full-device-recursive-queue-design.md
+?? docs/superpowers/specs/2026-06-12-gpu-subtree-persistent-depth-aware-fanout-design.md
+?? docs/superpowers/specs/2026-06-12-gpu-subtree-persistent-device-queue-design.md
+?? docs/superpowers/specs/2026-06-12-gpu-subtree-persistent-multi-cta-worker-pool-design.md
+?? docs/superpowers/specs/2026-06-12-gpu-subtree-persistent-strict-default-design.md
+?? docs/superpowers/validation/
+?? experiment/g5_wiki_subset_2026_06_09/
+?? experiment/pipeline_runtime_baseline_2026_06_08/sift_200k_128.fbin
+?? experiment/wiki35m_full_nooom_2026_06_09/
+git_status_short_end
+base=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
+query=/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
+gt=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
+data_root=/data_nvme_kioxia/tyj/data
+staging_root=/data_staging/wbh
+run_root=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260614_055026_persistent_leaf_output_bound
+Sun Jun 14 05:50:26 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        On  |   00000000:01:00.0 Off |                  Off |
+| 67%   31C    P8             19W /  450W |     205MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A           41178      G   /usr/lib/xorg/Xorg                      101MiB |
+|    0   N/A  N/A           41408      G   /usr/bin/gnome-shell                     15MiB |
+|    0   N/A  N/A           49581      G   .../8274/usr/lib/firefox/firefox         25MiB |
++-----------------------------------------------------------------------------------------+

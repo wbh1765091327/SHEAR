@@ -1,0 +1,21 @@
+Reading (with alignment) bin file /data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin ...Metadata: #pts = 10000, #dims = 1024, aligned_dim = 1024... allocating aligned memory of 40960000 bytes... done. Copying data to mem_aligned buffer... done.
+Opened: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin, size: 8000008, cache_size: 8000008
+Reading truthset file /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin ...
+Metadata: #pts = 10000, #dims = 100... 
+L2: Using AVX2 distance computation DistanceL2Float
+Resizing took: 0.263937s
+From graph header, expected_file_size: 1314573804, _max_observed_degree: 32, _start: 7932297, file_frozen_pts: 0
+Loading vamana graph /data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_run/index/wiki10m.tagore.vamana....done. Index has 10000000 nodes and 318643445 out-edges, _start is set to 7932297
+Num frozen points:0 _nd: 10000000 _start: 7932297 size(_location_to_tag): 0 size(_tag_to_location):0 Max points: 10000000
+Index loaded
+Using 8 threads to search
+  Ls         QPS     Avg dist cmps  Mean Latency (mus)   99.9 Latency   Recall@10
+=================================================================================
+ 100     4603.46           3001.95             1736.30        4404.91       80.93
+Done searching. Now saving results 
+Writing bin: /data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/search_l100/tagore_search_100_idx_uint32.bin
+bin: #pts = 10000, #dims = 10, size = 400008B
+Finished writing bin.
+Writing bin: /data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/search_l100/tagore_search_100_dists_float.bin
+bin: #pts = 10000, #dims = 10, size = 400008B
+Finished writing bin.

@@ -1,0 +1,7 @@
+base_header:
+   10000000       1024
+query_header:
+      10000       1024
+gt_header:
+      10000        100
+gt ids ok: n=10000 d=100 max_id=9999985 size=8000008

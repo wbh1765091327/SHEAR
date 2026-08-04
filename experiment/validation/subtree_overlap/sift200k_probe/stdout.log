@@ -1,0 +1,80 @@
+Starting PiPNN index build with R: 64  Lbuild: 100  alpha: 1.2  #threads: 8 search_DRAM_budget: 0 build_DRAM_budget: 0
+PiPNN: building graph for 200000 points (dim=128) with R=64 Lbuild=100 m_hash_bits=12...
+2026-06-12T03:12:16.248393Z  INFO deloann::algorithm::pipnn: PiPNN build start: num_points=200000, num_threads=8
+2026-06-12T03:12:16.248406Z  INFO deloann::algorithm::pipnn: PiPNN detailed profiling enabled via DELOANN_PIPNN_PROFILE
+2026-06-12T03:12:16.248458Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [start]: points=200000 rss_bytes=8511488 vm_hwm_bytes=8511488 sketch_bytes=0 reservoir_bytes=0 active_scratch_bytes_estimate=408800000 max_full_matrix_leaf_size=3500
+2026-06-12T03:12:16.465879Z  INFO deloann::algorithm::pipnn: PiPNN OOM thread model: requested_threads=8 pool_threads=8 leaf_budget_threads=8 memory_budget_bytes=17179869184
+2026-06-12T03:12:16.599724Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [oom after sketches]: points=200000 rss_bytes=264564736 vm_hwm_bytes=368750592 sketch_bytes=88 reservoir_bytes=0 active_scratch_bytes_estimate=408800000 max_full_matrix_leaf_size=3500
+2026-06-12T03:12:16.667047Z  INFO deloann::algorithm::pipnn: PiPNN OOM resident-reservoir mode enabled: num_points=200000 reservoir_bytes_estimate=174400000 alloc_elapsed=67.312897ms
+2026-06-12T03:12:16.667105Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [oom after resident reservoirs]: points=200000 rss_bytes=432517120 vm_hwm_bytes=432517120 sketch_bytes=88 reservoir_bytes=174400000 active_scratch_bytes_estimate=408800000 max_full_matrix_leaf_size=3500
+2026-06-12T03:12:16.667712Z  INFO deloann::algorithm::pipnn::rbc_partition: GPU-subtree partition starting: 200,000 points, adaptive_c_max=640, min_recurse=1,280
+2026-06-12T03:12:16.735883Z  INFO deloann::algorithm::pipnn::rbc_partition: [rbc/par-spool] point_reads=64 range_reads=26 range_rows=200000 hit_ratio=1.00 workers=8 build_x_ms=93 gemm_ms=45 topk_ms=64 merge_ms=0 spool_write_ms=1 flush_ms=0 total_ms=67
+2026-06-12T03:12:37.404637Z  INFO deloann::algorithm::pipnn::rbc_partition: ========== RBC Partition Complete ==========
+2026-06-12T03:12:37.404654Z  INFO deloann::algorithm::pipnn::rbc_partition: Duration: 20s
+2026-06-12T03:12:37.404657Z  INFO deloann::algorithm::pipnn::rbc_partition: Points: 200,000
+2026-06-12T03:12:37.404660Z  INFO deloann::algorithm::pipnn::rbc_partition: Leaf points emitted: 0
+2026-06-12T03:12:37.404662Z  INFO deloann::algorithm::pipnn::rbc_partition: Leaves: 0
+2026-06-12T03:12:37.404664Z  INFO deloann::algorithm::pipnn::rbc_partition: Adaptive c_max: 640
+2026-06-12T03:12:37.404666Z  INFO deloann::algorithm::pipnn::rbc_partition: Min recurse size: 1,280
+2026-06-12T03:12:37.404668Z  INFO deloann::algorithm::pipnn::rbc_partition: Max depth: 0
+2026-06-12T03:12:37.404670Z  INFO deloann::algorithm::pipnn::rbc_partition: Max stack: 0
+2026-06-12T03:12:37.404673Z  INFO deloann::algorithm::pipnn::rbc_partition: Max cluster size: 200,000
+2026-06-12T03:12:37.404675Z  INFO deloann::algorithm::pipnn::rbc_partition: Oversized leaf events: 0 (forced_splits=0, total_points=0, largest=0)
+2026-06-12T03:12:37.404677Z  INFO deloann::algorithm::pipnn::rbc_partition: Leaf Termination Reasons:
+2026-06-12T03:12:37.404679Z  INFO deloann::algorithm::pipnn::rbc_partition:   Natural size (<=c_max): 0 (0.0%)
+2026-06-12T03:12:37.404682Z  INFO deloann::algorithm::pipnn::rbc_partition:   Min recurse (<=2xc_max): 0 (0.0%)
+2026-06-12T03:12:37.404684Z  INFO deloann::algorithm::pipnn::rbc_partition:   Shrink ratio insufficient: 0 (0.0%)
+2026-06-12T03:12:37.404686Z  INFO deloann::algorithm::pipnn::rbc_partition:   Small deep cluster: 0 (0.0%)
+2026-06-12T03:12:37.404688Z  INFO deloann::algorithm::pipnn::rbc_partition:   Max depth reached: 0 (0.0%)
+2026-06-12T03:12:37.404690Z  INFO deloann::algorithm::pipnn::rbc_partition:   Partition fallback: 0 (0.0%)
+2026-06-12T03:12:37.404692Z  INFO deloann::algorithm::pipnn::rbc_partition: Partitioning Efficiency:
+2026-06-12T03:12:37.404694Z  INFO deloann::algorithm::pipnn::rbc_partition:   Total attempts: 1
+2026-06-12T03:12:37.404696Z  INFO deloann::algorithm::pipnn::rbc_partition:   Success (first try): 1 (100.0%)
+2026-06-12T03:12:37.404706Z  INFO deloann::algorithm::pipnn::rbc_partition:   Success (after retry): 0 (0.0%)
+2026-06-12T03:12:37.404707Z  INFO deloann::algorithm::pipnn::rbc_partition:   Failed (empty merge): 0 (0.0%)
+2026-06-12T03:12:37.404708Z  INFO deloann::algorithm::pipnn::rbc_partition:   Failed (no split): 0 (0.0%)
+2026-06-12T03:12:37.404710Z  INFO deloann::algorithm::pipnn::rbc_partition:   Retry escalations: 0
+2026-06-12T03:12:37.404711Z  INFO deloann::algorithm::pipnn::rbc_partition: Merge Effectiveness:
+2026-06-12T03:12:37.404712Z  INFO deloann::algorithm::pipnn::rbc_partition:   Pre-merge clusters: 64
+2026-06-12T03:12:37.404713Z  INFO deloann::algorithm::pipnn::rbc_partition:   Post-merge clusters: 64 (0.0% reduction)
+2026-06-12T03:12:37.404715Z  INFO deloann::algorithm::pipnn::rbc_partition:   Empty clusters dropped: 0
+2026-06-12T03:12:37.404716Z  INFO deloann::algorithm::pipnn::rbc_partition:   No-op merges: 1 (100.0%)
+2026-06-12T03:12:37.404718Z  INFO deloann::algorithm::pipnn::rbc_partition: Adaptive Parameters:
+2026-06-12T03:12:37.404719Z  INFO deloann::algorithm::pipnn::rbc_partition:   Leaders per attempt (avg): 64.0
+2026-06-12T03:12:37.404720Z  INFO deloann::algorithm::pipnn::rbc_partition:   Max leaders used: 64
+2026-06-12T03:12:37.404722Z  INFO deloann::algorithm::pipnn::rbc_partition:   Fanout per attempt (avg): 4.0
+2026-06-12T03:12:37.404723Z  INFO deloann::algorithm::pipnn::rbc_partition:   Max fanout used: 4
+2026-06-12T03:12:37.404724Z  INFO deloann::algorithm::pipnn::rbc_partition: Overlap Analysis:
+2026-06-12T03:12:37.404726Z  INFO deloann::algorithm::pipnn::rbc_partition:   Assignments before dedup: 1,000,000
+2026-06-12T03:12:37.404727Z  INFO deloann::algorithm::pipnn::rbc_partition:   Assignments after dedup: 1,000,000
+2026-06-12T03:12:37.404728Z  INFO deloann::algorithm::pipnn::rbc_partition:   Overlap ratio: 0.0%
+2026-06-12T03:12:37.404729Z  INFO deloann::algorithm::pipnn::rbc_partition: Dedup Activity:
+2026-06-12T03:12:37.404731Z  INFO deloann::algorithm::pipnn::rbc_partition:   Runs: 0 | Skipped: 0
+2026-06-12T03:12:37.404732Z  INFO deloann::algorithm::pipnn::rbc_partition:   Assignments before/after: 0 -> 0 (removed=0 / 0.000%)
+2026-06-12T03:12:37.404733Z  INFO deloann::algorithm::pipnn::rbc_partition: Phase Timing:
+2026-06-12T03:12:37.404735Z  INFO deloann::algorithm::pipnn::rbc_partition:   Cur dedup: 0s
+2026-06-12T03:12:37.404736Z  INFO deloann::algorithm::pipnn::rbc_partition:   Cluster assign: 0s
+2026-06-12T03:12:37.404737Z  INFO deloann::algorithm::pipnn::rbc_partition:   Merge clusters: 0s
+2026-06-12T03:12:37.404739Z  INFO deloann::algorithm::pipnn::rbc_partition:   Merged dedup: 0s
+2026-06-12T03:12:37.404740Z  INFO deloann::algorithm::pipnn::rbc_partition:   GEMM profile: total=0s build_x=0s gemm=0s topk=0s merge=0s blocks=32
+2026-06-12T03:12:37.404742Z  INFO deloann::algorithm::pipnn::rbc_partition:                 spool_write=0s flush=0s
+2026-06-12T03:12:37.404744Z  INFO deloann::algorithm::pipnn::rbc_partition:   Resident subtrees: hits=0 points=0 bytes=0 read=0s compute=0s fallbacks=0 permit_wait=0s
+2026-06-12T03:12:37.404745Z  INFO deloann::algorithm::pipnn::rbc_partition: Leaf Size Distribution:
+2026-06-12T03:12:37.404747Z  INFO deloann::algorithm::pipnn::rbc_partition:   [1-1K]: 0 (0.0%)
+2026-06-12T03:12:37.404748Z  INFO deloann::algorithm::pipnn::rbc_partition:   [1K-5K]: 0 (0.0%)
+2026-06-12T03:12:37.404749Z  INFO deloann::algorithm::pipnn::rbc_partition:   [5K-10K]: 0 (0.0%)
+2026-06-12T03:12:37.404751Z  INFO deloann::algorithm::pipnn::rbc_partition:   [10K-20K]: 0 (0.0%)
+2026-06-12T03:12:37.404752Z  INFO deloann::algorithm::pipnn::rbc_partition:   [20K-30K]: 0 (0.0%)
+2026-06-12T03:12:37.404753Z  INFO deloann::algorithm::pipnn::rbc_partition:   [30K+]: 0 (0.0%)
+2026-06-12T03:12:37.404754Z  INFO deloann::algorithm::pipnn::rbc_partition:   Min/Avg/Max leaf size: 0/0.0/0
+2026-06-12T03:12:37.404755Z  INFO deloann::algorithm::pipnn::rbc_partition: ==============================================
+2026-06-12T03:12:37.404764Z DEBUG deloann::algorithm::pipnn::rbc_partition: Depth Distribution:
+2026-06-12T03:12:37.404765Z DEBUG deloann::algorithm::pipnn::rbc_partition:   Depth 0: leaves=0 processed=1 points=0 avg_leaf_size=0.0 min=200,000 max=200,000
+2026-06-12T03:12:37.404856Z  INFO deloann::algorithm::pipnn: PiPNN OOM resident-reservoir streaming done: elapsed=20.737747518s
+2026-06-12T03:12:37.438897Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [oom after resident emit]: points=200000 rss_bytes=638173184 vm_hwm_bytes=642510848 sketch_bytes=88 reservoir_bytes=0 active_scratch_bytes_estimate=408800000 max_full_matrix_leaf_size=3500
+2026-06-12T03:12:37.438907Z  INFO deloann::algorithm::pipnn: PiPNN OOM point io_uring gather: batches=0 windows=0 bytes=0 fallbacks=0
+2026-06-12T03:12:37.439363Z  INFO deloann::algorithm::pipnn: PiPNN OOM completed with resident reservoirs: estimated_bytes=174400000 budget_bytes=17179869184
+2026-06-12T03:12:37.443078Z  INFO deloann::index::inmem_index::pipnn_oom_build: PiPNN lightweight OOM graph build done via direct point store: num_points=200000 output="/data_staging/wbh/gpu_subtree_overlap_validation_20260612/sift200k_probe/index/_mem.index"
+PiPNN: graph build done in 21.274096706 seconds
+PiPNN: OOM graph written directly to "/data_staging/wbh/gpu_subtree_overlap_validation_20260612/sift200k_probe/index/_mem.index"
+PiPNN: index build completed successfully

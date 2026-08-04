@@ -1,0 +1,10 @@
+diskann_prefix=/data_staging/wbh/tagore_wiki10m_measurement/smoke_partition_10k/diskann_part/wiki10k
+tagore_out=/data_staging/wbh/tagore_wiki10m_measurement/smoke_partition_10k/tagore_input
+num_points=10000
+dim=1024
+clusters=10
+min_cluster_count=949
+max_cluster_count=3613
+total_cluster_points=20000
+centers_path=/data_staging/wbh/tagore_wiki10m_measurement/smoke_partition_10k/tagore_input/centers.bin
+cluster_prefix=/data_staging/wbh/tagore_wiki10m_measurement/smoke_partition_10k/tagore_input/clusters/cluster_

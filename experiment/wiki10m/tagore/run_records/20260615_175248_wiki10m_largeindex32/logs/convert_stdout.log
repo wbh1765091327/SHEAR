@@ -1,0 +1,3 @@
+converted clusters=32 min_count=190821 max_count=1134094 total=20000000
+centers_path=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_input/centers.bin
+cluster_prefix=/data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_input/clusters/cluster_

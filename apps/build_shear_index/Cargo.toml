@@ -1,0 +1,18 @@
+[package]
+name = "build_shear_index"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cuda = ["shear_core/pipnn_cuda"]
+
+[dependencies]
+shear_core = { path = "../../shear-core" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.0", features = ["derive"] }
+rand = "0.9"
+
+[dev-dependencies]
+rand = "0.9"

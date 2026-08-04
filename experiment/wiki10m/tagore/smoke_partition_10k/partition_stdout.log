@@ -1,0 +1,9 @@
+Opened: /data_staging/wbh/tagore_wiki10m_measurement/smoke_partition_10k/wiki_10k_1024.fbin, size: 40960008, cache_size: 40960008
+Processing global k-means (kmeans_partitioning Step)
+Saving global k-center pivots
+Writing bin: /data_staging/wbh/tagore_wiki10m_measurement/smoke_partition_10k/diskann_part/wiki10k_centroids.bin
+bin: #pts = 10, #dims = 1024, size = 40968B
+Finished writing bin.
+Opened: /data_staging/wbh/tagore_wiki10m_measurement/smoke_partition_10k/wiki_10k_1024.fbin, size: 40960008, cache_size: 40960008
+Actual shard sizes: 1338 949 2660 3613 2107 2122 1768 2392 1735 1316 
+ Partitioned 10000 with replication factor 2 to get 20000 points across 10 shards 

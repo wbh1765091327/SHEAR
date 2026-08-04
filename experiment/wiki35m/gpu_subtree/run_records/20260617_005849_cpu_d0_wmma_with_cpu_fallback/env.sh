@@ -1,0 +1,16 @@
+export DATA_ROOT=/data_nvme_kioxia/tyj/data
+export STAGING_ROOT=/data_staging/wbh
+export WIKI35M_DIR=/data_nvme_kioxia/tyj/data/wiki-1024-35M
+export WIKI35M_BASE=/data_nvme_kioxia/tyj/data/wiki-1024-35M/en_base.fbin
+export WIKI35M_QUERY_PATH=/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
+export WIKI35M_GT_PATH=/data_nvme_kioxia/tyj/data/wiki-1024-35M/gt100.bin
+export RUN_ID=20260617_005849_cpu_d0_wmma_with_cpu_fallback
+export RUN_ROOT=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback
+export INDEX_DIR=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/index
+export OOM_DIR=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/oom
+export PROFILE_JSON=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/profile.json
+export BUILD_STDOUT=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/stdout.log
+export BUILD_STDERR=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/stderr.log
+export TIME_LOG=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/time.log
+export SEARCH_LOG=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/search.log
+export SEARCH_RESULTS=/data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260617_005849_cpu_d0_wmma_with_cpu_fallback/search_results.fbin

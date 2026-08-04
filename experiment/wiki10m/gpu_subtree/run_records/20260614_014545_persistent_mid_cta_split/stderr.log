@@ -1,0 +1,1 @@
+Error: Index { err: "CUDA persistent subtree overflow: resident_rows=249439 overflow_flags=0x4 leaf_rows=497802 leaf_count=31182 partition_pops=498 leaf_pushes=31180 topk_pops=31179 assignment_passes=0 max_active_points=0 persistent_kernel_event_ms=49038.398" }

@@ -1,0 +1,12 @@
+
+[2026-06-16T16:03:40+08:00] build start persistent-wmma-tf32
+[2026-06-16T16:09:44+08:00] search start persistent-wmma-tf32
+[2026-06-16T16:10:33+08:00] done persistent-wmma-tf32
+
+[2026-06-16T16:10:33+08:00] build start persistent-tiled-gemm-fp32
+[2026-06-16T16:17:19+08:00] search start persistent-tiled-gemm-fp32
+[2026-06-16T16:18:08+08:00] done persistent-tiled-gemm-fp32
+
+[2026-06-16T16:18:08+08:00] build start persistent-cuvs-bruteforce-fp32
+[2026-06-16T16:28:37+08:00] search start persistent-cuvs-bruteforce-fp32
+[2026-06-16T16:29:24+08:00] done persistent-cuvs-bruteforce-fp32

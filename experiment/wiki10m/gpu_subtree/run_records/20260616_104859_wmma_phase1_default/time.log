@@ -1,0 +1,23 @@
+	Command being timed: "target/release/build_pipnn_index --data-type float --dist-fn l2 --data-path /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin --index-path-prefix /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_104859_wmma_phase1_default/index --overwrite --oom-enable --oom-memory-budget-gb 200 --oom-temp-dir /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_104859_wmma_phase1_default/oom --oom-profile-json /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260616_104859_wmma_phase1_default/profile.json --max-degree 64 --lbuild 100 --num-threads 8 --leaf-size-min 140 --leaf-size-max 640 --leaf-knn 2 --max-leaders 64 --psamp-fraction 0.05 --fanout-top 4 --fanout-second 2 --root-risk-candidate-rs 1,2,4 --seed 42 --partitioner gpu-subtree --gpu-subtree-leaf-topk-backend persistent-wmma-tf32 --pipnn-backend cuda --pipnn-gpu-device 0 --pipnn-gpu-workspace-budget-gb 16"
+	User time (seconds): 552.76
+	System time (seconds): 160.04
+	Percent of CPU this job got: 121%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 9:44.46
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 15096268
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 62309846
+	Voluntary context switches: 22476
+	Involuntary context switches: 3520
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 3190168
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

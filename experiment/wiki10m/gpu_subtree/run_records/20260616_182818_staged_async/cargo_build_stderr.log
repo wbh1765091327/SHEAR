@@ -1,0 +1,253 @@
+   Compiling deloann v0.1.0 (/home/wbh/cppwork/PiPGANN/DeloANN)
+warning: unused import: `std::os::unix::fs::OpenOptionsExt`
+ --> DeloANN/src/buffer_pool/mmcache.rs:7:5
+  |
+7 | use std::os::unix::fs::OpenOptionsExt;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `error`
+  --> DeloANN/src/buffer_pool/recache.rs:14:22
+   |
+14 | use tracing::{debug, error, info};
+   |                      ^^^^^
+
+warning: the feature `vec_into_raw_parts` has been stable since 1.93.0 and no longer requires an attribute to enable
+ --> DeloANN/src/lib.rs:7:12
+  |
+7 | #![feature(vec_into_raw_parts)]
+  |            ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: variable does not need to be mutable
+   --> DeloANN/src/algorithm/pipnn/spill_hashprune.rs:625:5
+    |
+625 |     mut on_point_done: F,
+    |     ----^^^^^^^^^^^^^
+    |     |
+    |     help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `compact_topk_batch_from_leaf_gram` is never used
+  --> DeloANN/src/algorithm/pipnn/compute_backend.rs:16:4
+   |
+16 | fn compact_topk_batch_from_leaf_gram(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `GPU_PERSISTENT_FALLBACK_REASON_LARGE_SUBTREE` is never used
+   --> DeloANN/src/algorithm/pipnn/compute_backend.rs:158:18
+    |
+158 | pub(crate) const GPU_PERSISTENT_FALLBACK_REASON_LARGE_SUBTREE: u32 = 1 << 1;
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GPU_PERSISTENT_LEAF_TILE_ROWS` is never used
+   --> DeloANN/src/algorithm/pipnn/compute_backend.rs:174:18
+    |
+174 | pub(crate) const GPU_PERSISTENT_LEAF_TILE_ROWS: usize = 128;
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `plan_gpu_persistent_subtree_resident_admission` is never used
+   --> DeloANN/src/algorithm/pipnn/compute_backend.rs:628:15
+    |
+628 | pub(crate) fn plan_gpu_persistent_subtree_resident_admission(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CompactTopKLeafBatchPlan` is never constructed
+   --> DeloANN/src/algorithm/pipnn/compute_backend.rs:854:19
+    |
+854 | pub(crate) struct CompactTopKLeafBatchPlan {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `plan_compact_topk_leaf_batches` is never used
+   --> DeloANN/src/algorithm/pipnn/compute_backend.rs:863:15
+    |
+863 | pub(crate) fn plan_compact_topk_leaf_batches(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `assignment_backend`, `leaf_topk_backend`, and `child_points` are never read
+   --> DeloANN/src/algorithm/pipnn/compute_backend.rs:973:16
+    |
+972 | pub(crate) struct GpuSubtreeTopKProfile {
+    |                   --------------------- fields in this struct
+973 |     pub(crate) assignment_backend: PiPNNGpuSubtreeAssignmentBackend,
+    |                ^^^^^^^^^^^^^^^^^^
+974 |     pub(crate) leaf_topk_backend: PiPNNGpuSubtreeLeafTopKBackend,
+    |                ^^^^^^^^^^^^^^^^^
+975 |     pub(crate) child_points: usize,
+    |                ^^^^^^^^^^^^
+    |
+    = note: `GpuSubtreeTopKProfile` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `merge` is never used
+    --> DeloANN/src/algorithm/pipnn/compute_backend.rs:1255:19
+     |
+1130 | impl GpuSubtreeTopKProfile {
+     | -------------------------- method in this implementation
+...
+1255 |     pub(crate) fn merge(&mut self, other: Self) {
+     |                   ^^^^^
+
+warning: field `cpu_leaf_global_to_local_wall` is never read
+    --> DeloANN/src/algorithm/pipnn/compute_backend.rs:1332:5
+     |
+1331 | struct ResidentSubtreeTopKHostProfile {
+     |        ------------------------------ field in this struct
+1332 |     cpu_leaf_global_to_local_wall: Duration,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `ResidentSubtreeTopKHostProfile` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `persistent_multileaf_replay_function_default` and `persistent_multileaf_replay_function_cta_b` are never read
+    --> DeloANN/src/algorithm/pipnn/compute_backend.rs:6196:9
+     |
+6183 |     struct CudaGemmEngine {
+     |            -------------- fields in this struct
+...
+6196 |         persistent_multileaf_replay_function_default: Option<Arc<CudaFunction>>,
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+6197 |         persistent_multileaf_replay_function_cta_b: Option<Arc<CudaFunction>>,
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `persistent_multileaf_replay_function` and `run_persistent_multileaf_topk_replay` are never used
+    --> DeloANN/src/algorithm/pipnn/compute_backend.rs:6839:12
+     |
+6707 |     impl CudaGemmEngine {
+     |     ------------------- methods in this implementation
+...
+6839 |         fn persistent_multileaf_replay_function(
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+8120 |         fn run_persistent_multileaf_topk_replay(
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `file` is never read
+  --> DeloANN/src/algorithm/pipnn/external_store.rs:35:12
+   |
+35 |     Mmap { file: File, mmap: Mmap },
+   |     ----   ^^^^
+   |     |
+   |     field in this variant
+   |
+   = note: `SketchBacking` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `choose_gemm_tile_sizes` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:1066:4
+     |
+1066 | fn choose_gemm_tile_sizes(num_leaders: usize, dim: usize) -> (usize, usize) {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `choose_gemm_tile_sizes_with_override` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:1248:15
+     |
+1248 | pub(crate) fn choose_gemm_tile_sizes_with_override(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `seed` is never read
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:1394:16
+     |
+1391 | pub(crate) struct GpuSubtreeChildRun {
+     |                   ------------------ field in this struct
+...
+1394 |     pub(crate) seed: u64,
+     |                ^^^^
+     |
+     = note: `GpuSubtreeChildRun` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `materialize_merged_children_from_spool` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:2563:4
+     |
+2563 | fn materialize_merged_children_from_spool(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `record_stack_size` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:4332:8
+     |
+4148 | impl PartitionStats {
+     | ------------------- method in this implementation
+...
+4332 |     fn record_stack_size(&mut self, stack_size: usize) {
+     |        ^^^^^^^^^^^^^^^^^
+
+warning: function `rbc_partition_gpu_subtree_streaming` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:4484:15
+     |
+4484 | pub(crate) fn rbc_partition_gpu_subtree_streaming(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `compute_clusters_gemm_cpu` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:5461:15
+     |
+5461 | pub(super) fn compute_clusters_gemm_cpu(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `log_via_progress_bar` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:6835:4
+     |
+6835 | fn log_via_progress_bar(pb: &ProgressBar, level: Level, message: impl Into<String>) {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `log_partition_warning` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:6849:4
+     |
+6849 | fn log_partition_warning(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `log_debug_snapshot` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:6871:4
+     |
+6871 | fn log_debug_snapshot(
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `format_progress_line` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:7326:4
+     |
+7326 | fn format_progress_line(
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `format_depth_range` is never used
+    --> DeloANN/src/algorithm/pipnn/rbc_partition.rs:7340:4
+     |
+7340 | fn format_depth_range(stack: &[(Vec<u32>, usize, usize)], current_depth: usize) -> String {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: field `rabitq_table` is never read
+  --> DeloANN/src/index/evolve_index/mmap_index.rs:52:5
+   |
+32 | pub struct MmapIndex {
+   |            --------- field in this struct
+...
+52 |     rabitq_table: Option<RabitQTable>,
+   |     ^^^^^^^^^^^^
+
+warning: method `get_node_buf` is never used
+   --> DeloANN/src/index/evolve_index/mmap_index.rs:800:8
+    |
+115 | impl MmapIndex {
+    | -------------- method in this implementation
+...
+800 |     fn get_node_buf(
+    |        ^^^^^^^^^^^^
+
+warning: feature `vec_into_chunks` is declared but not used
+ --> DeloANN/src/lib.rs:5:12
+  |
+5 | #![feature(vec_into_chunks)]
+  |            ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_features)]` (part of `#[warn(unused)]`) on by default
+
+warning: feature `linked_list_retain` is declared but not used
+ --> DeloANN/src/lib.rs:9:12
+  |
+9 | #![feature(linked_list_retain)]
+  |            ^^^^^^^^^^^^^^^^^^
+
+warning: `deloann` (lib) generated 32 warnings (run `cargo fix --lib -p deloann` to apply 3 suggestions)
+   Compiling search_mem_index v0.1.0 (/home/wbh/cppwork/PiPGANN/cmd_drivers/search_mem_index)
+   Compiling build_pipnn_index v0.1.0 (/home/wbh/cppwork/PiPGANN/cmd_drivers/build_pipnn_index)
+    Finished `release` profile [optimized] target(s) in 47.39s

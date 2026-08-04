@@ -1,0 +1,6 @@
+Base data: 10000000 points, dim=1024
+Graph: 10000000 nodes, start=6843085, max_degree=64
+Queries: 10000
+Search: 10000 queries in 5.02s (1991.0 QPS)
+Recall@10: 0.9311
+Results saved to "/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260617_192834_fanout6_leaf_wmma_b_sweep/per_warp_b/search/search_l100_results.fbin"

@@ -1,0 +1,9 @@
+Opened: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin, size: 40960000008, cache_size: 67108864
+Processing global k-means (kmeans_partitioning Step)
+Saving global k-center pivots
+Writing bin: /data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/diskann_part/wiki10m_centroids.bin
+bin: #pts = 32, #dims = 1024, size = 131080B
+Finished writing bin.
+Opened: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin, size: 40960000008, cache_size: 67108864
+Actual shard sizes: 712411 376696 848584 1013489 499991 822249 316022 429065 190821 609711 512121 611741 597085 1134094 607133 576731 732623 686295 375865 982213 561341 1131034 741742 726218 409582 391656 908770 822614 562692 544793 224045 340573 
+ Partitioned 10000000 with replication factor 2 to get 20000000 points across 32 shards 

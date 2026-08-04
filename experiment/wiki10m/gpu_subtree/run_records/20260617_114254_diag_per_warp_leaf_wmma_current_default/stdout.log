@@ -1,0 +1,11 @@
+Starting PiPNN index build with R: 64  Lbuild: 100  alpha: 1.2  #threads: 8 search_DRAM_budget: 0 build_DRAM_budget: 0
+PiPNN: building graph for 10000000 points (dim=1024) with R=64 Lbuild=100 m_hash_bits=12...
+2026-06-17T03:43:21.104891Z  INFO deloann::algorithm::pipnn: PiPNN build start: num_points=10000000, num_threads=8
+2026-06-17T03:43:21.104953Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [start]: points=10000000 rss_bytes=12894208 vm_hwm_bytes=16252928 sketch_bytes=0 reservoir_bytes=0 active_scratch_bytes_estimate=509152000 max_full_matrix_leaf_size=3500
+2026-06-17T03:43:21.303821Z  INFO deloann::algorithm::pipnn: PiPNN OOM thread model: requested_threads=8 pool_threads=8 leaf_budget_threads=8 memory_budget_bytes=214748364800
+2026-06-17T03:43:36.206087Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [oom after sketches]: points=10000000 rss_bytes=749592576 vm_hwm_bytes=1266610176 sketch_bytes=88 reservoir_bytes=0 active_scratch_bytes_estimate=509152000 max_full_matrix_leaf_size=3500
+2026-06-17T03:43:39.545992Z  INFO deloann::algorithm::pipnn: PiPNN OOM resident-reservoir mode enabled: num_points=10000000 reservoir_bytes_estimate=8720000000 alloc_elapsed=3.339888965s
+2026-06-17T03:43:39.546073Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [oom after resident reservoirs]: points=10000000 rss_bytes=9149501440 vm_hwm_bytes=9149501440 sketch_bytes=88 reservoir_bytes=8720000000 active_scratch_bytes_estimate=509152000 max_full_matrix_leaf_size=3500
+2026-06-17T03:43:39.559495Z  INFO deloann::algorithm::pipnn::rbc_partition: GPU-subtree partition starting: 10,000,000 points, adaptive_c_max=2,560, min_recurse=5,120
+2026-06-17T03:44:29.875261Z  INFO deloann::algorithm::pipnn::rbc_partition: [rbc/par-spool] point_reads=1500 range_reads=9921 range_rows=10000000 hit_ratio=1.00 workers=8 build_x_ms=36464 gemm_ms=315237 topk_ms=32482 merge_ms=0 spool_write_ms=125 flush_ms=0 total_ms=50313
+PiPNN: error: Index { err: "gpu-subtree D1+ child 2/1500 failed: run_len=11250 replayed_len=11250 unique_len=11250 extents=3 backend=Cuda assignment_backend=persistent-wmma-tf32 leaf_topk_backend=persistent-wmma-tf32: IndexError: CUDA stream synchronize after persistent subtree failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")" }

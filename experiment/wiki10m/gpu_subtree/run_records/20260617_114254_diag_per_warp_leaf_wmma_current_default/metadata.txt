@@ -1,0 +1,9 @@
+purpose=diagnose_per_warp_leaf_wmma_current_default
+run_root=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260617_114254_diag_per_warp_leaf_wmma_current_default
+base=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
+max_leaders=1500
+fanout=8,3
+leaf_topk_backend=persistent-wmma-tf32
+assignment_backend=persistent-wmma-tf32
+wmma_b_strategy=per-warp
+exit_status=1

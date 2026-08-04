@@ -1,0 +1,23 @@
+	Command being timed: "/home/wbh/cppwork/DiskANN-OOM/build/apps/search_memory_index --data_type float --dist_fn l2 --index_path_prefix /data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/tagore_run/index/wiki10m.tagore.vamana --result_path /data_staging/wbh/tagore_wiki10m_measurement/runs/20260615_175248_wiki10m_largeindex32/search_l100/tagore_search --query_file /data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin --gt_file /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin --recall_at 10 --search_list 100 --num_threads 8"
+	User time (seconds): 24.71
+	System time (seconds): 28.26
+	Percent of CPU this job got: 106%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:49.92
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 42041204
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 10510346
+	Voluntary context switches: 103107
+	Involuntary context switches: 259
+	Swaps: 0
+	File system inputs: 57256088
+	File system outputs: 1568
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

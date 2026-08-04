@@ -1,0 +1,75 @@
+[4140265] build_pipnn_index@127.0.0.1
+  gpu_persistent_subtree_topk (256, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.9
+    Section: Command line profiler metrics
+    -------------------------------------------------------------------- ----------- --------------
+    Metric Name                                                          Metric Unit   Metric Value
+    -------------------------------------------------------------------- ----------- --------------
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.avg                             1450316.59
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.max                                3047953
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.min                                 249419
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum                              185640523
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.avg                               10378.50
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.max                                  21888
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.min                                   1792
+    l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum                                1328448
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.avg                                 7395407.88
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.max                                   13335856
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.min                                    2346376
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum                                  946612209
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.avg                                 1760356.64
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.max                                    3270709
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.min                                     424921
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_st.sum                                  225325650
+    sm__inst_executed_pipe_tensor_op_hmma_v2.avg                                inst         658656
+    sm__inst_executed_pipe_tensor_op_hmma_v2.max                                inst        1392640
+    sm__inst_executed_pipe_tensor_op_hmma_v2.min                                inst         200704
+    sm__inst_executed_pipe_tensor_op_hmma_v2.sum                                inst       84307968
+    sm__pipe_tensor_cycles_active_v2.avg                                       cycle        5269248
+    sm__pipe_tensor_cycles_active_v2.max                                       cycle       11141120
+    sm__pipe_tensor_cycles_active_v2.min                                       cycle        1605632
+    sm__pipe_tensor_cycles_active_v2.sum                                       cycle      674463744
+    sm__warps_active.avg                                                        warp 39252757467.57
+    sm__warps_active.max                                                        warp    39385474083
+    sm__warps_active.min                                                        warp    39186130272
+    sm__warps_active.sum                                                        warp  5024352955849
+    smsp__inst_executed_pipe_tensor_op_hmma_v2.avg                              inst         164664
+    smsp__inst_executed_pipe_tensor_op_hmma_v2.max                              inst         348160
+    smsp__inst_executed_pipe_tensor_op_hmma_v2.min                              inst          50176
+    smsp__inst_executed_pipe_tensor_op_hmma_v2.sum                              inst       84307968
+    smsp__sass_data_bytes_mem_shared_op_ld.avg                                 Mbyte          57.25
+    smsp__sass_data_bytes_mem_shared_op_ld.max                                 Mbyte          82.84
+    smsp__sass_data_bytes_mem_shared_op_ld.min                                 Mbyte          31.17
+    smsp__sass_data_bytes_mem_shared_op_ld.sum                                 Gbyte          29.31
+    smsp__sass_data_bytes_mem_shared_op_st.avg                                 Mbyte          42.53
+    smsp__sass_data_bytes_mem_shared_op_st.max                                 Mbyte          62.77
+    smsp__sass_data_bytes_mem_shared_op_st.min                                 Mbyte          21.68
+    smsp__sass_data_bytes_mem_shared_op_st.sum                                 Gbyte          21.78
+    smsp__sass_inst_executed_op_shared_ld.avg                                   inst     1167286.28
+    smsp__sass_inst_executed_op_shared_ld.max                                   inst        1581613
+    smsp__sass_inst_executed_op_shared_ld.min                                   inst         593550
+    smsp__sass_inst_executed_op_shared_ld.sum                                   inst      597650574
+    smsp__sass_inst_executed_op_shared_st.avg                                   inst      396690.45
+    smsp__sass_inst_executed_op_shared_st.max                                   inst         649993
+    smsp__sass_inst_executed_op_shared_st.min                                   inst         168948
+    smsp__sass_inst_executed_op_shared_st.sum                                   inst      203105512
+    smsp__sass_l1tex_data_bank_conflicts_pipe_lsu_mem_shared_op_ldsm.avg                          0
+    smsp__sass_l1tex_data_bank_conflicts_pipe_lsu_mem_shared_op_ldsm.max                          0
+    smsp__sass_l1tex_data_bank_conflicts_pipe_lsu_mem_shared_op_ldsm.min                          0
+    smsp__sass_l1tex_data_bank_conflicts_pipe_lsu_mem_shared_op_ldsm.sum                          0
+    smsp__warp_issue_stalled_barrier_per_warp_active.max_rate                                     1
+    smsp__warp_issue_stalled_barrier_per_warp_active.pct                           %          76.32
+    smsp__warp_issue_stalled_barrier_per_warp_active.ratio                                     0.76
+    smsp__warp_issue_stalled_long_scoreboard_per_warp_active.max_rate                             1
+    smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct                   %          20.53
+    smsp__warp_issue_stalled_long_scoreboard_per_warp_active.ratio                             0.21
+    smsp__warp_issue_stalled_mio_throttle_per_warp_active.max_rate                                1
+    smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct                      %           0.01
+    smsp__warp_issue_stalled_mio_throttle_per_warp_active.ratio                                0.00
+    smsp__warp_issue_stalled_short_scoreboard_per_warp_active.max_rate                            1
+    smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct                  %           0.45
+    smsp__warp_issue_stalled_short_scoreboard_per_warp_active.ratio                            0.00
+    smsp__warp_issue_stalled_wait_per_warp_active.max_rate                                        1
+    smsp__warp_issue_stalled_wait_per_warp_active.pct                              %           1.66
+    smsp__warp_issue_stalled_wait_per_warp_active.ratio                                        0.02
+    -------------------------------------------------------------------- ----------- --------------
+

@@ -1,0 +1,55 @@
+Run ID: 20260612_025458_two_tier_queue_admission_fix
+Run root: /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_025458_two_tier_queue_admission_fix
+Timestamp recorded: 2026-06-12T03:26:09+08:00
+Host: ccyilong
+Kernel: Linux ccyilong 6.8.0-111-generic #111-Ubuntu SMP PREEMPT_DYNAMIC Sat Apr 11 23:16:02 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+GPU: NVIDIA GeForce RTX 4090, driver 580.105.08, memory.total 24564 MiB
+
+Git:
+- Commit: 90d4de0
+- Branch: gpu-next-tasks-2026-06-09
+- Worktree status: dirty; see repository `git status --short` for full file list.
+
+Inputs:
+- Base: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
+  Header: 10000000 1024
+- Query: /data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
+  Header: 10000 1024
+- GT: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
+  Header: 10000 100
+  Size: 8000008 bytes
+  Max id: 9999985
+
+Build:
+- Binary: target/release/build_pipnn_index
+- Key args: --partitioner gpu-subtree --gpu-subtree-output compact-topk --pipnn-backend cuda --pipnn-gpu-device 0 --pipnn-gpu-workspace-budget-gb 16 --max-degree 64 --lbuild 100 --num-threads 8 --leaf-size-min 140 --leaf-size-max 640 --leaf-knn 2 --max-leaders 64 --psamp-fraction 0.05 --fanout-top 4 --fanout-second 2 --root-risk-candidate-rs 1,2,4 --seed 42
+- Exit status: 0
+- Wall time: 32:51.76
+- Max RSS: 15101416 kbytes
+- Mem index: /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_025458_two_tier_queue_admission_fix/index/_mem.index
+- Mem index bytes: 880495276
+- Profile: /data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260612_025458_two_tier_queue_admission_fix/profile.json
+
+Search:
+- Binary: target/release/search_mem_index
+- Key args: --recall-at 10 --search-list-size 100 --num-threads 8
+- GT path: /data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
+- Exit status: 0
+- Wall time: 0:45.69
+- Max RSS: 80000512 kbytes
+- QPS: 2571.5
+- Recall@10: 0.8560
+- Search result bytes: 400008
+
+Profile pass/fail gates:
+- queue_passes > 0: pass, value 192
+- queue_large_node_count > 0: pass, value 4177
+- queue_overflow_count == 0: pass
+- queue_overflow_flags == 0: pass
+- queue_fallback_reason_flags == 0: pass
+- resident_topk_metadata_h2d_bytes == 0: pass
+- cpu_cluster_merge_ms == 0: pass
+- cpu_leaf_global_to_local_ms == 0: pass
+- cpu_fallbacks == 0: pass
+- compact_unsupported_count == 0: pass
+- compact_unsupported_points == 0: pass

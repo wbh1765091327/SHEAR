@@ -1,0 +1,11 @@
+Starting PiPNN index build with R: 64  Lbuild: 100  alpha: 1.2  #threads: 8 search_DRAM_budget: 0 build_DRAM_budget: 0
+PiPNN: building graph for 35000000 points (dim=1024) with R=64 Lbuild=100 m_hash_bits=12...
+2026-06-17T15:03:42.711683Z  INFO deloann::algorithm::pipnn: PiPNN build start: num_points=35000000, num_threads=8
+2026-06-17T15:03:42.711695Z  INFO deloann::algorithm::pipnn: PiPNN detailed profiling enabled via DELOANN_PIPNN_PROFILE
+2026-06-17T15:03:42.711740Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [start]: points=35000000 rss_bytes=8740864 vm_hwm_bytes=12058624 sketch_bytes=0 reservoir_bytes=0 active_scratch_bytes_estimate=509152000 max_full_matrix_leaf_size=3500
+2026-06-17T15:03:42.844184Z  INFO deloann::algorithm::pipnn: PiPNN OOM thread model: requested_threads=8 pool_threads=8 leaf_budget_threads=8 memory_budget_bytes=214748364800
+2026-06-17T15:04:36.090150Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [oom after sketches]: points=35000000 rss_bytes=1479258112 vm_hwm_bytes=2462334976 sketch_bytes=88 reservoir_bytes=0 active_scratch_bytes_estimate=509152000 max_full_matrix_leaf_size=3500
+2026-06-17T15:04:49.038362Z  INFO deloann::algorithm::pipnn: PiPNN OOM resident-reservoir mode enabled: num_points=35000000 reservoir_bytes_estimate=30520000000 alloc_elapsed=12.948198801s
+2026-06-17T15:04:49.038432Z  INFO deloann::algorithm::pipnn: PiPNN memory telemetry [oom after resident reservoirs]: points=35000000 rss_bytes=30879166464 vm_hwm_bytes=30879166464 sketch_bytes=88 reservoir_bytes=30520000000 active_scratch_bytes_estimate=509152000 max_full_matrix_leaf_size=3500
+2026-06-17T15:04:49.090978Z  INFO deloann::algorithm::pipnn::rbc_partition: GPU-subtree partition starting: 35,000,000 points, adaptive_c_max=2,560, min_recurse=5,120
+2026-06-17T15:13:27.942628Z  INFO deloann::algorithm::pipnn::rbc_partition: [rbc/par-spool] point_reads=4996 range_reads=34725 range_rows=35000006 hit_ratio=1.00 workers=8 build_x_ms=130227 gemm_ms=3658325 topk_ms=229978 merge_ms=0 spool_write_ms=536 flush_ms=0 total_ms=518788

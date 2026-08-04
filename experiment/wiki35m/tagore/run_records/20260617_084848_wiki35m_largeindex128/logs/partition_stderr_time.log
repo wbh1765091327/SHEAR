@@ -1,0 +1,23 @@
+	Command being timed: "/home/wbh/cppwork/DiskANN-OOM/build/apps/utils/partition_data float /data_nvme_kioxia/tyj/data/wiki-1024-35M/en_base.fbin /data_staging/wbh/tagore_wiki35m_measurement/runs/20260617_084848_wiki35m_largeindex128/diskann_part/wiki35m 0.01 128 2"
+	User time (seconds): 2278.45
+	System time (seconds): 527.13
+	Percent of CPU this job got: 621%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 7:31.51
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 24154608
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 81
+	Minor (reclaiming a frame) page faults: 6048572
+	Voluntary context switches: 631924
+	Involuntary context switches: 33958306
+	Swaps: 0
+	File system inputs: 46707888
+	File system outputs: 560562296
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

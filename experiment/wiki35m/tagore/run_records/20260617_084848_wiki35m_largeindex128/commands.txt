@@ -1,0 +1,4 @@
+partition_data float /data_nvme_kioxia/tyj/data/wiki-1024-35M/en_base.fbin $RUN_ROOT/diskann_part/wiki35m 0.01 128 2
+convert_diskann_partition_to_tagore --clusters 128 --num-points 35000000 --dim 1024
+Tagore.largeIndex([0], 1024, 64, 128, max_points_from_shards, ..., max_degree=32, buffer_size=16, num=35000000, threshold=1.2, final_degree=32, TOPM=64)
+PiPGANN search_mem_index --search-list-size 100 --recall-at 10

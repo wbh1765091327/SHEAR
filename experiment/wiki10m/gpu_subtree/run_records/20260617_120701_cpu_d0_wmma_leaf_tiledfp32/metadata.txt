@@ -1,0 +1,92 @@
+date=2026-06-17T12:07:02+08:00
+host=ccyilong
+cwd=/home/wbh/cppwork/PiPGANN
+git_commit=59686f9693a0837d7906879ab60ab7822592ff61
+git_status_short_begin
+ M AGENTS.md
+ M DeloANN/benches/kmeans_bench.rs
+ M DeloANN/benches/neighbor_bench.rs
+ M DeloANN/src/algorithm/pipnn/compute_backend.rs
+ M DeloANN/src/algorithm/pipnn/direct_io.rs
+ M DeloANN/src/algorithm/pipnn/external_store.rs
+ M DeloANN/src/algorithm/pipnn/hash_prune.rs
+ M DeloANN/src/algorithm/pipnn/leaf_build.rs
+ M DeloANN/src/algorithm/pipnn/mod.rs
+ M DeloANN/src/algorithm/pipnn/params.rs
+ M DeloANN/src/algorithm/pipnn/point_store.rs
+ M DeloANN/src/algorithm/pipnn/rbc_partition.rs
+ M DeloANN/src/algorithm/pipnn/scheduler.rs
+ M DeloANN/src/algorithm/pipnn/spill_hashprune.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/assign.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/builder.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/manifest.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/point_store.rs
+ M DeloANN/src/algorithm/pipnn/topo_em/reduce.rs
+ M DeloANN/src/buffer_pool/mmcache.rs
+ M DeloANN/src/index/evolve_index/evolve_builder.rs
+ M DeloANN/src/index/inmem_index/inmem_index_storage.rs
+ M DeloANN/src/index/inmem_index/mod.rs
+ M DeloANN/src/index/inmem_index/pipnn_oom_writer.rs
+ M DeloANN/src/index/mod.rs
+ M DeloANN/src/model/data_store/inmem_dataset.rs
+ M DeloANN/src/model/rabitq/rabitq_construct.rs
+ M DeloANN/tests/pipnn_oom_build_test.rs
+ M DeloANN/tests/rabitq_test.rs
+ M DeloANN/tests/topo_em_test.rs
+ M DeloANN/tests/velocache_test.rs
+ M README.md
+ M cmd_drivers/build_pipnn_index/src/main.rs
+ M cmd_drivers/build_topoem_index/src/main.rs
+ M cmd_drivers/eval_topoem_recall/src/main.rs
+ M cmd_drivers/search_disk_index/src/search_index_utils.rs
+ M docs/README.md
+ M docs/ROADMAP.md
+ M docs/pipnn_fanout_math.md
+ M experiment/pipeline_runtime_baseline_2026_06_08/run_pipeline_runtime_baseline.py
+ M experiment/pipeline_runtime_baseline_2026_06_08/summary.json
+ M experiment/pipeline_runtime_baseline_2026_06_08/summary.md
+git_status_short_end
+base=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
+query=/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
+gt=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
+data_root=/data_nvme_kioxia/tyj/data
+staging_root=/data_staging/wbh
+run_root=/data_staging/wbh/wiki10m_gpu_subtree_measurement/runs/20260617_120701_cpu_d0_wmma_leaf_tiledfp32
+default_path=cpu_d0+resident_gpu+d1_assignment_persistent_wmma_tf32+leaf_persistent_wmma_tf32
+leaf_topk_selected_backend=persistent-wmma-tf32
+leaf_wmma_topk_enabled=false
+leaf_topk_internal_execution=persistent_tiled_gemm_fp32_fallback
+leaf_wmma_topk_opt_in_env=DELOANN_PIPNN_ENABLE_LEAF_WMMA_TOPK=1
+d1_device_leader_stride=128_not_root_max_leaders
+oom_memory_budget_gib=200
+gpu_workspace_budget_gib=16
+leaf_size_min=256
+leaf_size_max=1280
+max_leaders=1500
+fanout_schedule_depth0_depth1_depth2plus=8,3,1
+root_risk_candidate_rs=1,2,4,8
+Wed Jun 17 12:07:02 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        On  |   00000000:01:00.0 Off |                  Off |
+| 67%   33C    P8             19W /  450W |     205MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A           41178      G   /usr/lib/xorg/Xorg                      101MiB |
+|    0   N/A  N/A           41408      G   /usr/bin/gnome-shell                     15MiB |
+|    0   N/A  N/A           49581      G   .../8274/usr/lib/firefox/firefox         25MiB |
++-----------------------------------------------------------------------------------------+
+build_exit_code=0
+search_exit_code=0
+cleanup_mem_index_bytes=1933790824

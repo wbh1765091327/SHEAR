@@ -1,0 +1,34 @@
+build_exit=build_exit=0
+mem_index_bytes=901735048
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 9:35.14
+	Maximum resident set size (kbytes): 15117772
+profile extracts:
+4:  "memory_budget_bytes": 214748364800,
+18:  "pipeline": { "descriptor_receive_wall_ms": 0, "descriptor_batch_extend_wall_ms": 0, "stage_wall_ms": 0, "compute_flush_wall_ms": 0, "topk_queue_roundtrip_wall_ms": 0, "edge_queue_roundtrip_wall_ms": 0, "edge_flush_wall_ms": 0, "descriptor_queue_empty_count": 0, "cuda_batch_count": 0, "cuda_batch_leaves": 0, "cuda_batch_rows": 0, "cuda_batch_target_bytes": 0, "cuda_batch_actual_bytes": 0, "cuda_batch_underfilled_count": 0 },
+19:  "leaf_flow": { "host_load_wall_ms": 0, "backend_compute_wall_ms": 0, "compact_materialize_wall_ms": 0, "hash_wall_ms": 2597, "edge_sink_wall_ms": 35142, "flush_wall_ms": 35142 },
+20:  "gpu": { "gpu_h2d_bytes": 0, "gpu_d2h_bytes": 0, "gpu_h2d_ms": 0, "gpu_d2h_ms": 0, "gpu_kernel_ms": 0, "gpu_sync_ms": 0, "gpu_h2d_submit_wall_ms": 0, "gpu_kernel_launch_wall_ms": 0, "gpu_kernel_elapsed_ms": 0, "gpu_d2h_submit_wall_ms": 0, "gpu_post_d2h_sync_wall_ms": 0, "gpu_stream_total_elapsed_ms": 0, "gpu_workspace_peak_bytes": 0, "gpu_workspace_budget_bytes": 0, "gpu_workspace_pressure_events": 0, "gpu_cpu_fallbacks": 0 },
+22:  "resident_subtree": { "resident_subtree_count": 0, "resident_subtree_points": 0, "resident_subtree_bytes": 0, "resident_subtree_read_wall": 0, "resident_subtree_compute_wall": 0, "resident_subtree_emit_wall_ms": 0, "resident_subtree_leaf_count": 0, "resident_subtree_fallback_count": 0, "resident_subtree_fallback_points": 0, "resident_subtree_max_points": 0, "resident_subtree_avg_points": 0.000000, "resident_subtree_permit_wait": 0 },
+63:  "partitioner": { "kind": "gpu-subtree", "kmeans": { "points": 0, "emitted_points": 0, "leaves": 0, "split_attempts": 0, "assignment_passes": 0, "empty_clusters": 0, "fallback_splits": 0, "max_leaf_size": 0, "wall_ms": 0 } },
+persistent large-node profile checks passed
+gpu_subtree.d0_wall_ms=20930
+gpu_subtree.d0_child_run_count=64
+gpu_subtree.d0_child_points=40000000
+gpu_subtree.d0_child_max_len=1378181
+gpu_subtree.d1plus_producer_ms=507105
+gpu_subtree.d1plus_child_replay_ms=223
+gpu_subtree.d1plus_backend_ms=501661
+gpu_subtree.d1plus_push_wait_ms=23
+gpu_subtree.d1plus_queue_max_bytes=55059956
+gpu_subtree.d1plus_queue_max_batches=47875
+gpu_subtree.async_flush_ms=46026
+gpu_subtree.async_flush_worker_ms_sum=46026
+gpu_subtree.async_flush_batches=999011
+gpu_subtree.async_flush_rows=80000000
+gpu_subtree.persistent_success_count=64
+gpu_subtree.persistent_large_node_splits=32684
+gpu_subtree.persistent_large_node_max_rows=1378181
+gpu_subtree.persistent_leaf_size_max=640
+gpu_subtree.persistent_partition_worker_blocks=128
+gpu_subtree.persistent_topk_worker_blocks=128
+memory_budget_bytes=214748364800
+partitioner={'kind': 'gpu-subtree', 'kmeans': {'points': 0, 'emitted_points': 0, 'leaves': 0, 'split_attempts': 0, 'assignment_passes': 0, 'empty_clusters': 0, 'fallback_splits': 0, 'max_leaf_size': 0, 'wall_ms': 0}}

@@ -1,0 +1,15 @@
+[package]
+name = "tessa_operator_replay"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cuda = ["shear_core/pipnn_cuda"]
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+shear_core = { path = "../../shear-core" }
+
+[dev-dependencies]
+tempfile = "3.20"

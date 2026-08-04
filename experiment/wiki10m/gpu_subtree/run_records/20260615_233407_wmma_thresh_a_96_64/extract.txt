@@ -1,0 +1,26 @@
+mem_index_bytes=902080892
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 9:41.96
+	Maximum resident set size (kbytes): 15095768
+	Exit status: 0
+Base data: 10000000 points, dim=1024
+Graph: 10000000 nodes, start=6843085, max_degree=64
+Queries: 10000
+Search: 10000 queries in 3.78s (2642.4 QPS)
+Recall@10: 0.8415
+search_results_bytes=400008
+total_ms=456531
+persistent_total_ms=325551
+resident_topk_kernel_event_ms=325549
+host_control_ms=122582
+cpu_compact_flush_ms=42096
+persistent_topk_claims=1285597
+persistent_topk_rows=80000000
+persistent_leaf_size_count=997685
+persistent_leaf_size_min=1
+persistent_leaf_size_max=640
+persistent_queue_overflow_flags=0
+persistent_partition_claims=32489
+persistent_partition_pops=32489
+persistent_topk_pops=1285597
+persistent_large_node_splits=32489
+persistent_large_node_max_rows=1378181

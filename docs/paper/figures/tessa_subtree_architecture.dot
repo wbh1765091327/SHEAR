@@ -1,0 +1,196 @@
+digraph TessaSubtreeArchitectureV1 {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    margin=0,
+    pad=0.01,
+    size="3.35,2.35!",
+    ratio="fill",
+    nodesep=0.10,
+    ranksep=0.14,
+    compound=true,
+    newrank=true,
+    splines=ortho,
+    outputorder=edgesfirst,
+    fontname="Helvetica"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#4B5563",
+    fillcolor="#FFFFFF",
+    fontname="Times-Roman",
+    fontsize=15,
+    margin="0.04,0.03",
+    penwidth=1.25
+  ];
+  edge [
+    color="#273444",
+    fontcolor="#273444",
+    fontname="Helvetica",
+    fontsize=13,
+    penwidth=1.35,
+    arrowsize=0.68
+  ];
+
+  // Version-1 semantic contract:
+  // subtree {gid, q, s, n}; Resident SQ8 subtree;
+  // Partition queue Q_p; Leaf queue Q_l; TESSA shared core;
+  // 16 x 16 SQ8 tile; signed-int8 WMMA; INT32 accumulation;
+  // FP32 distance recovery; Bounded-degree graph G.
+
+  subgraph cluster_cpu {
+    label="CPU";
+    labelloc=t;
+    labeljust=l;
+    color="#DCEEFF";
+    fillcolor="#DCEEFF";
+    style="rounded,filled";
+    penwidth=1.0;
+    fontname="Helvetica";
+    fontsize=18;
+
+    cpu_input [
+      group="left",
+      style="rounded,dotted,filled",
+      color="#1F2937",
+      fillcolor="#F8FBFF",
+      tooltip="SQ sidecar gather; subtree {gid, q, s, n}",
+      label=<
+        <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2" CELLPADDING="1">
+          <TR>
+            <TD ROWSPAN="3">
+              <TABLE BORDER="1" COLOR="#4D76B8" CELLBORDER="1" CELLSPACING="0" CELLPADDING="0">
+                <TR><TD WIDTH="7" HEIGHT="7" BGCOLOR="#DCEAFF"></TD><TD WIDTH="7" BGCOLOR="#C9DEFF"></TD><TD WIDTH="7" BGCOLOR="#DCEAFF"></TD></TR>
+                <TR><TD HEIGHT="7" BGCOLOR="#C9DEFF"></TD><TD BGCOLOR="#DCEAFF"></TD><TD BGCOLOR="#C9DEFF"></TD></TR>
+                <TR><TD HEIGHT="7" BGCOLOR="#DCEAFF"></TD><TD BGCOLOR="#C9DEFF"></TD><TD BGCOLOR="#DCEAFF"></TD></TR>
+              </TABLE>
+            </TD>
+            <TD ALIGN="LEFT"><B>SQ sidecar gather</B></TD>
+          </TR>
+          <TR><TD ALIGN="LEFT">admitted subtree</TD></TR>
+          <TR><TD ALIGN="LEFT">{gid, q, s, n}</TD></TR>
+        </TABLE>
+      >
+    ];
+
+    cpu_output [
+      group="right",
+      style="rounded,dotted,filled",
+      color="#1F2937",
+      fillcolor="#F8FBFF",
+      tooltip="Compact candidate batch; HashPrune+; Bounded-degree graph G",
+      label=<
+        <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1">
+          <TR><TD ALIGN="LEFT"><B>Compact candidate batch</B></TD></TR>
+          <TR><TD ALIGN="LEFT">{src, nbr, dist}</TD></TR>
+          <TR><TD ALIGN="LEFT">HashPrune+ → graph G</TD></TR>
+        </TABLE>
+      >
+    ];
+
+    { rank=same; cpu_input; cpu_output; }
+    cpu_input -> cpu_output [style=invis, weight=100];
+  }
+
+  subgraph cluster_gpu {
+    label="GPU";
+    labelloc=t;
+    labeljust=l;
+    color="#FFF5BE";
+    fillcolor="#FFF5BE";
+    style="rounded,filled";
+    penwidth=1.0;
+    fontname="Helvetica";
+    fontsize=18;
+
+    gpu_exec [
+      shape=plain,
+      tooltip="Resident SQ8 subtree → Fused-persistent kernel → Compact top-k",
+      label=<
+        <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="4" CELLPADDING="1">
+          <TR>
+            <TD PORT="resident" BORDER="1" COLOR="#1F2937" BGCOLOR="#FFFDF1" CELLPADDING="4">
+              <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="0">
+                <TR><TD><B>Resident SQ8</B></TD></TR>
+                <TR>
+                  <TD>
+                    <TABLE BORDER="1" COLOR="#4D76B8" CELLBORDER="1" CELLSPACING="0" CELLPADDING="0">
+                      <TR><TD WIDTH="7" HEIGHT="7" BGCOLOR="#DCEAFF"></TD><TD WIDTH="7" BGCOLOR="#C9DEFF"></TD><TD WIDTH="7" BGCOLOR="#DCEAFF"></TD></TR>
+                      <TR><TD HEIGHT="7" BGCOLOR="#C9DEFF"></TD><TD BGCOLOR="#DCEAFF"></TD><TD BGCOLOR="#C9DEFF"></TD></TR>
+                      <TR><TD HEIGHT="7" BGCOLOR="#DCEAFF"></TD><TD BGCOLOR="#C9DEFF"></TD><TD BGCOLOR="#DCEAFF"></TD></TR>
+                    </TABLE>
+                  </TD>
+                </TR>
+                <TR><TD>q · s · n · IDs</TD></TR>
+              </TABLE>
+            </TD>
+
+            <TD><FONT FACE="Helvetica" POINT-SIZE="17">→</FONT></TD>
+
+            <TD BORDER="1" COLOR="#7A6A31" BGCOLOR="#FFFDF1" CELLPADDING="4">
+              <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="3" CELLPADDING="0">
+                <TR><TD COLSPAN="3"><FONT FACE="Helvetica"><B>Fused-persistent kernel</B></FONT></TD></TR>
+                <TR>
+                  <TD BORDER="1" COLOR="#4D76B8" BGCOLOR="#E4EEFF" CELLPADDING="3">
+                    <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="0">
+                      <TR><TD><B>Q<SUB>p</SUB> | Partition</B></TD></TR>
+                      <TR><TD>RBC assignment</TD></TR>
+                      <TR><TD><FONT POINT-SIZE="11">child ↺ · leaf ↓</FONT></TD></TR>
+                      <HR/>
+                      <TR><TD><B>Q<SUB>l</SUB> | Candidate</B></TD></TR>
+                      <TR><TD>leaf top-k</TD></TR>
+                    </TABLE>
+                  </TD>
+
+                  <TD><FONT FACE="Helvetica" POINT-SIZE="17">⇄</FONT></TD>
+
+                  <TD BORDER="1" COLOR="#2A7880" BGCOLOR="#DDF3F3" CELLPADDING="3">
+                    <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="0">
+                      <TR><TD><FONT FACE="Helvetica"><B>TESSA shared core</B></FONT></TD></TR>
+                      <TR>
+                        <TD>
+                          <TABLE BORDER="1" COLOR="#397D83" CELLBORDER="1" CELLSPACING="0" CELLPADDING="0">
+                            <TR><TD WIDTH="7" HEIGHT="7" BGCOLOR="#BFE4E5"></TD><TD WIDTH="7" BGCOLOR="#D7F0F0"></TD><TD WIDTH="7" BGCOLOR="#BFE4E5"></TD></TR>
+                            <TR><TD HEIGHT="7" BGCOLOR="#D7F0F0"></TD><TD BGCOLOR="#BFE4E5"></TD><TD BGCOLOR="#D7F0F0"></TD></TR>
+                            <TR><TD HEIGHT="7" BGCOLOR="#BFE4E5"></TD><TD BGCOLOR="#D7F0F0"></TD><TD BGCOLOR="#BFE4E5"></TD></TR>
+                          </TABLE>
+                        </TD>
+                      </TR>
+                      <TR><TD>16×16 SQ8 tile</TD></TR>
+                      <TR><TD>s8 WMMA → s32</TD></TR>
+                      <TR><TD>FP32 distance</TD></TR>
+                      <TR><TD><FONT POINT-SIZE="11">assignment + scoring</FONT></TD></TR>
+                    </TABLE>
+                  </TD>
+                </TR>
+              </TABLE>
+            </TD>
+
+            <TD><FONT FACE="Helvetica" POINT-SIZE="17">→</FONT></TD>
+
+            <TD PORT="compact" BORDER="1" COLOR="#1F2937" BGCOLOR="#FFFDF1" CELLPADDING="4">
+              <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="0">
+                <TR><TD><B>Compact top-k</B></TD></TR>
+                <TR><TD BGCOLOR="#C9DEFF">src | nbr | dist</TD></TR>
+                <TR><TD BGCOLOR="#DCEAFF">··· | ··· | ···</TD></TR>
+                <TR><TD BGCOLOR="#C9DEFF">src | nbr | dist</TD></TR>
+              </TABLE>
+            </TD>
+          </TR>
+        </TABLE>
+      >
+    ];
+  }
+
+  cpu_input -> gpu_exec:resident:n [
+    weight=100,
+    xlabel="H2D\nSQ8 subtree"
+  ];
+  cpu_output -> gpu_exec:compact:n [style=invis, weight=100];
+  gpu_exec:compact:n -> cpu_output [
+    constraint=false,
+    xlabel="D2H\ncompact top-k"
+  ];
+}

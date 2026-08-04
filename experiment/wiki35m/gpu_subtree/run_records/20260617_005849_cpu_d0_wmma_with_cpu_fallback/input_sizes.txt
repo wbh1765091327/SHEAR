@@ -1,0 +1,3 @@
+/data_nvme_kioxia/tyj/data/wiki-1024-35M/en_base.fbin 143360000008
+/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin 40960008
+/data_nvme_kioxia/tyj/data/wiki-1024-35M/gt100.bin 8000008
