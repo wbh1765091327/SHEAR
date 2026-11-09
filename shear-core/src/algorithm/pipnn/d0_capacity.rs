@@ -139,6 +139,11 @@ pub(crate) struct D0CapacityTelemetry {
     pub(crate) c_high: usize,
     pub(crate) c_target: usize,
     pub(crate) c_low: usize,
+    pub(crate) threshold_policy: &'static str,
+    pub(crate) high_budget_bytes: usize,
+    pub(crate) high_required_bytes: usize,
+    pub(crate) target_budget_bytes: usize,
+    pub(crate) target_required_bytes: usize,
     pub(crate) k_capacity: usize,
     pub(crate) quality_min_root_leaders: usize,
     pub(crate) root_leader_cap: usize,
@@ -155,6 +160,25 @@ pub(crate) struct D0CapacityTelemetry {
     pub(crate) actual_child_p95_unique_rows: usize,
     pub(crate) actual_child_p99_unique_rows: usize,
     pub(crate) admission_failures: usize,
+}
+
+impl D0CapacityTelemetry {
+    pub(crate) fn record_thresholds(&mut self, thresholds: D0CapacityThresholds,
+                                  dim: usize, params: &PiPNNParams) {
+        self.c_gpu = thresholds.c_gpu;
+        self.c_high = thresholds.c_high;
+        self.c_target = thresholds.c_target;
+        self.c_low = thresholds.c_low;
+        self.threshold_policy = "byte-admission";
+        let high = d1_admission_preflight(thresholds.c_high, dim, params,
+                                         params.gpu_subtree_d0_capacity_high_ratio);
+        let target = d1_admission_preflight(thresholds.c_target, dim, params,
+                                           params.gpu_subtree_d0_capacity_target_ratio);
+        self.high_budget_bytes = high.budget_bytes;
+        self.high_required_bytes = high.required_bytes;
+        self.target_budget_bytes = target.budget_bytes;
+        self.target_required_bytes = target.required_bytes;
+    }
 }
 
 #[cfg(any(feature = "pipnn_cuda", test))]
@@ -220,6 +244,30 @@ pub(crate) fn compute_thresholds(c_gpu: usize, cfg: D0CapacityConfig) -> D0Capac
         c_target,
         c_low,
     }
+}
+
+/// Scaling a full-budget row count does not scale fixed workspace overhead.
+/// Keep throughput-model limits, but also fit the actual fractional byte budget.
+pub(crate) fn compute_admission_thresholds(
+    c_gpu: usize, dim: usize, params: &PiPNNParams, cfg: D0CapacityConfig,
+) -> D0CapacityThresholds {
+    let mut thresholds = compute_thresholds(c_gpu, cfg);
+    if c_gpu == 0 {
+        return thresholds;
+    }
+    let high_ratio = cfg.high_ratio.clamp(0.01, 1.0);
+    let target_ratio = cfg.target_ratio.clamp(0.01, high_ratio);
+    let safe_rows = |ratio: f64| {
+        let workspace = params.effective_gpu_workspace_budget_bytes();
+        let budget = ((workspace as f64) * ratio).floor().max(1.0) as usize;
+        find_max_admissible_rows(dim, params.leaf_knn,
+            super::compute_backend::gpu_persistent_subtree_max_leaders_for_params(params),
+            params.fanout_second.max(1), Some(workspace), Some(budget), params)
+    };
+    thresholds.c_high = thresholds.c_high.min(safe_rows(high_ratio));
+    thresholds.c_target = thresholds.c_target.min(thresholds.c_high).min(safe_rows(target_ratio));
+    thresholds.c_low = thresholds.c_low.min(thresholds.c_target);
+    thresholds
 }
 
 pub(crate) fn plan_root_leaders(
@@ -442,6 +490,84 @@ mod tests {
         );
         assert_eq!(plan.k_initial, plan.k_capacity);
         assert_eq!(plan.root_leader_source, "capacity");
+    }
+
+    #[test]
+    fn sq4_100m_fractional_byte_admission_boundary() {
+        let mut params = PiPNNParams::default();
+        params.gpu_subtree_sq4_plus = true;
+        params.gpu_subtree_sq4_primary_center = true;
+        params.gpu_subtree_sq_native_int4 = true;
+        params.gpu_subtree_sq_bits = 4;
+        params.gpu_subtree_sq_wmma_mode = super::super::PiPNNGpuSubtreeSqWmmaMode::Build;
+        params.gpu_workspace_budget_bytes = 16usize << 30;
+        params.leaf_knn = 2;
+        params.c_min = 256;
+        params.c_max = 1280;
+        params.fanout_top = 8;
+        params.fanout_second = 3;
+        params.max_leaders = 5000;
+        let cfg = D0CapacityConfig { enabled: true, high_ratio: 0.08,
+            target_ratio: 0.08, low_ratio: 0.08, ..D0CapacityConfig::default() };
+        let failed = d1_admission_preflight(1_515_897, 512, &params, 0.08);
+        assert!(!failed.supported);
+        // The current counter header has 168 u64 words (the historical failure had 167).
+        assert_eq!(failed.required_bytes - failed.budget_bytes, 17_334);
+        let thresholds = compute_admission_thresholds(18_950_395, 512, &params, cfg);
+        assert!(thresholds.c_high < 1_515_897);
+        assert_eq!(thresholds.c_high, thresholds.c_target);
+        assert!(d1_admission_preflight(thresholds.c_high, 512, &params, 0.08).supported);
+        assert!(!d1_admission_preflight(thresholds.c_high + 1, 512, &params, 0.08).supported);
+        assert_eq!(plan_root_leaders(100_000_000, 8, thresholds, cfg).k_initial, 528);
+        eprintln!("100M byte-admission regression: old_failed_rows=1515897 safe_rows={} budget_bytes={}",
+            thresholds.c_high, failed.budget_bytes);
+    }
+
+    #[test]
+    fn sq4_planning_budget_is_independent_of_upload_threshold() {
+        let mut params = PiPNNParams::default();
+        params.gpu_subtree_sq4_plus = true;
+        params.gpu_subtree_sq4_primary_center = true;
+        params.gpu_subtree_sq_native_int4 = true;
+        params.gpu_subtree_sq_bits = 4;
+        params.gpu_subtree_sq_wmma_mode = super::super::PiPNNGpuSubtreeSqWmmaMode::Build;
+        params.gpu_workspace_budget_bytes = 16usize << 30;
+        params.leaf_knn = 2;
+        params.c_min = 256;
+        params.c_max = 1280;
+        params.fanout_top = 8;
+        params.fanout_second = 3;
+        params.max_leaders = 5000;
+        let old_cfg = D0CapacityConfig { enabled: true, high_ratio: 0.08,
+            target_ratio: 0.08, low_ratio: 0.08, ..D0CapacityConfig::default() };
+        let cfg = D0CapacityConfig { high_ratio: 0.50, ..old_cfg };
+        let before = compute_admission_thresholds(18_950_395, 512, &params, old_cfg);
+        let after = compute_admission_thresholds(18_950_395, 512, &params, cfg);
+
+        assert_eq!(before.c_target, after.c_target);
+        assert_eq!(before.c_low, after.c_low);
+        assert!(after.c_high > after.c_target);
+        for (rows, fanout, leaders) in [(10_000_000, 6, 64), (100_000_000, 8, 528)] {
+            let a = plan_root_leaders(rows, fanout, before, old_cfg);
+            let b = plan_root_leaders(rows, fanout, after, cfg);
+            assert_eq!(a, b);
+            assert_eq!(b.k_initial, leaders);
+        }
+
+        let above_target = after.c_target + 1;
+        assert!(!d1_admission_preflight(above_target, 512, &params, 0.08).supported);
+        assert!(d1_admission_preflight(above_target, 512, &params, 0.50).supported);
+        assert_eq!(split_leader_count(above_target, after), 1);
+        let at_limit = d1_admission_preflight(after.c_high, 512, &params, 0.50);
+        let over_limit = d1_admission_preflight(after.c_high + 1, 512, &params, 0.50);
+        assert_eq!(at_limit.budget_bytes, 8usize << 30);
+        assert!(at_limit.supported);
+        assert!(!over_limit.supported);
+        assert!(over_limit.required_bytes > over_limit.budget_bytes);
+        assert_eq!(split_leader_count(after.c_high + 1, after),
+                   (after.c_high + 1).div_ceil(after.c_target));
+        eprintln!("SQ4 separate limits: target_rows={} threshold_rows={} threshold_bytes={} leaders_100m=528",
+                  after.c_target, after.c_high, at_limit.budget_bytes);
     }
 
     #[test]

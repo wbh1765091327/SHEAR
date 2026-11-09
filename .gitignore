@@ -9,3 +9,9 @@ perf.data*
 .codebase-memory/
 __pycache__/
 *.py[cod]
+
+# Local datasets, run outputs, and unpacked system dependencies.
+/data/
+/runs/
+/.local-deps/
+/.venv-data/

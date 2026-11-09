@@ -395,6 +395,7 @@ fn run_prepared_tessa_operator_replay(
         "task_metrics.tsv",
         "summary.json",
         "summary.md",
+        "kernel_resources.json",
         "failure.json",
     ] {
         let path = config.output_dir.join(file);
@@ -407,6 +408,10 @@ fn run_prepared_tessa_operator_replay(
     }
 
     let mut session = TessaCudaReplaySession::new(config.gpu_device, &prepared)?;
+    let mut resource_json = serde_json::to_vec_pretty(&session.kernel_resource_attributes()?)
+        .map_err(|err| replay_error(format!("failed to serialize replay kernel resources: {err}")))?;
+    resource_json.push(b'\n');
+    write_replay_file(&config.output_dir.join("kernel_resources.json"), &resource_json)?;
     let mut samples = Vec::new();
     let mut canonical = HashMap::<TessaReplayMode, TessaCudaModeResult>::new();
     for (phase, sweep_count) in [

@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/NVIDIA/cutlass",
+  "tag": "v3.9.2",
+  "commit": "ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e",
+  "archive_sha256": "36429479df2ab1cd1c7981c2d34e786106326ccfefc8846f902f76151a65e112",
+  "contents": "Unmodified literal-include dependency closure of include/cutlass/arch/mma_sm80.h (93 headers), plus LICENSE.txt"
+}

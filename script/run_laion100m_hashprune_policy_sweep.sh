@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MODE=${1:-help}
-OUTPUT_BASE=${OUTPUT_BASE:-/data_staging/wbh/hashprune_policy_sweep/laion100m}
+OUTPUT_BASE=${OUTPUT_BASE:-${SHEAR_OUTPUT_ROOT}/hashprune_policy_sweep/laion100m}
 RUN_ID=${RUN_ID:-}
 EXPERIMENT_PROFILE=${EXPERIMENT_PROFILE:-legacy-15}
-BASE=/data_nvme_kioxia/tyj/data/laion-512-100M/base.fbin
-QUERY=/data_nvme_kioxia/tyj/data/laion-512-100M/query.fbin
-GT=/data_nvme_kioxia/tyj/data/laion-512-100M/gt100.bin
-RABITQ1_SIDECAR=/data_staging/wbh/unified_graph_rabitq1/sidecars/laion100m.rabitq1
+BASE=${SHEAR_DATA_ROOT}/laion-512-100M/base.fbin
+QUERY=${SHEAR_DATA_ROOT}/laion-512-100M/query.fbin
+GT=${SHEAR_DATA_ROOT}/laion-512-100M/gt100.bin
+RABITQ1_SIDECAR=${SHEAR_DATA_ROOT}/sidecars/laion100m.rabitq1
 EXPECTED_SIDECAR_SHA256=46a7758e2008313f1d31893966db2afe10c46d12103780b4ee06b796c975fae0
 ROWS=100000000
 DIM=512
@@ -172,7 +173,7 @@ acquire_locks() {
   mkdir -p "$OUTPUT_BASE"
   exec 8>"$OUTPUT_BASE/.batch.lock"
   flock -n 8 || die "HashPrune policy sweep lock is held"
-  exec 9>/data_staging/wbh/.shear_experiment.lock
+  exec 9>${SHEAR_OUTPUT_ROOT}/.shear_experiment.lock
   flock -n 9 || die "global SHEAR experiment lock is held"
 }
 

@@ -661,6 +661,7 @@ pub enum PiPNNGpuSubtreeD0PartitionMode {
     #[default]
     RbcFanout,
     TagoreKMeansTopK,
+    BudgetKMeansTopK,
     GpuKMeansCoarse,
 }
 
@@ -670,6 +671,7 @@ impl PiPNNGpuSubtreeD0PartitionMode {
         match self {
             Self::RbcFanout => "rbc-fanout",
             Self::TagoreKMeansTopK => "tagore-kmeans-topk",
+            Self::BudgetKMeansTopK => "budget-kmeans-topk",
             Self::GpuKMeansCoarse => "gpu-kmeans-coarse",
         }
     }
@@ -689,11 +691,12 @@ impl FromStr for PiPNNGpuSubtreeD0PartitionMode {
             "rbc" | "rbc-fanout" | "rbc_fanout" => Ok(Self::RbcFanout),
             "tagore" | "tagore-kmeans-topk" | "tagore_kmeans_topk" | "kmeans-topk"
             | "kmeans_topk" => Ok(Self::TagoreKMeansTopK),
+            "budget-kmeans-topk" | "budget_kmeans_topk" => Ok(Self::BudgetKMeansTopK),
             "gpu-kmeans-coarse" | "gpu_kmeans_coarse" | "gpu-kmeans" | "gpu_kmeans" => {
                 Ok(Self::GpuKMeansCoarse)
             }
             other => Err(format!(
-                "Unsupported GPU-subtree D0 partition mode '{other}', expected one of: rbc-fanout, tagore-kmeans-topk, gpu-kmeans-coarse"
+                "Unsupported GPU-subtree D0 partition mode '{other}', expected one of: rbc-fanout, budget-kmeans-topk, tagore-kmeans-topk, gpu-kmeans-coarse"
             )),
         }
     }
@@ -2228,6 +2231,13 @@ pub struct PiPNNParams {
     pub gpu_subtree_rabitq_d1_topk_mode: PiPNNGpuSubtreeRabitqD1TopKMode,
     /// Experimental SQ8 staging mode that creates the SQ sidecar during global D0 assignment.
     pub gpu_subtree_sq_staging_mode: PiPNNGpuSubtreeSqStagingMode,
+    /// Experimental rotated residual SQ8 D0 coding; D1+ uses raw vectors.
+    pub gpu_subtree_sq8_rotated_residual_d0: bool,
+    /// Re-encode each D1+ child around its own mean after the shared rotation.
+    pub gpu_subtree_sq8_rotated_residual_d1: bool,
+    pub gpu_subtree_sq8_rotated_residual_d1_int8: bool,
+    /// Seed for the FHT-Kac rotation in the experimental D0 residual SQ8 mode.
+    pub gpu_subtree_sq8_rotated_residual_seed: u64,
     /// Raw rows uploaded per SQ8 GPU-D0 staging shard.
     pub gpu_subtree_sq_staging_upload_shard_rows: usize,
     /// Keep SQ8 GPU-D0 staging but use the raw FP32 D1+ path for diagnostics.
@@ -2244,6 +2254,8 @@ pub struct PiPNNParams {
     pub gpu_subtree_sq_bits: usize,
     /// Use packed signed INT4 SQ codes and native INT4 WMMA for SQ build mode.
     pub gpu_subtree_sq_native_int4: bool,
+    pub gpu_subtree_sq4_plus: bool,
+    pub gpu_subtree_sq4_primary_center: bool,
     /// Experimental SQ-int8 WMMA resident path. Off preserves raw f32 resident upload.
     pub gpu_subtree_sq_wmma_mode: PiPNNGpuSubtreeSqWmmaMode,
     /// Optional global SQ-int8 WMMA sidecar prefix used by shadow/build modes.
@@ -2302,9 +2314,9 @@ pub struct PiPNNParams {
     pub gpu_subtree_d0_capacity_enable: bool,
     /// Controls admission and capacity-retry splitting for D1+ GPU subtree tasks.
     pub gpu_subtree_d1plus_lazy_split_mode: PiPNNGpuSubtreeD1PlusLazySplitMode,
-    /// Fraction of resident-admissible rows that marks an oversized D0 child.
+    /// Upload admission high-water fraction, independent of the D0 planning target below.
     pub gpu_subtree_d0_capacity_high_ratio: f64,
-    /// Fraction of resident-admissible rows used as the split-only repair target.
+    /// D0 leader-planning budget fraction, also used as the split-only repair target.
     pub gpu_subtree_d0_capacity_target_ratio: f64,
     /// Fraction of resident-admissible rows below which a child is counted as small for telemetry.
     pub gpu_subtree_d0_capacity_low_ratio: f64,
@@ -2972,6 +2984,15 @@ impl PiPNNParams {
         self.max_full_matrix_leaf_size.max(1)
     }
 
+    pub(crate) fn sq4_budget_d0(&self) -> bool {
+        self.gpu_subtree_d0_partition_mode == PiPNNGpuSubtreeD0PartitionMode::BudgetKMeansTopK
+            || (self.gpu_subtree_sq4_plus && self.gpu_subtree_d0_partition_mode == PiPNNGpuSubtreeD0PartitionMode::RbcFanout)
+    }
+
+    pub(crate) fn sq4_primary_center_count_hint(&self) -> usize {
+        if self.sq4_budget_d0() { 64 } else { self.gpu_subtree_d0_tagore_partitions }
+    }
+
     /// 根据当前簇规模和深度返回采样比例。
     #[inline]
     pub fn adaptive_psamp_fraction(&self, cluster_size: usize, depth: usize) -> f64 {
@@ -3170,10 +3191,16 @@ impl PiPNNParams {
             gpu_subtree_rabitq_d0_leader_tile: 64,
             gpu_subtree_rabitq_d0_partial_r: 8,
             gpu_subtree_sq_staging_mode: PiPNNGpuSubtreeSqStagingMode::Off,
+            gpu_subtree_sq8_rotated_residual_d0: false,
+            gpu_subtree_sq8_rotated_residual_d1: false,
+            gpu_subtree_sq8_rotated_residual_d1_int8: false,
+            gpu_subtree_sq8_rotated_residual_seed: 42,
             gpu_subtree_sq_staging_upload_shard_rows: 524_288,
             gpu_subtree_sq_staging_raw_d1_diagnostic: false,
             gpu_subtree_sq_bits: 8,
             gpu_subtree_sq_native_int4: false,
+            gpu_subtree_sq4_plus: false,
+            gpu_subtree_sq4_primary_center: false,
             gpu_subtree_sq_wmma_mode: PiPNNGpuSubtreeSqWmmaMode::Off,
             gpu_subtree_sq_wmma_sidecar_prefix: None,
             gpu_subtree_sq_wmma_sidecar_mode: PiPNNGpuSubtreeSqWmmaSidecarMode::Off,
@@ -3425,10 +3452,16 @@ impl Default for PiPNNParams {
             gpu_subtree_rabitq_d0_leader_tile: 64,
             gpu_subtree_rabitq_d0_partial_r: 8,
             gpu_subtree_sq_staging_mode: PiPNNGpuSubtreeSqStagingMode::Off,
+            gpu_subtree_sq8_rotated_residual_d0: false,
+            gpu_subtree_sq8_rotated_residual_d1: false,
+            gpu_subtree_sq8_rotated_residual_d1_int8: false,
+            gpu_subtree_sq8_rotated_residual_seed: 42,
             gpu_subtree_sq_staging_upload_shard_rows: 524_288,
             gpu_subtree_sq_staging_raw_d1_diagnostic: false,
             gpu_subtree_sq_bits: 8,
             gpu_subtree_sq_native_int4: false,
+            gpu_subtree_sq4_plus: false,
+            gpu_subtree_sq4_primary_center: false,
             gpu_subtree_sq_wmma_mode: PiPNNGpuSubtreeSqWmmaMode::Off,
             gpu_subtree_sq_wmma_sidecar_prefix: None,
             gpu_subtree_sq_wmma_sidecar_mode: PiPNNGpuSubtreeSqWmmaSidecarMode::Off,

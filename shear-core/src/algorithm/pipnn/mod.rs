@@ -44,6 +44,11 @@ pub(crate) mod persistent_async_d2h;
 pub(crate) mod range_reservoir_store;
 pub(crate) mod reservoir_delta_log;
 pub(crate) mod reservoir_writeback_cache;
+mod sq4_primary;
+mod gpu_sketch;
+#[cfg(feature = "pipnn_cuda")]
+mod sq4_gpu_d0;
+pub(crate) mod sq8_rotated_residual_sidecar;
 pub(crate) mod throughput_model;
 pub use dco_sq_int8::SqInt8CpuKernel;
 pub(crate) mod ddc_res;
@@ -516,6 +521,7 @@ use self::scheduler::{
 use self::spill_hashprune::{
     ExternalHashPruneReducer, ExternalReduceConfig, SpillEdgeSink, SpillReduceStats, SpillRunStats,
 };
+use self::sq8_rotated_residual_sidecar::Sq8RotatedResidualSidecar;
 use crate::common::{AnnError, AnnResult};
 use crate::model::InmemDataset;
 
@@ -1147,7 +1153,13 @@ fn should_use_sq_staging_fused_sketch(
     hashprune_candidate_backend
         && !lrpf_candidate_backend
         && matches!(params.partitioner, PiPNNPartitionerKind::GpuSubtree)
-        && params.gpu_subtree_sq_staging_mode.is_enabled()
+        && (params.gpu_subtree_sq_staging_mode.is_enabled()
+            || (params.gpu_subtree_sq4_plus
+                && (params.gpu_subtree_sq4_primary_center || rbc_partition::partition_gpu_d0_requested())
+                && (params.sq4_budget_d0() || params.gpu_subtree_d0_partition_mode
+                    == PiPNNGpuSubtreeD0PartitionMode::TagoreKMeansTopK)
+                && params.m_hash_bits > 0
+                && std::env::var("SHEAR_PIPNN_SQ4_D0_FUSED_SKETCH").as_deref() != Ok("0")))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1577,6 +1589,7 @@ fn estimate_oom_sidecar_resident(
         };
     }
     if params.gpu_subtree_sq_wmma_mode == PiPNNGpuSubtreeSqWmmaMode::Build
+        && !params.gpu_subtree_sq4_plus
         && params.gpu_subtree_sq_wmma_sidecar_mode.is_enabled()
         && params.gpu_subtree_sq_wmma_sidecar_mode != PiPNNGpuSubtreeSqWmmaSidecarMode::CreateOnly
         && params.gpu_subtree_sq_wmma_sidecar_prefix.is_some()
@@ -1658,6 +1671,7 @@ fn maybe_open_sq_wmma_runtime_sidecar(
     memory_plan: &OomMemoryPlan,
 ) -> AnnResult<Option<SqWmmaSidecar>> {
     if !matches!(params.partitioner, PiPNNPartitionerKind::GpuSubtree)
+        || params.gpu_subtree_sq4_plus
         || params.gpu_subtree_sq_wmma_mode != PiPNNGpuSubtreeSqWmmaMode::Build
         || !params.gpu_subtree_sq_wmma_sidecar_mode.is_enabled()
         || params.gpu_subtree_sq_wmma_sidecar_mode == PiPNNGpuSubtreeSqWmmaSidecarMode::CreateOnly
@@ -3888,6 +3902,7 @@ where
     let gpu_subtree_runtime_context = GpuSubtreeRuntimeContext {
         rabitq_plus_resident_sidecar: rabitq_plus_resident_sidecar.as_ref(),
         sq_wmma_sidecar: sq_wmma_sidecar.as_ref(),
+        rotated_residual_sq8_sidecar: None,
         turboquant_sidecar: turboquant_sidecar.as_ref(),
         rabitq_residual_payload: None,
         rabitq_residual_qcode_store: None,
@@ -4008,7 +4023,8 @@ where
         );
         let reservoir_init_config = reservoir_initialization_config_from_env(pool_threads);
         let overlap_enabled = reservoir_init_config.overlap_enabled && !params.root_stop_after_d00;
-        let d0_read_progress = (overlap_enabled && sq_staging_fused_sketch_candidate)
+        let d0_read_progress = (overlap_enabled && sq_staging_fused_sketch_candidate
+            && params.gpu_subtree_sq_staging_mode.is_enabled())
             .then(|| Arc::new(D0ReadProgress::new(num_points)));
         info!(
             "PiPNN OOM resident-reservoir mode planned: num_points={} reservoir_bytes_estimate={} layout={} allocation_phase={} workers={}",
@@ -4172,7 +4188,8 @@ where
         let reservoir_init_config = reservoir_initialization_config_from_env(pool_threads);
         let overlap_enabled = reservoir_init_config.overlap_enabled && !params.root_stop_after_d00;
         let d0_read_progress =
-            (overlap_enabled && sq_staging_fused_sketch_candidate && dense_resident_points > 0)
+            (overlap_enabled && sq_staging_fused_sketch_candidate && dense_resident_points > 0
+                && params.gpu_subtree_sq_staging_mode.is_enabled())
                 .then(|| Arc::new(D0ReadProgress::new(dense_resident_points)));
         info!(
             "PiPNN OOM hybrid reservoir plan: budget_points={} dense_points={} pinned_points={} total_points={} dense_reservoir_bytes_estimate={} layout={} allocation_phase={} workers={}",
@@ -5337,8 +5354,8 @@ fn emit_streaming_partition_compact_topk(
             params.gpu_subtree_sq_staging_mode,
             PiPNNGpuSubtreeSqStagingMode::GpuD0ShardLocalD1
                 | PiPNNGpuSubtreeSqStagingMode::GpuD0ClusterBatchD1
-        ) || params.gpu_subtree_sq_wmma_mode
-            != PiPNNGpuSubtreeSqWmmaMode::Build
+        ) || params.gpu_subtree_sq8_rotated_residual_d1
+            || params.gpu_subtree_sq_wmma_mode != PiPNNGpuSubtreeSqWmmaMode::Build
         {
             None
         } else {
@@ -5357,8 +5374,11 @@ fn emit_streaming_partition_compact_topk(
             };
             Some(sidecar)
         };
+        let rotated_sidecar =
+            open_rotated_residual_sq8_runtime_sidecar(params, all_indices.len(), dataset.dim())?;
         let sq_staging_runtime_context = GpuSubtreeRuntimeContext {
             sq_wmma_sidecar: sq_staging_sidecar.as_ref(),
+            rotated_residual_sq8_sidecar: rotated_sidecar.as_ref(),
             ..gpu_subtree_runtime_context
         };
         let queue_budget_bytes = params
@@ -5408,6 +5428,28 @@ fn emit_streaming_partition_compact_topk(
     )
 }
 
+fn open_rotated_residual_sq8_runtime_sidecar(
+    params: &PiPNNParams,
+    rows: usize,
+    dim: usize,
+) -> AnnResult<Option<Sq8RotatedResidualSidecar>> {
+    if !params.gpu_subtree_sq8_rotated_residual_d1 {
+        return Ok(None);
+    }
+    let prefix = params
+        .gpu_subtree_sq_wmma_sidecar_prefix
+        .as_ref()
+        .ok_or_else(|| {
+            AnnError::log_index_error("Rotated residual SQ8 sidecar prefix is missing".to_string())
+        })?;
+    Ok(Some(Sq8RotatedResidualSidecar::open(
+        prefix,
+        rows,
+        dim,
+        params.gpu_subtree_sq8_rotated_residual_seed,
+    )?))
+}
+
 fn emit_streaming_partition_compact_topk_sq_staging_fused_sketch(
     subtree_backend: &dyn self::compute_backend::PiPNNComputeBackend,
     dataset: &dyn PointStore,
@@ -5426,23 +5468,39 @@ fn emit_streaming_partition_compact_topk_sq_staging_fused_sketch(
     Duration,
 )> {
     let mut rng = StdRng::seed_from_u64(params.random_seed);
-    let preflight = run_gpu_subtree_sq_staging_preflight_with_sketch(
-        subtree_backend,
-        dataset,
-        all_indices,
-        params.metric(),
-        params,
-        pool_threads as u32,
-        &mut rng,
-        Some(artifact_dir),
-        sketch_path,
-        d0_read_progress,
-    )?;
+    let preflight = if params.gpu_subtree_sq4_plus
+        && !params.gpu_subtree_sq_staging_mode.is_enabled()
+    {
+        rbc_partition::run_gpu_subtree_sq4_d0_preflight_with_sketch(
+            subtree_backend, dataset, all_indices, params.metric(), params,
+            pool_threads as u32, &mut rng, Some(artifact_dir), sketch_path,
+            gpu_subtree_runtime_context,
+            match std::env::var("SHEAR_PIPNN_SQ4_D0_SKETCH_BACKEND").as_deref() {
+                Ok("cpu") | Err(std::env::VarError::NotPresent) => false,
+                Ok("gpu") => true,
+                other => return Err(AnnError::log_index_error(format!(
+                    "Invalid SQ4+ D0 sketch backend {other:?}; expected cpu or explicit gpu experiment"))),
+            },
+        )?
+    } else {
+        run_gpu_subtree_sq_staging_preflight_with_sketch(
+            subtree_backend,
+            dataset,
+            all_indices,
+            params.metric(),
+            params,
+            pool_threads as u32,
+            &mut rng,
+            Some(artifact_dir),
+            sketch_path,
+            d0_read_progress,
+        )?
+    };
     let fused_sketch_compute_wall = preflight.fused_sketch_compute_wall;
     let fused_sketch_join_wait_wall = preflight.fused_sketch_join_wait_wall;
     let fused_sketches = preflight.fused_sketches.ok_or_else(|| {
         AnnError::log_index_error(
-            "SQ GPU-D0 staging fused sketch preflight returned no sketches".to_string(),
+            "D0 fused sketch preflight returned no sketches".to_string(),
         )
     })?;
     if !params.root_stop_after_d00 && !preflight.d0_plan.child_runs.is_empty() {
@@ -5452,8 +5510,9 @@ fn emit_streaming_partition_compact_topk_sq_staging_fused_sketch(
         params.gpu_subtree_sq_staging_mode,
         PiPNNGpuSubtreeSqStagingMode::GpuD0ShardLocalD1
             | PiPNNGpuSubtreeSqStagingMode::GpuD0ClusterBatchD1
-    ) || params.gpu_subtree_sq_wmma_mode
-        != PiPNNGpuSubtreeSqWmmaMode::Build
+    ) || params.gpu_subtree_sq8_rotated_residual_d1
+        || params.gpu_subtree_sq4_plus
+        || params.gpu_subtree_sq_wmma_mode != PiPNNGpuSubtreeSqWmmaMode::Build
     {
         None
     } else {
@@ -5472,8 +5531,11 @@ fn emit_streaming_partition_compact_topk_sq_staging_fused_sketch(
         };
         Some(sidecar)
     };
+    let rotated_sidecar =
+        open_rotated_residual_sq8_runtime_sidecar(params, all_indices.len(), dataset.dim())?;
     let sq_staging_runtime_context = GpuSubtreeRuntimeContext {
         sq_wmma_sidecar: sq_staging_sidecar.as_ref(),
+        rotated_residual_sq8_sidecar: rotated_sidecar.as_ref(),
         ..gpu_subtree_runtime_context
     };
     let queue_budget_bytes = params
@@ -5993,6 +6055,9 @@ impl OomSerialTimingBreakdown {
                 profile.rbc.gpu_subtree_sq_staging_raw_read_wall,
                 profile.rbc.gpu_subtree_sq_staging_raw_h2d_wall,
                 profile.rbc.gpu_subtree_sq_staging_gpu_quantize_wall,
+                profile
+                    .rbc
+                    .gpu_subtree_sq_staging_host_rotated_quantize_wall,
                 profile.rbc.gpu_subtree_sq_staging_gpu_d0_assign_wall,
                 d0_sq_qcode_write_total,
             ]) > Duration::ZERO;
@@ -6008,6 +6073,9 @@ impl OomSerialTimingBreakdown {
             profile.rbc.gpu_subtree_sq_staging_raw_read_wall,
             profile.rbc.gpu_subtree_sq_staging_raw_h2d_wall,
             profile.rbc.gpu_subtree_sq_staging_gpu_quantize_wall,
+            profile
+                .rbc
+                .gpu_subtree_sq_staging_host_rotated_quantize_wall,
             profile.rbc.gpu_subtree_sq_staging_gpu_d0_assign_wall,
             d0_sq_qcode_write_total,
         ]);
@@ -6040,7 +6108,10 @@ impl OomSerialTimingBreakdown {
             );
             let d0_sq_quantize = oom_profile_take_serial_part(
                 &mut d0_remaining,
-                profile.rbc.gpu_subtree_sq_staging_gpu_quantize_wall,
+                profile.rbc.gpu_subtree_sq_staging_gpu_quantize_wall
+                    + profile
+                        .rbc
+                        .gpu_subtree_sq_staging_host_rotated_quantize_wall,
             );
             let d0_sq_d0_assign = oom_profile_take_serial_part(
                 &mut d0_remaining,
@@ -7905,6 +7976,9 @@ fn write_oom_profile(path: &Path, profile: &OomProfile) -> AnnResult<()> {
     let sq_gpu_staging_total_ms = (profile.rbc.gpu_subtree_sq_staging_raw_read_wall
         + profile.rbc.gpu_subtree_sq_staging_raw_h2d_wall
         + profile.rbc.gpu_subtree_sq_staging_gpu_quantize_wall
+        + profile
+            .rbc
+            .gpu_subtree_sq_staging_host_rotated_quantize_wall
         + profile.rbc.gpu_subtree_sq_staging_qcode_d2h_wall
         + profile.rbc.gpu_subtree_sq_staging_gpu_d0_assign_wall
         + profile
@@ -7988,17 +8062,43 @@ fn write_oom_profile(path: &Path, profile: &OomProfile) -> AnnResult<()> {
         "leader_count",
         profile.rbc.gpu_subtree_sq_staging_global_d0_leaders,
     );
+    let rotated_residual_d0 = profile
+        .rbc
+        .gpu_subtree_sq_d0_assign_kernel_mode
+        .contains("rotated-residual");
     insert_json_value(
         &mut sq_gpu_staging_map,
         "distance_formula",
-        "sq8_approx_l2_norms_scales_dot",
+        if rotated_residual_d0 {
+            "sq8_rotated_residual_reconstructed_l2"
+        } else {
+            "sq8_approx_l2_norms_scales_dot"
+        },
     );
-    insert_json_value(&mut sq_gpu_staging_map, "d0_distance", "sq8-code-code");
+    insert_json_value(
+        &mut sq_gpu_staging_map,
+        "d0_distance",
+        if rotated_residual_d0 {
+            "sq8-residual-plus-center"
+        } else {
+            "sq8-code-code"
+        },
+    );
     insert_json_value(&mut sq_gpu_staging_map, "d0_leader_scope", "global");
     insert_json_value(
         &mut sq_gpu_staging_map,
         "sidecar_source",
         profile.rbc.gpu_subtree_sq_staging_sidecar_source,
+    );
+    insert_json_value(
+        &mut sq_gpu_staging_map,
+        "d1_distance",
+        match profile.rbc.gpu_subtree_sq_staging_sidecar_source {
+            "rotated-residual-v2-int8" => "sq8-residual-center-int8",
+            "rotated-residual-v2" => "reconstructed-fp32",
+            "none-rotated-residual" => "raw-fp32",
+            _ => "sq8-int8",
+        },
     );
     insert_json_value(
         &mut sq_gpu_staging_map,
@@ -8021,6 +8121,14 @@ fn write_oom_profile(path: &Path, profile: &OomProfile) -> AnnResult<()> {
         profile
             .rbc
             .gpu_subtree_sq_staging_gpu_quantize_wall
+            .as_millis(),
+    );
+    insert_json_value(
+        &mut sq_gpu_staging_map,
+        "host_rotated_quantize_ms",
+        profile
+            .rbc
+            .gpu_subtree_sq_staging_host_rotated_quantize_wall
             .as_millis(),
     );
     insert_json_value(
@@ -8521,6 +8629,7 @@ fn write_oom_profile(path: &Path, profile: &OomProfile) -> AnnResult<()> {
     ) {
         (true, true) => "mixed",
         (true, false) => "warp-dp4a",
+        (false, true) if profile.sq_native_int4 => "int4-wmma",
         (false, true) => "wmma",
         (false, false) => "none",
     };
@@ -11138,6 +11247,11 @@ fn write_oom_profile(path: &Path, profile: &OomProfile) -> AnnResult<()> {
     insert_json_value(&mut d0_capacity_map, "c_high", d0_capacity.c_high);
     insert_json_value(&mut d0_capacity_map, "c_target", d0_capacity.c_target);
     insert_json_value(&mut d0_capacity_map, "c_low", d0_capacity.c_low);
+    insert_json_value(&mut d0_capacity_map, "threshold_policy", d0_capacity.threshold_policy);
+    insert_json_value(&mut d0_capacity_map, "high_budget_bytes", d0_capacity.high_budget_bytes);
+    insert_json_value(&mut d0_capacity_map, "high_required_bytes", d0_capacity.high_required_bytes);
+    insert_json_value(&mut d0_capacity_map, "target_budget_bytes", d0_capacity.target_budget_bytes);
+    insert_json_value(&mut d0_capacity_map, "target_required_bytes", d0_capacity.target_required_bytes);
     insert_json_value(&mut d0_capacity_map, "k_capacity", d0_capacity.k_capacity);
     insert_json_value(
         &mut d0_capacity_map,

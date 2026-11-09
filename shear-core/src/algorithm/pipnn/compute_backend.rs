@@ -15,7 +15,10 @@ use super::dco_sq_int8::SQ_INT8_DEFAULT_K_ALIGN;
 use super::dco_sq_int8::SqGpuD0StagingProfile;
 use super::dco_sq_int8::{SqGpuD0QuantizeAssignRequest, SqGpuD0QuantizeAssignResult};
 #[cfg(feature = "pipnn_cuda")]
-use super::dco_sq_int8::{SqInt8Matrix, quantize_sq_int8_matrix_with_bits, sq_int8_padded_dim};
+use super::dco_sq_int8::{
+    SqInt8Matrix, quantize_sq_int8_matrix_with_bits, quantize_sq8_rotated_residual_matrix,
+    sq_int8_padded_dim,
+};
 #[cfg(feature = "pipnn_cuda")]
 use super::dco_turboquant::{
     TURBOQUANT_MSE4_SIDECAR_META_ROW_BYTES, TurboQuantMse4GatheredInput, TurboQuantMse4Sidecar,
@@ -271,7 +274,7 @@ pub(crate) const GPU_PERSISTENT_UNSUPPORTED_EXPLICIT_KERNEL: u32 = 1 << 18;
 #[cfg(any(feature = "pipnn_cuda", test))]
 pub(crate) const GPU_PERSISTENT_LARGE_TILE_CAPACITY: u32 = 1 << 19;
 #[cfg(any(feature = "pipnn_cuda", test))]
-const GPU_QUEUE_COUNTER_WORDS: usize = 159;
+const GPU_QUEUE_COUNTER_WORDS: usize = 168;
 #[cfg(any(feature = "pipnn_cuda", test))]
 const TESSA_CAPTURE_ASSIGNMENT_CELLS: usize =
     TESSA_ASSIGNMENT_ROW_BINS * TESSA_ASSIGNMENT_LEADER_BINS;
@@ -419,6 +422,7 @@ pub(crate) const GPU_PERSISTENT_DISTANCE_SOURCE_RAW: u32 = 0;
 pub(crate) const GPU_PERSISTENT_DISTANCE_SOURCE_RABITQ_PLUS: u32 = 1;
 #[cfg(any(feature = "pipnn_cuda", test))]
 pub(crate) const GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8: u32 = 2;
+pub(crate) const GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL: u32 = 4;
 #[cfg(any(feature = "pipnn_cuda", test))]
 pub(crate) const GPU_PERSISTENT_DISTANCE_SOURCE_TURBOQUANT_MSE4: u32 = 3;
 #[cfg(any(feature = "pipnn_cuda", test))]
@@ -470,6 +474,8 @@ pub(crate) const GPU_PERSISTENT_SQ8_ASSIGNMENT_KERNEL_AUTO: u32 = 0;
 pub(crate) const GPU_PERSISTENT_SQ8_ASSIGNMENT_KERNEL_WARP_DP4A: u32 = 1;
 #[cfg(any(feature = "pipnn_cuda", test))]
 pub(crate) const GPU_PERSISTENT_SQ8_ASSIGNMENT_KERNEL_WMMA: u32 = 2;
+#[cfg(any(feature = "pipnn_cuda", test))]
+const GPU_PERSISTENT_SQ4_ASSIGNMENT_KERNEL_WMMA: u32 = 3;
 #[cfg(any(feature = "pipnn_cuda", test))]
 pub(crate) const GPU_PERSISTENT_SQ8_LEAF_EXECUTOR_AUTO: u32 = 0;
 #[cfg(any(feature = "pipnn_cuda", test))]
@@ -921,12 +927,21 @@ fn estimate_gpu_resident_subtree_device_bytes_for_params(
     } else {
         padded_dim
     };
+    let projection_bytes = if params.gpu_subtree_sq4_primary_center {
+        let c = params.sq4_primary_center_count_hint();
+        resident_rows
+            .saturating_mul(c.saturating_add(1))
+            .saturating_add(c.saturating_mul(c))
+            .saturating_add(dim.saturating_mul(c))
+            .saturating_add(2)
+            .saturating_mul(size_of::<f32>())
+    } else { 0 };
     resident_rows.saturating_mul(
         code_row_bytes
             .saturating_add(std::mem::size_of::<u32>())
             .saturating_add(std::mem::size_of::<f32>())
             .saturating_add(std::mem::size_of::<f32>()),
-    )
+    ).saturating_add(projection_bytes)
 }
 
 #[cfg(any(feature = "pipnn_cuda", test))]
@@ -967,6 +982,7 @@ pub(crate) struct PersistentLeafHistogramRecord<'a> {
     pub(crate) kernel_event_ms: f64,
     pub(crate) leaf_size_bucket_bounds: Vec<usize>,
     pub(crate) leaf_size_bucket_counts: Vec<usize>,
+    pub(crate) leaf_size_bucket_pairs: Vec<u64>,
     pub(crate) topk_tile_bucket_bounds: Vec<usize>,
     pub(crate) topk_tile_bucket_counts: Vec<usize>,
     pub(crate) partial_tile_count: usize,
@@ -1017,12 +1033,14 @@ fn build_persistent_leaf_histogram_record<'a>(
     let effective_tile_rows = tile_rows.max(1);
     let mut leaf_size_bucket_counts = vec![0; PERSISTENT_LEAF_HISTOGRAM_BUCKETS.len()];
     let mut topk_tile_bucket_counts = vec![0; PERSISTENT_LEAF_HISTOGRAM_BUCKETS.len()];
+    let mut leaf_size_bucket_pairs = vec![0u64; PERSISTENT_LEAF_HISTOGRAM_BUCKETS.len()];
     let mut computed_topk_pops = 0usize;
     let mut partial_tile_count = 0usize;
     let mut full_tile_count = 0usize;
     for &raw_size in leaf_sizes {
         let size = usize::try_from(raw_size).unwrap_or(usize::MAX);
         leaf_size_bucket_counts[persistent_leaf_size_bucket_index(size)] += 1;
+        leaf_size_bucket_pairs[persistent_leaf_size_bucket_index(size)] += raw_size.saturating_mul(raw_size.saturating_sub(1));
         let tile_count = size.div_ceil(effective_tile_rows);
         topk_tile_bucket_counts[persistent_topk_tile_bucket_index(tile_count)] += 1;
         computed_topk_pops = computed_topk_pops.saturating_add(tile_count);
@@ -1064,6 +1082,7 @@ fn build_persistent_leaf_histogram_record<'a>(
         kernel_event_ms: profile.resident_topk_kernel_event_wall.as_secs_f64() * 1000.0,
         leaf_size_bucket_bounds: persistent_histogram_bucket_bounds(),
         leaf_size_bucket_counts,
+        leaf_size_bucket_pairs,
         topk_tile_bucket_bounds: persistent_topk_tile_bucket_bounds(),
         topk_tile_bucket_counts,
         partial_tile_count,
@@ -1314,6 +1333,9 @@ pub(crate) fn plan_gpu_persistent_subtree(
     budget_bytes: Option<usize>,
     params: &PiPNNParams,
 ) -> GpuPersistentSubtreePlan {
+    // Experimental target-sized leaf policy, independently switchable from WMMA changes.
+    let leaf_policy = std::env::var("SHEAR_PIPNN_SQ8_WMMA_OPT_MASK")
+        .ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) & 32768 != 0;
     let mut plan = GpuPersistentSubtreePlan {
         attempted: true,
         supported: false,
@@ -1323,8 +1345,8 @@ pub(crate) fn plan_gpu_persistent_subtree(
         max_queue_rows: resident_rows.max(1).saturating_mul(4096),
         max_leaf_count: resident_rows.max(1),
         max_leaf_rows: resident_rows,
-        leaf_min: GPU_PERSISTENT_LEAF_MIN,
-        leaf_target: GPU_PERSISTENT_LEAF_TARGET,
+        leaf_min: if leaf_policy { 128 } else { GPU_PERSISTENT_LEAF_MIN },
+        leaf_target: if leaf_policy { 256 } else { GPU_PERSISTENT_LEAF_TARGET },
         leaf_max: GPU_PERSISTENT_LEAF_MAX.max(params.c_max.max(1)),
         leaf_tile_rows: params.gpu_subtree_persistent_leaf_tile_rows.max(1),
         large_scratch_rows: resident_rows.max(1),
@@ -1870,6 +1892,8 @@ fn gpu_subtree_sq_native_int4_required_layout() -> GpuSubtreeQuantizedCodeLayout
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GpuSubtreeQuantizedInput<'a> {
     pub(crate) distance_kind: GpuSubtreeQuantizedDistanceKind,
+    pub(crate) rotated_center_ids: Option<&'a [u32]>,
+    pub(crate) rotated_centers: Option<&'a [f32]>,
     pub(crate) global_ids: &'a [u32],
     pub(crate) codes: &'a [i8],
     pub(crate) deltas: &'a [f32],
@@ -1884,6 +1908,7 @@ pub(crate) struct GpuSubtreeQuantizedInput<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct OwnedGpuSubtreeQuantizedInput {
+    pub(crate) rotated: Option<(Arc<Vec<u32>>, Arc<Vec<f32>>)>,
     pub(crate) distance_kind: GpuSubtreeQuantizedDistanceKind,
     pub(crate) global_ids: Arc<Vec<u32>>,
     pub(crate) codes: Arc<Vec<i8>>,
@@ -1900,6 +1925,8 @@ pub(crate) struct OwnedGpuSubtreeQuantizedInput {
 impl OwnedGpuSubtreeQuantizedInput {
     pub(crate) fn as_borrowed(&self) -> GpuSubtreeQuantizedInput<'_> {
         GpuSubtreeQuantizedInput {
+            rotated_center_ids: self.rotated.as_ref().map(|r| r.0.as_slice()),
+            rotated_centers: self.rotated.as_ref().map(|r| r.1.as_slice()),
             distance_kind: self.distance_kind,
             global_ids: self.global_ids.as_slice(),
             codes: self.codes.as_slice(),
@@ -1938,6 +1965,11 @@ impl OwnedGpuSubtreeQuantizedInput {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<f32>()),
             )
+            .saturating_add(self.rotated.as_ref().map_or(0, |(ids, centers)| {
+                ids.capacity()
+                    .saturating_mul(size_of::<u32>())
+                    .saturating_add(centers.capacity().saturating_mul(size_of::<f32>()))
+            }))
     }
 }
 
@@ -4189,7 +4221,7 @@ mod cuda_backend {
 
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as cublas_sys};
     use cudarc::driver::{
-        CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DeviceRepr, HostSlice,
+        CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, HostSlice,
         LaunchConfig, PushKernelArg, SyncOnDrop, result as cuda_result, sys,
     };
     use cudarc::nvrtc::{CompileOptions, compile_ptx, compile_ptx_with_opts};
@@ -4837,8 +4869,112 @@ extern "C" __global__ void leaf_topk_lune_witness(
 }
 "#;
 
+    const ROTATED_RESIDUAL_SQ8_PREPARE_KERNEL_SRC: &str = r#"
+extern "C" __global__ void rotated_residual_sq8_prepare(
+    const signed char* codes,
+    const float* scales,
+    const float* center_ids,
+    const float* centers,
+    float* residual_norms,
+    unsigned int rows,
+    unsigned int dim,
+    unsigned int padded_dim,
+    unsigned int center_count,
+    float* output
+) {
+    unsigned long long slot = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long projection_count = (unsigned long long)rows * center_count;
+    unsigned long long gram_count = (unsigned long long)center_count * center_count;
+    if (slot == 0ull) {
+        output[0] = __uint_as_float(rows);
+        output[1] = __uint_as_float(center_count);
+    }
+    if (slot < projection_count) {
+        unsigned int row = (unsigned int)(slot / center_count);
+        unsigned int center = (unsigned int)(slot % center_count);
+        const signed char* code = codes + (unsigned long long)row * padded_dim;
+        const float* mean = centers + (unsigned long long)center * dim;
+        float dot = 0.0f;
+        float mean_norm = 0.0f;
+        unsigned int own_center = (unsigned int)center_ids[row];
+        for (unsigned int axis = 0u; axis < dim; ++axis) {
+            dot += (float)code[axis] * mean[axis];
+            if (center == own_center) mean_norm += mean[axis] * mean[axis];
+        }
+        float projection = scales[row] * dot;
+        output[2ull + slot] = projection;
+        if (center == own_center) {
+            residual_norms[row] += 2.0f * projection + mean_norm;
+        }
+    } else if (slot < projection_count + gram_count) {
+        unsigned long long pair = slot - projection_count;
+        unsigned int left = (unsigned int)(pair / center_count);
+        unsigned int right = (unsigned int)(pair % center_count);
+        const float* a = centers + (unsigned long long)left * dim;
+        const float* b = centers + (unsigned long long)right * dim;
+        float dot = 0.0f;
+        for (unsigned int axis = 0u; axis < dim; ++axis) dot += a[axis] * b[axis];
+        output[2ull + projection_count + pair] = dot;
+    }
+}
+// A CTA computes 16 points by 16 centers. The extra center rows form the Gram matrix.
+extern "C" __global__ void sq4_primary_prepare(
+    const signed char* codes, const float* scales, const float* center_ids,
+    const float* centers, float* norms, unsigned int rows, unsigned int dim,
+    unsigned int padded_dim, unsigned int count, float* output
+) {
+    __shared__ float left[16][16], right[16][17];
+    unsigned int x = threadIdx.x, y = threadIdx.y;
+    unsigned int row = blockIdx.x * 16 + y, center = blockIdx.y * 16 + x;
+    unsigned int source_center = blockIdx.y * 16 + y;
+    unsigned long long base = 2ull + (unsigned long long)rows * count;
+    if (row == 0 && center == 0) {
+        output[0] = __uint_as_float(rows);
+        output[1] = __uint_as_float(count);
+    }
+    bool own = row < rows && (unsigned int)center_ids[row] == center;
+    float dot = 0.0f, center_norm = 0.0f;
+    for (unsigned int k = 0; k < dim; k += 16) {
+        unsigned int axis = k + x;
+        float value = 0.0f;
+        if (axis < dim && row < rows) {
+            unsigned char packed = codes[(unsigned long long)row * (padded_dim / 2) + axis / 2];
+            int nibble = (packed >> (4 * (axis & 1))) & 15;
+            value = (float)((nibble ^ 8) - 8);
+        } else if (axis < dim && row - rows < count) {
+            value = centers[(unsigned long long)(row - rows) * dim + axis];
+        }
+        left[y][x] = value;
+        right[y][x] = axis < dim && source_center < count
+            ? centers[(unsigned long long)source_center * dim + axis] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            float c = right[x][i];
+            dot += left[y][i] * c;
+            if (own) center_norm += c * c;
+        }
+        __syncthreads();
+    }
+    if (center >= count) return;
+    if (row < rows) {
+        float projection = scales[row] * dot;
+        output[2ull + (unsigned long long)row * count + center] = projection;
+        if (own) norms[row] += 2.0f * projection + center_norm;
+    } else if (row - rows < count) {
+        output[base + (unsigned long long)(row - rows) * count + center] = dot;
+    }
+}
+"#;
+
     pub(super) const GPU_PERSISTENT_SUBTREE_KERNEL_SRC: &str = r#"
 #include <mma.h>
+#ifndef GPU_PERSISTENT_SQ4_LEAF_CUTLASS
+#define GPU_PERSISTENT_SQ4_LEAF_CUTLASS 0
+#endif
+#if GPU_PERSISTENT_SQ4_LEAF_CUTLASS
+#include <cutlass/arch/mma_sm80.h>
+#endif
 
 static const unsigned long long GPU_PERSISTENT_QUEUE_NODE_OVERFLOW = 1ull << 0;
 static const unsigned long long GPU_PERSISTENT_QUEUE_ROW_OVERFLOW = 1ull << 1;
@@ -4873,6 +5009,7 @@ static const unsigned int GPU_PERSISTENT_ASSIGNMENT_OPERATOR_WMMA_TF32 = 3u;
 static const unsigned int GPU_PERSISTENT_DISTANCE_SOURCE_RAW = 0u;
 static const unsigned int GPU_PERSISTENT_DISTANCE_SOURCE_RABITQ_PLUS = 1u;
 static const unsigned int GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8 = 2u;
+static const unsigned int GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL = 4u;
 static const unsigned int GPU_PERSISTENT_DISTANCE_SOURCE_TURBOQUANT_MSE4 = 3u;
 static const unsigned int GPU_PERSISTENT_ASSIGNMENT_DCO_NONE = 0u;
 static const unsigned int GPU_PERSISTENT_ASSIGNMENT_DCO_PREFIX_PROJECTION = 1u;
@@ -4897,6 +5034,7 @@ static const unsigned int GPU_PERSISTENT_SQ8_LEAF_MODE_D96_K2 = 2u;
 static const unsigned int GPU_PERSISTENT_SQ8_ASSIGNMENT_KERNEL_AUTO = 0u;
 static const unsigned int GPU_PERSISTENT_SQ8_ASSIGNMENT_KERNEL_WARP_DP4A = 1u;
 static const unsigned int GPU_PERSISTENT_SQ8_ASSIGNMENT_KERNEL_WMMA = 2u;
+static const unsigned int GPU_PERSISTENT_SQ4_ASSIGNMENT_KERNEL_WMMA = 3u;
 static const unsigned int GPU_PERSISTENT_SQ8_LEAF_EXECUTOR_AUTO = 0u;
 static const unsigned int GPU_PERSISTENT_SQ8_LEAF_EXECUTOR_WARP_DP4A = 1u;
 static const unsigned int GPU_PERSISTENT_SQ8_LEAF_EXECUTOR_WMMA = 2u;
@@ -4915,6 +5053,24 @@ static const unsigned int GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA = 8u;
 static const unsigned int GPU_PERSISTENT_RABITQ_SPLIT_BATCH_ROWS = 32u;
 static const unsigned int GPU_PERSISTENT_RABITQ_SPLIT_EX_BITS = 7u;
 static const unsigned int GPU_PERSISTENT_TOPK_WMMA_COLS = 16u;
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+#define GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+#define GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O3B_ASSIGNMENT
+#define GPU_PERSISTENT_SQ8_WMMA_O3B_ASSIGNMENT 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O3B_LEAF
+#define GPU_PERSISTENT_SQ8_WMMA_O3B_LEAF 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT
+#define GPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O4_LEAF
+#define GPU_PERSISTENT_SQ8_WMMA_O4_LEAF 0
+#endif
 struct __align__(32) GpuPersistentSq8WmmaScratch {
     signed char a[
         GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA
@@ -4926,6 +5082,13 @@ struct __align__(32) GpuPersistentSq8WmmaScratch {
         * GPU_PERSISTENT_TOPK_WMMA_N
         * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K
     ];
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT || GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+    signed char b_cta[
+        GPU_PERSISTENT_TOPK_WMMA_N
+        * (GPU_PERSISTENT_SQ8_WMMA_O3B_ASSIGNMENT || GPU_PERSISTENT_SQ8_WMMA_O3B_LEAF
+            ? 32u : GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K)
+    ];
+#endif
     int c[
         GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA
         * GPU_PERSISTENT_TOPK_WMMA_M
@@ -4972,6 +5135,9 @@ struct __align__(32) GpuPersistentSq8WmmaScratch {
 #ifndef GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_TOPK_CLAIMS
 #define GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_TOPK_CLAIMS 0
 #endif
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF && (GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_TILE_CALLS || GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_K_SLICES)
+#error O3A leaf CTA barriers require WMMA debug abort to be disabled
+#endif
 #ifndef GPU_PERSISTENT_DISABLE_TOPK_HELP_LARGE
 #define GPU_PERSISTENT_DISABLE_TOPK_HELP_LARGE 0
 #endif
@@ -4983,6 +5149,15 @@ struct __align__(32) GpuPersistentSq8WmmaScratch {
 #endif
 #ifndef GPU_PERSISTENT_LEAF_SQ_INT8_WMMA_ENABLE
 #define GPU_PERSISTENT_LEAF_SQ_INT8_WMMA_ENABLE 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT
+#define GPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O1_LEAF
+#define GPU_PERSISTENT_SQ8_WMMA_O1_LEAF 0
+#endif
+#ifndef GPU_PERSISTENT_SQ8_WMMA_O2_LEAF
+#define GPU_PERSISTENT_SQ8_WMMA_O2_LEAF 0
 #endif
 #ifndef GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
 #define GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE 0
@@ -5184,7 +5359,16 @@ static const unsigned long long P_TOPK_IDLE_LEAF_RESETS = 155ull;
 static const unsigned long long P_TOPK_IDLE_LARGE_RESETS = 156ull;
 static const unsigned long long P_LEAF_SQ8_DP4A_TILES = 157ull;
 static const unsigned long long P_LEAF_SQ8_WMMA_TILES = 158ull;
-static const unsigned int GPU_PERSISTENT_COUNTER_WORDS = 159u;
+static const unsigned long long P_LEAF_POLICY_MERGES = 159ull;
+static const unsigned long long P_LEAF_POLICY_DEDUP_ROWS = 160ull;
+static const unsigned long long P_LEAF_POLICY_SMALL_EXCEPTIONS = 161ull;
+static const unsigned long long P_LEAF_POLICY_SPLITS = 162ull;
+static const unsigned long long P_LEAF_POLICY_LEADERS = 163ull;
+static const unsigned long long P_LEAF_POLICY_MAX_DEPTH = 164ull;
+static const unsigned long long P_LEAF_POLICY_MERGE_CLOCKS = 165ull;
+static const unsigned long long P_LEAF_POLICY_MERGED_GROUPS = 166ull;
+static const unsigned long long P_SQ4_RECT8X32_TILES = 167ull;
+static const unsigned int GPU_PERSISTENT_COUNTER_WORDS = 168u;
 
 struct GpuPersistentTopkLocalCounters {
     unsigned long long empty_polls;
@@ -5459,7 +5643,7 @@ static __device__ void gpu_tessa_capture_assignment(
             : ((mixed << shift) | (mixed >> (64u - shift)));
         member_xor ^= rotated;
     }
-    unsigned long long task_hash = 0xa33a40642123820dull;
+    unsigned long long task_hash = 0x4e1874bfb2ce5501ull;
     task_hash = gpu_tessa_fnv_u64(task_hash, capture_seed);
     task_hash = gpu_tessa_fnv_u32(task_hash, depth);
     task_hash = gpu_tessa_fnv_u32(task_hash, retry);
@@ -5475,7 +5659,7 @@ static __device__ void gpu_tessa_capture_assignment(
     if (task_hash == 0ull) {
         task_hash = 1ull;
     }
-    unsigned long long priority = 0x5015fcc8e2db9992ull;
+    unsigned long long priority = 0xba85766154a424f6ull;
     priority = gpu_tessa_fnv_u64(priority, capture_seed);
     priority = gpu_tessa_fnv_u64(priority, task_hash);
     if (priority == 0ull) {
@@ -6367,6 +6551,29 @@ static __device__ void gpu_persistent_assignment_reset_best4(
     }
 }
 
+static __device__ float gpu_persistent_rotated_residual_sq8_l2_from_dot(
+    int code_dot,
+    unsigned int left,
+    unsigned int right,
+    const float* full_norms,
+    const float* scales,
+    const float* center_ids,
+    const float* projections_and_gram
+) {
+    unsigned int rows = __float_as_uint(projections_and_gram[0]);
+    unsigned int center_count = __float_as_uint(projections_and_gram[1]);
+    unsigned int left_center = (unsigned int)center_ids[left];
+    unsigned int right_center = (unsigned int)center_ids[right];
+    unsigned long long projection_base = 2ull;
+    unsigned long long gram_base = projection_base + (unsigned long long)rows * center_count;
+    float full_dot = scales[left] * scales[right] * (float)code_dot
+        + projections_and_gram[projection_base + (unsigned long long)left * center_count + right_center]
+        + projections_and_gram[projection_base + (unsigned long long)right * center_count + left_center]
+        + projections_and_gram[gram_base + (unsigned long long)left_center * center_count + right_center];
+    float dist = full_norms[left] + full_norms[right] - 2.0f * full_dot;
+    return dist > 0.0f ? dist : 0.0f;
+}
+
 static __device__ float gpu_persistent_assignment_distance(
     const float* resident_x,
     const float* resident_norms,
@@ -6397,7 +6604,8 @@ static __device__ float gpu_persistent_assignment_distance(
             dim
         );
     }
-    if (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8) {
+    if (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+        || distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL) {
         const signed char* point_code = rabitq_codes + ((unsigned long long)point) * rabitq_code_row_bytes;
         const signed char* leader_code = rabitq_codes + ((unsigned long long)leader) * rabitq_code_row_bytes;
         int dot = gpu_persistent_assignment_dot_sq_quantized(
@@ -6406,6 +6614,11 @@ static __device__ float gpu_persistent_assignment_distance(
             rabitq_padded_dim,
             rabitq_code_layout
         );
+        if (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL) {
+            return gpu_persistent_rotated_residual_sq8_l2_from_dot(
+                dot, point, leader, resident_norms, rabitq_deltas, rabitq_sums, resident_x
+            );
+        }
         float dist = resident_norms[point]
             + resident_norms[leader]
             - 2.0f * rabitq_deltas[point] * rabitq_deltas[leader] * (float)dot;
@@ -7072,6 +7285,17 @@ static __device__ float gpu_persistent_adaptive_psamp_fraction(
         frac = 0.1f;
     }
     return frac;
+}
+
+// Clamp expected average child size; actual small children are repaired after assignment.
+static __device__ unsigned int gpu_persistent_target_leaders(
+    unsigned int n, unsigned int fanout, unsigned int cap
+) {
+    unsigned long long memberships = (unsigned long long)n * fanout;
+    unsigned int lower = fanout + 1u;
+    unsigned int upper = min(cap, (unsigned int)(memberships / 128u));
+    if (upper < lower) return min(cap, lower); // Tiny roots retain existing fanout/termination handling.
+    return min(upper, max(lower, (unsigned int)((memberships + 255u) / 256u)));
 }
 
 static __device__ unsigned int gpu_persistent_terminal_limit(unsigned int adaptive_c_max) {
@@ -9397,7 +9621,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_scalar_
     unsigned int leaf_dco_audit,
     unsigned int col_task_base,
     unsigned int col_task_count,
-    unsigned int staged_output
+    unsigned int staged_output,
+    unsigned int distance_source
 ) {
     unsigned int tile_end = tile_offset + tile_rows;
     if (tile_end > row_count) {
@@ -9500,7 +9725,9 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_scalar_
         )) {
             continue;
         }
-        const float* row_vec = resident_x + ((unsigned long long)local_i) * dim;
+        const float* row_vec = distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL
+            ? (const float*)0
+            : resident_x + ((unsigned long long)local_i) * dim;
         float norm_i = resident_norms[local_i];
         float best_dist[32];
         unsigned int best_id[32];
@@ -9626,6 +9853,11 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_scalar_
                                 leaf_sq_int8_sums[local_j],
                                 resident_norms[local_j],
                                 dim
+                            );
+                        } else if (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL) {
+                            approx_dist = gpu_persistent_rotated_residual_sq8_l2_from_dot(
+                                dot, local_i, local_j, resident_norms,
+                                leaf_sq_int8_scales, leaf_sq_int8_sums, resident_x
                             );
                         } else {
                             approx_dist = gpu_persistent_sq_int8_l2_from_dot(
@@ -10057,9 +10289,13 @@ static __device__ void gpu_persistent_sq_wmma_consume_sq_filter_c_tile(
     unsigned int row_band_end,
     unsigned int active_cols,
     unsigned int survivor_limit,
+    unsigned int c_col_major,
+    unsigned int c_dist_precomputed,
     float* survivor_dist,
     unsigned int* survivor_local_id,
-    unsigned int* survivor_id
+    unsigned int* survivor_id,
+    const float* center_ids = 0,
+    const float* projections = 0
 ) {
     unsigned int lane = threadIdx.x & 31u;
     bool row_active =
@@ -10076,13 +10312,21 @@ static __device__ void gpu_persistent_sq_wmma_consume_sq_filter_c_tile(
         if (local_j >= resident_rows || local_i == local_j) {
             continue;
         }
-        float approx_dist = gpu_persistent_sq_int8_l2_from_dot(
-            c_tile[lane * GPU_PERSISTENT_TOPK_WMMA_N + local_col],
-            a_scales[lane],
-            a_norms[lane],
-            leaf_sq_scales[local_j],
-            resident_norms[local_j]
-        );
+        int c_value = c_tile[c_col_major
+            ? local_col * GPU_PERSISTENT_TOPK_WMMA_M + lane
+            : lane * GPU_PERSISTENT_TOPK_WMMA_N + local_col];
+        float approx_dist = projections
+            ? gpu_persistent_rotated_residual_sq8_l2_from_dot(c_value, local_i, local_j,
+                resident_norms, leaf_sq_scales, center_ids, projections)
+            : c_dist_precomputed
+            ? __int_as_float(c_value)
+            : gpu_persistent_sq_int8_l2_from_dot(
+                c_value,
+                a_scales[lane],
+                a_norms[lane],
+                leaf_sq_scales[local_j],
+                resident_norms[local_j]
+            );
         gpu_persistent_leaf_insert_survivor_fp32(
             approx_dist,
             local_j,
@@ -10512,8 +10756,12 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
 
     signed char* a_tile = scratch->a
         + warp * GPU_PERSISTENT_TOPK_WMMA_M * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+    signed char* b_tile = scratch->b_cta;
+#else
     signed char* b_tile = scratch->b
         + warp * GPU_PERSISTENT_TOPK_WMMA_N * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+#endif
     int* c_tile = scratch->c
         + warp * GPU_PERSISTENT_TOPK_WMMA_M * GPU_PERSISTENT_TOPK_WMMA_N;
     unsigned int* a_local_ids = scratch->a_local_ids
@@ -10525,6 +10773,20 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
     float* a_norms = scratch->a_norms + warp * GPU_PERSISTENT_TOPK_WMMA_M;
     float* a_scales = scratch->a_scales + warp * GPU_PERSISTENT_TOPK_WMMA_M;
     float* a_sums = scratch->a_sums + warp * GPU_PERSISTENT_TOPK_WMMA_M;
+#if GPU_PERSISTENT_SQ8_WMMA_O1_LEAF
+    bool c_col_major = leaf_dco_mode == GPU_PERSISTENT_LEAF_DCO_WMMA_FILTER
+        && leaf_sq_int8_code_layout == GPU_PERSISTENT_SQ_CODE_LAYOUT_DENSE_I8;
+#else
+    bool c_col_major = false;
+#endif
+#if GPU_PERSISTENT_SQ8_WMMA_O2_LEAF
+    bool direct_survivor_output = leaf_dco_mode == GPU_PERSISTENT_LEAF_DCO_WMMA_FILTER
+        && leaf_sq_int8_code_layout == GPU_PERSISTENT_SQ_CODE_LAYOUT_DENSE_I8
+        && leaf_dco_rerank_mode == GPU_PERSISTENT_LEAF_DCO_RERANK_NONE
+        && leaf_dco_audit == 0u;
+#else
+    bool direct_survivor_output = false;
+#endif
 
     unsigned int candidate_count = row_count - 1u;
     unsigned int survivor_limit = leaf_dco_rerank_mode == GPU_PERSISTENT_LEAF_DCO_RERANK_EXACT
@@ -10574,8 +10836,10 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
         unsigned int survivor_local_id[GPU_PERSISTENT_LEAF_DCO_MAX_SURVIVORS];
         unsigned int survivor_id[GPU_PERSISTENT_LEAF_DCO_MAX_SURVIVORS];
         for (unsigned int slot = 0u; slot < GPU_PERSISTENT_LEAF_DCO_MAX_SURVIVORS; ++slot) {
-            best_dist[slot] = 3.402823466e+38F;
-            best_id[slot] = 0xffffffffu;
+            if (!direct_survivor_output) {
+                best_dist[slot] = 3.402823466e+38F;
+                best_id[slot] = 0xffffffffu;
+            }
             survivor_dist[slot] = 3.402823466e+38F;
             survivor_local_id[slot] = 0xffffffffu;
             survivor_id[slot] = 0xffffffffu;
@@ -10643,7 +10907,11 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
                     b_global_ids[local_col] = 0xffffffffu;
                 }
             }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+            __syncthreads();
+#else
             __syncwarp();
+#endif
 
             nvcuda::wmma::fragment<
                 nvcuda::wmma::matrix_a,
@@ -10662,6 +10930,82 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
             nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
             nvcuda::wmma::fill_fragment(acc_frag, 0);
 
+#if GPU_PERSISTENT_SQ8_WMMA_O3B_LEAF
+            // C is only written after the K loop; use its per-warp bytes
+            // for the A panel and, without CTA sharing, the B panel.
+            signed char* a_wide = reinterpret_cast<signed char*>(c_tile);
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+            signed char* b_wide = scratch->b_cta;
+#else
+            signed char* b_wide = a_wide + GPU_PERSISTENT_TOPK_WMMA_M * 32u;
+#endif
+            for (unsigned int axis_base = 0u; axis_base < filter_padded_dim; axis_base += 32u) {
+                for (unsigned int idx = lane; idx < GPU_PERSISTENT_TOPK_WMMA_M * 32u; idx += 32u) {
+                    unsigned int local_row = idx / 32u;
+                    unsigned int axis = axis_base + (idx % 32u);
+                    unsigned int row_local_id = a_local_ids[local_row];
+                    a_wide[idx] = !rabitq_split_mode && row_local_id < resident_rows
+                            && axis < filter_padded_dim
+                        ? leaf_sq_int8_codes[((unsigned long long)row_local_id)
+                            * leaf_sq_int8_code_row_bytes + axis]
+                        : 0;
+                }
+                for (unsigned int idx =
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                         threadIdx.x;
+#else
+                         lane;
+#endif
+                     idx < GPU_PERSISTENT_TOPK_WMMA_N * 32u;
+                     idx +=
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                         blockDim.x
+#else
+                         32u
+#endif
+                ) {
+                    unsigned int local_col = idx / 32u;
+                    unsigned int axis = axis_base + (idx % 32u);
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                    unsigned int col_local_id = scratch->b_local_ids[local_col];
+#else
+                    unsigned int col_local_id = b_local_ids[local_col];
+#endif
+                    b_wide[idx] = !rabitq_split_mode && col_local_id < resident_rows
+                            && axis < filter_padded_dim
+                        ? leaf_sq_int8_codes[((unsigned long long)col_local_id)
+                            * leaf_sq_int8_code_row_bytes + axis]
+                        : 0;
+                }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                __syncthreads();
+#else
+                __syncwarp();
+#endif
+                for (unsigned int slice = 0u; slice < 32u; slice += GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K) {
+                    if (axis_base + slice >= filter_padded_dim) {
+                        break;
+                    }
+                    if (gpu_persistent_wmma_debug_abort_k_slice_if_needed(
+                        counters,
+                        wmma_diag_counters,
+                        &scratch->debug_abort_cta,
+                        lane,
+                        axis_base + slice
+                    )) {
+                        return;
+                    }
+                    nvcuda::wmma::load_matrix_sync(a_frag, a_wide + slice, 32u);
+                    nvcuda::wmma::load_matrix_sync(b_frag, b_wide + slice, 32u);
+                    nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                __syncthreads();
+#else
+                __syncwarp();
+#endif
+            }
+#else
             for (unsigned int axis_base = 0u;
                  axis_base < filter_padded_dim;
                  axis_base += GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K) {
@@ -10690,6 +11034,19 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
                     }
                     a_tile[idx] = value;
                 }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                for (unsigned int idx = threadIdx.x;
+                     idx < GPU_PERSISTENT_TOPK_WMMA_N * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+                     idx += blockDim.x) {
+                    unsigned int local_col = idx / GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+                    unsigned int local_axis = idx - local_col * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+                    unsigned int col_local_id = scratch->b_local_ids[local_col];
+                    b_tile[idx] = !rabitq_split_mode && col_local_id < resident_rows
+                        ? leaf_sq_int8_codes[((unsigned long long)col_local_id)
+                            * leaf_sq_int8_code_row_bytes + axis_base + local_axis]
+                        : 0;
+                }
+#else
                 for (unsigned int idx = lane;
                      idx < GPU_PERSISTENT_TOPK_WMMA_N * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
                      idx += 32u) {
@@ -10706,20 +11063,70 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
                     }
                     b_tile[local_col * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K + local_axis] = value;
                 }
+#endif
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                __syncthreads();
+#else
                 __syncwarp();
+#endif
                 nvcuda::wmma::load_matrix_sync(a_frag, a_tile, GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K);
                 nvcuda::wmma::load_matrix_sync(b_frag, b_tile, GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K);
                 nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF
+                __syncthreads();
+#else
                 __syncwarp();
+#endif
             }
-            nvcuda::wmma::store_matrix_sync(
-                c_tile,
-                acc_frag,
-                GPU_PERSISTENT_TOPK_WMMA_N,
-                nvcuda::wmma::mem_row_major
-            );
+#endif
+#if GPU_PERSISTENT_SQ8_WMMA_O1_LEAF
+            if (c_col_major) {
+                nvcuda::wmma::store_matrix_sync(
+                    c_tile,
+                    acc_frag,
+                    GPU_PERSISTENT_TOPK_WMMA_M,
+                    nvcuda::wmma::mem_col_major
+                );
+            } else
+#endif
+            {
+                nvcuda::wmma::store_matrix_sync(
+                    c_tile,
+                    acc_frag,
+                    GPU_PERSISTENT_TOPK_WMMA_N,
+                    nvcuda::wmma::mem_row_major
+                );
+            }
             __syncwarp();
             if (leaf_dco_mode == GPU_PERSISTENT_LEAF_DCO_WMMA_FILTER) {
+#if GPU_PERSISTENT_SQ8_WMMA_O4_LEAF
+                bool precompute_distance =
+                    leaf_sq_int8_code_layout == GPU_PERSISTENT_SQ_CODE_LAYOUT_DENSE_I8;
+                if (precompute_distance) {
+                    unsigned int distance_row = lane & 15u;
+                    unsigned int local_i = a_local_ids[distance_row];
+                    for (unsigned int local_col = lane >> 4; local_col < active_cols; local_col += 2u) {
+                        unsigned int local_j = b_local_ids[local_col];
+                        if (local_i >= resident_rows || local_j >= resident_rows || local_i == local_j) {
+                            continue;
+                        }
+                        unsigned int c_index = c_col_major
+                            ? local_col * GPU_PERSISTENT_TOPK_WMMA_M + distance_row
+                            : distance_row * GPU_PERSISTENT_TOPK_WMMA_N + local_col;
+                        float approx_dist = gpu_persistent_sq_int8_l2_from_dot(
+                            c_tile[c_index],
+                            a_scales[distance_row],
+                            a_norms[distance_row],
+                            leaf_sq_int8_scales[local_j],
+                            resident_norms[local_j]
+                        );
+                        c_tile[c_index] = __float_as_int(approx_dist);
+                    }
+                    __syncwarp();
+                }
+#else
+                bool precompute_distance = false;
+#endif
                 gpu_persistent_sq_wmma_consume_sq_filter_c_tile(
                     c_tile,
                     a_local_ids,
@@ -10734,6 +11141,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
                     row_band_end,
                     active_cols,
                     survivor_limit,
+                    c_col_major ? 1u : 0u,
+                    precompute_distance ? 1u : 0u,
                     survivor_dist,
                     survivor_local_id,
                     survivor_id
@@ -10788,9 +11197,11 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
 
         if (leaf_dco_rerank_mode == GPU_PERSISTENT_LEAF_DCO_RERANK_NONE) {
             if (active_row) {
-                for (unsigned int slot = 0u; slot < k; ++slot) {
-                    best_dist[slot] = survivor_dist[slot];
-                    best_id[slot] = survivor_id[slot];
+                if (!direct_survivor_output) {
+                    for (unsigned int slot = 0u; slot < k; ++slot) {
+                        best_dist[slot] = survivor_dist[slot];
+                        best_id[slot] = survivor_id[slot];
+                    }
                 }
                 atomicAdd(&counters[P_LEAF_DCO_APPROX_OUTPUT_PAIRS], (unsigned long long)k);
             }
@@ -10919,12 +11330,14 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
         }
         if (staged_output != 0u) {
             if (active_row) {
+                float* output_dist = direct_survivor_output ? survivor_dist : best_dist;
+                unsigned int* output_id = direct_survivor_output ? survivor_id : best_id;
                 unsigned int out_row = row_start + row_band_start + lane;
                 atomicAdd(&counters[P_LEAF_DCO_FINALIZE_STARTED], 1ull);
                 gpu_persistent_merge_topk_row_locked(
                     out_row,
-                    best_dist,
-                    best_id,
+                    output_dist,
+                    output_id,
                     k,
                     topk_ids,
                     topk_dists,
@@ -10934,11 +11347,13 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
                 atomicAdd(&counters[P_LEAF_DCO_FINALIZE_DONE], 1ull);
             }
         } else if (active_row) {
+            float* output_dist = direct_survivor_output ? survivor_dist : best_dist;
+            unsigned int* output_id = direct_survivor_output ? survivor_id : best_id;
             unsigned int out_row = row_start + row_band_start + lane;
             unsigned long long out = ((unsigned long long)out_row) * k;
             for (unsigned int slot = 0u; slot < k; ++slot) {
-                topk_ids[out + slot] = best_id[slot];
-                topk_dists[out + slot] = best_dist[slot];
+                topk_ids[out + slot] = output_id[slot];
+                topk_dists[out + slot] = output_dist[slot];
             }
         }
         if (threadIdx.x == 0u && staged_output != 0u) {
@@ -10946,6 +11361,614 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_wmma_fi
         }
     }
 }
+#endif
+
+
+// Opt-in software profiling. Every CTA owns its counters: no contended atomics.
+// globaltimer timestamps share one time domain across SMs. Phases are sampled;
+// these include instruction/memory latency, and are not hardware stall counters.
+#ifndef GPU_PERSISTENT_LEAF_PROFILE
+#define GPU_PERSISTENT_LEAF_PROFILE 0
+#endif
+#ifndef GPU_PERSISTENT_LEAF_PROFILE_PHASES
+#define GPU_PERSISTENT_LEAF_PROFILE_PHASES 0
+#endif
+#if GPU_PERSISTENT_LEAF_PROFILE
+#define LP_WORDS 4352u
+#define LP_TRACE_BASE 256u
+#define LP_TRACE_CAP 512u
+extern "C" { __device__ unsigned long long shear_leaf_profile[256][LP_WORDS]; }
+__shared__ unsigned int lp_sample;
+#if GPU_PERSISTENT_LEAF_PROFILE_PHASES
+__shared__ unsigned long long lp_phases[8][10];
+#endif
+static __device__ __forceinline__ unsigned long long lp_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t) :: "memory");
+    return t;
+}
+static __device__ __forceinline__ unsigned int lp_bucket(unsigned int n) {
+    return n <= 32 ? 0 : n <= 64 ? 1 : n <= 96 ? 2 : n <= 128 ? 3 :
+        n <= 192 ? 4 : n <= 256 ? 5 : n <= 384 ? 6 : n <= 512 ? 7 :
+        n <= 768 ? 8 : n <= 1024 ? 9 : n <= 1280 ? 10 : 11;
+}
+static __device__ void lp_begin_task(unsigned int start) {
+    if (threadIdx.x == 0) {
+        unsigned int hash = (start ^ (start >> 16)) * 0x7feb352du;
+        lp_sample = ((hash ^ (hash >> 15)) & 31u) == 0u;
+    }
+#if GPU_PERSISTENT_LEAF_PROFILE_PHASES
+    // Called by thread zero before the existing descriptor broadcast barrier.
+    if (threadIdx.x == 0 && lp_sample)
+        for (unsigned int w = 0; w < 8; ++w)
+            for (unsigned int i = 0; i < 5; ++i) lp_phases[w][i] = 0ull;
+#endif
+}
+#if GPU_PERSISTENT_LEAF_PROFILE_PHASES
+static __device__ __forceinline__ void lp_phase_begin(unsigned int phase) {
+    if (lp_sample && (threadIdx.x & 31u) == 0u)
+        lp_phases[threadIdx.x / 32u][5u + phase] = lp_now();
+}
+static __device__ __forceinline__ void lp_phase_end(unsigned int phase) {
+    if (lp_sample && (threadIdx.x & 31u) == 0u) {
+        unsigned int w = threadIdx.x / 32u;
+        lp_phases[w][phase] += lp_now() - lp_phases[w][5u + phase];
+    }
+}
+#else
+#define lp_phase_begin(x) ((void)0)
+#define lp_phase_end(x) ((void)0)
+#endif
+static __device__ void lp_finish_task(unsigned int start, unsigned int count,
+    unsigned int offset, unsigned int leaf, unsigned long long begin,
+    unsigned long long barrier_begin, unsigned long long end) {
+    if (threadIdx.x != 0 || blockIdx.x >= 256) return;
+    unsigned long long* h = shear_leaf_profile[blockIdx.x];
+    unsigned long long* b = h + 16u + lp_bucket(count) * 20u;
+    unsigned long long elapsed = end - begin;
+    b[0]++; b[1] += offset == 0u; b[2] += offset == 0u ? count : 0u;
+    b[3] += elapsed; b[4] += end - barrier_begin;
+#if GPU_PERSISTENT_SQ4_LEAF_BIG_CTA
+    b[5] += count > 384u && count <= 1280u && offset != 0u;
+#endif
+    b[6] = max(b[6], elapsed);
+    h[8] += elapsed; h[12]++;
+    if (h[9] == 0ull) h[9] = begin;
+    h[10] = end;
+    if (!lp_sample) return;
+    b[8]++; b[9] += elapsed;
+#if GPU_PERSISTENT_LEAF_PROFILE_PHASES
+    for (unsigned int w = 0; w < 8; ++w)
+        for (unsigned int i = 0; i < 5; ++i) b[10u + i] += lp_phases[w][i];
+#endif
+    unsigned long long idx = h[6]++;
+    if (idx >= LP_TRACE_CAP) { h[7]++; return; }
+    unsigned long long* t = h + LP_TRACE_BASE + idx * 8u;
+    t[0] = begin; t[1] = end; t[2] = start; t[3] = count;
+    t[4] = offset; t[5] = leaf; t[6] = end - barrier_begin; t[7] = blockIdx.x;
+}
+#else
+#define lp_phase_begin(x) ((void)0)
+#define lp_phase_end(x) ((void)0)
+#endif
+
+#if (GPU_PERSISTENT_SQ4_PRIMARY_RECT8X32 || GPU_PERSISTENT_SQ4_LEAF_CTA || GPU_PERSISTENT_SQ4_LEAF_BIG_CTA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+#ifndef GPU_PERSISTENT_SQ4_BIG_LEAF_TILE
+#define GPU_PERSISTENT_SQ4_BIG_LEAF_TILE 32
+#endif
+// Leaf and large-node tasks execute at separate times within a CTA.
+#if GPU_PERSISTENT_SQ4_LEAF_BIG_CTA && GPU_PERSISTENT_SQ4_BIG_LEAF_TILE >= 64
+extern __shared__ __align__(32) int sq4_primary_cta_tile[][256];
+#else
+__shared__ __align__(32) int sq4_primary_cta_tile[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][256];
+#endif
+#endif
+
+#if (GPU_PERSISTENT_SQ4_LEAF_CTA || GPU_PERSISTENT_SQ4_LEAF_BIG_CTA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+#ifndef GPU_PERSISTENT_SQ4_LEAF_CTA_MAX_ROWS
+#define GPU_PERSISTENT_SQ4_LEAF_CTA_MAX_ROWS 64
+#endif
+// Reuse the directed leaf's four 8x32 packed operand fragments per warp.
+__shared__ __align__(32) unsigned char sq4_leaf_cta_operands[8][512];
+
+static __device__ void gpu_persistent_sq4_wmma_dot8x8(
+    const signed char* codes, unsigned int stride, unsigned int padded_dim,
+    unsigned int point, unsigned int center, unsigned int resident_rows,
+    unsigned int* a, unsigned int* b, int* dots, unsigned int leading_dim
+);
+
+static __device__ unsigned int sq4_leaf_upper_offset(unsigned int count,
+    unsigned int first, unsigned int second) {
+    return first * (2u * count - first - 1u) / 2u + second - first - 1u;
+}
+
+static __device__ void gpu_persistent_sq4_leaf_cta(
+    const float* meta, const unsigned int* ids, const float* norms,
+    const signed char* codes, const float* scales, const float* center_ids,
+    unsigned int padded_dim, unsigned int stride,
+    const volatile unsigned int* members, unsigned int start, unsigned int count,
+    unsigned int k, unsigned int* output_ids, float* output_scores,
+    unsigned long long* counters
+) {
+    unsigned int lane = threadIdx.x % 32u;
+    unsigned int warp = threadIdx.x / 32u;
+    unsigned int blocks = (count + 7u) / 8u;
+    unsigned int resident_rows = gpu_persistent_resident_row_count(counters);
+    unsigned int* a = reinterpret_cast<unsigned int*>(sq4_leaf_cta_operands[warp]);
+    unsigned int* b = reinterpret_cast<unsigned int*>(sq4_leaf_cta_operands[warp] + 128u);
+    int* tile_dots = reinterpret_cast<int*>(sq4_leaf_cta_operands[warp] + 256u);
+    int* dots = &sq4_primary_cta_tile[0][0];
+    if (threadIdx.x < count) {
+        gpu_persistent_valid_resident_row(members[start + threadIdx.x], resident_rows,
+            counters, GPU_PERSISTENT_INVALID_TOPK_ROW_ID);
+    }
+    unsigned long long begin = clock64();
+    unsigned int row = threadIdx.x;
+    unsigned int point = row < count ? members[start + row] : 0xffffffffu;
+    float scores[4] = {3.402823466e+38F, 3.402823466e+38F, 3.402823466e+38F, 3.402823466e+38F};
+    unsigned int chosen[4] = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    if (count <= 64u) {
+        // The strict upper triangle of 64 points uses 2016 of the existing
+        // 2048 INT32 slots. Self-distances are skipped by the original executor.
+        for (unsigned int task = warp; task < blocks * (blocks + 1u) / 2u;
+             task += blockDim.x / 32u) {
+            unsigned int rb = 0u, cb = task;
+            while (cb >= blocks - rb) { cb -= blocks - rb; ++rb; }
+            cb += rb;
+            unsigned int left = rb * 8u + lane / 4u;
+            unsigned int right = cb * 8u + lane / 4u;
+            unsigned int point = left < count ? members[start + left] : 0xffffffffu;
+            unsigned int candidate = right < count ? members[start + right] : 0xffffffffu;
+            gpu_persistent_sq4_wmma_dot8x8(codes, stride, padded_dim, point, candidate,
+                resident_rows, a, b, tile_dots, 8u);
+            __syncwarp();
+            for (unsigned int cell = lane; cell < 64u; cell += 32u) {
+                unsigned int row = rb * 8u + cell / 8u;
+                unsigned int col = cb * 8u + cell % 8u;
+                if (row < col && col < count)
+                    dots[sq4_leaf_upper_offset(count, row, col)] = tile_dots[cell];
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+        if (row < count) {
+            for (unsigned int col = 0u; col < count; ++col) {
+                unsigned int candidate = members[start + col];
+                if (point >= resident_rows || candidate >= resident_rows || point == candidate) continue;
+                int dot = dots[sq4_leaf_upper_offset(count, min(row, col), max(row, col))];
+                float score = gpu_persistent_rotated_residual_sq8_l2_from_dot(
+                    dot, point, candidate, norms, scales, center_ids, meta);
+                gpu_persistent_insert_topk_candidate_fp32(score, ids[candidate], k, scores, chosen);
+            }
+        }
+    } else {
+        // Stream 32x32 square tiles using the same shared allocation. Visiting
+        // upper tiles lexicographically preserves ascending candidate order for
+        // both endpoints, including the order-sensitive epsilon tie handling.
+        // A 33-int pitch avoids row-reader shared-memory bank conflicts.
+        for (unsigned int rb = 0u; rb < count; rb += 32u) {
+            for (unsigned int cb = rb; cb < count; cb += 32u) {
+                unsigned int tasks = rb == cb ? 10u : 16u;
+                for (unsigned int task = warp; task < tasks; task += blockDim.x / 32u) {
+                    unsigned int r = task / 4u, c = task % 4u;
+                    if (rb == cb) {
+                        r = 0u; c = task;
+                        while (c >= 4u - r) { c -= 4u - r; ++r; }
+                        c += r;
+                    }
+                    unsigned int left = rb + r * 8u + lane / 4u;
+                    unsigned int right = cb + c * 8u + lane / 4u;
+                    unsigned int lhs = left < count ? members[start + left] : 0xffffffffu;
+                    unsigned int rhs = right < count ? members[start + right] : 0xffffffffu;
+                    gpu_persistent_sq4_wmma_dot8x8(codes, stride, padded_dim, lhs, rhs,
+                        resident_rows, a, b, tile_dots, 8u);
+                    __syncwarp();
+                    for (unsigned int cell = lane; cell < 64u; cell += 32u) {
+                        unsigned int i = r * 8u + cell / 8u;
+                        unsigned int j = c * 8u + cell % 8u;
+                        if (rb == cb && i > j) continue;
+                        dots[i * 33u + j] = tile_dots[cell];
+                        if (rb == cb && i != j) dots[j * 33u + i] = tile_dots[cell];
+                    }
+                    __syncwarp();
+                }
+                __syncthreads();
+                bool left_row = row >= rb && row < rb + 32u;
+                bool right_row = cb != rb && row >= cb && row < cb + 32u;
+                if (row < count && (left_row || right_row)) {
+                    unsigned int base = left_row ? cb : rb;
+                    for (unsigned int col = base; col < min(base + 32u, count); ++col) {
+                        unsigned int candidate = members[start + col];
+                        if (point >= resident_rows || candidate >= resident_rows || point == candidate) continue;
+                        int dot = left_row ? dots[(row - rb) * 33u + col - cb]
+                                           : dots[(col - rb) * 33u + row - cb];
+                        float score = gpu_persistent_rotated_residual_sq8_l2_from_dot(
+                            dot, point, candidate, norms, scales, center_ids, meta);
+                        gpu_persistent_insert_topk_candidate_fp32(score, ids[candidate], k, scores, chosen);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+    if (row < count) {
+        unsigned long long offset = ((unsigned long long)start + row) * k;
+        for (unsigned int slot = 0u; slot < k; ++slot) {
+            output_ids[offset + slot] = chosen[slot];
+            output_scores[offset + slot] = scores[slot];
+        }
+        atomicAdd(&counters[P_LEAF_DCO_PREFILTER_CLOCKS], clock64() - begin);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        unsigned long long pairs = (unsigned long long)count * (count - 1u);
+        unsigned int survivors = min(k, count - 1u);
+        atomicAdd(&counters[P_LEAF_SQ8_WMMA_TILES], 1ull);
+        atomicAdd(&counters[P_LEAF_DCO_ROWS], (unsigned long long)count);
+        atomicAdd(&counters[P_LEAF_DCO_PAIR_COUNT], pairs);
+        atomicAdd(&counters[P_LEAF_DCO_PREFILTER_PAIRS], pairs);
+        atomicAdd(&counters[P_LEAF_DCO_PRUNED_PAIRS], pairs - count * survivors);
+        atomicAdd(&counters[P_LEAF_DCO_SURVIVOR_PAIRS], (unsigned long long)count * survivors);
+        atomicAdd(&counters[P_LEAF_DCO_APPROX_OUTPUT_PAIRS], (unsigned long long)count * k);
+        atomicAdd(&counters[P_LEAF_DCO_PREFILTER_ROW_STARTED], (unsigned long long)count);
+        atomicAdd(&counters[P_LEAF_DCO_PREFILTER_ROW_DONE], (unsigned long long)count);
+        atomicAdd(&counters[P_LEAF_DCO_PROGRESS_HEARTBEAT], 2ull * count);
+        gpu_persistent_mark_progress(counters);
+    }
+}
+#if GPU_PERSISTENT_SQ4_LEAF_BIG_CTA
+// A shared distance needs one reproducible floating-point evaluation order.
+// Use global IDs so gathering the same pair in another partition does not
+// choose a different order for the two cross-projection additions.
+static __device__ float gpu_persistent_sq4_leaf_pair_distance(
+    int dot, unsigned int left, unsigned int right, const unsigned int* ids,
+    const float* norms, const float* scales, const float* center_ids, const float* meta
+) {
+    if (ids[left] > ids[right]) {
+        unsigned int swap = left;
+        left = right;
+        right = swap;
+    }
+    return gpu_persistent_rotated_residual_sq8_l2_from_dot(
+        dot, left, right, norms, scales, center_ids, meta);
+}
+
+#ifndef GPU_PERSISTENT_SQ4_LEAF_MICRO16
+#define GPU_PERSISTENT_SQ4_LEAF_MICRO16 0
+#endif
+#if GPU_PERSISTENT_SQ4_LEAF_MICRO16
+using GpuSq4LeafAcc8 = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 8, 8, 32, int>;
+
+#if GPU_PERSISTENT_SQ4_LEAF_CUTLASS
+using GpuSq4LeafCutlassMma = cutlass::arch::Mma<
+    cutlass::gemm::GemmShape<16, 8, 64>, 32,
+    cutlass::int4b_t, cutlass::layout::RowMajor,
+    cutlass::int4b_t, cutlass::layout::ColumnMajor,
+    int, cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAddSaturate>;
+
+static __device__ __forceinline__ void gpu_persistent_sq4_leaf_cutlass_store16x8(
+    const GpuSq4LeafCutlassMma::FragmentC& acc, int* dots,
+    const float* meta, const unsigned int* ids, const float* norms,
+    const float* scales, const float* center_ids,
+    const volatile unsigned int* members, unsigned int start, unsigned int count,
+    unsigned int resident_rows, unsigned int rb, unsigned int cb,
+    unsigned int row0, unsigned int col0, unsigned int pitch
+) {
+    unsigned int lane = threadIdx.x & 31u;
+    // PTX m16n8k64: each lane owns two adjacent columns in two rows.
+    #pragma unroll
+    for (unsigned int element = 0u; element < 4u; ++element) {
+        unsigned int i = row0 + lane / 4u + (element / 2u) * 8u;
+        unsigned int j = col0 + (lane & 3u) * 2u + (element & 1u);
+        if (rb == cb && i > j) continue;
+        int value = acc[element];
+#if GPU_PERSISTENT_SQ4_LEAF_SHARED_DISTANCE
+        unsigned int left = rb + i < count ? members[start + rb + i] : 0xffffffffu;
+        unsigned int right = cb + j < count ? members[start + cb + j] : 0xffffffffu;
+        float score = 3.402823466e+38F;
+        if (left < resident_rows && right < resident_rows && left != right)
+            score = gpu_persistent_sq4_leaf_pair_distance(
+                value, left, right, ids, norms, scales, center_ids, meta);
+        value = __float_as_int(score);
+#endif
+        dots[i * pitch + j] = value;
+        if (rb == cb && i != j) dots[j * pitch + i] = value;
+    }
+}
+#endif
+
+// The caller starts phase zero. After operand consumption, its first 256 bytes
+// become an 8x8 accumulator staging area; no additional shared storage is needed.
+static __device__ __forceinline__ void gpu_persistent_sq4_leaf_store_acc8(
+    const GpuSq4LeafAcc8& acc, int* temporary, int* dots,
+    const float* meta, const unsigned int* ids, const float* norms,
+    const float* scales, const float* center_ids,
+    const volatile unsigned int* members, unsigned int start, unsigned int count,
+    unsigned int resident_rows, unsigned int rb, unsigned int cb,
+    unsigned int row0, unsigned int col0, unsigned int pitch
+) {
+    nvcuda::wmma::store_matrix_sync(temporary, acc, 8, nvcuda::wmma::mem_row_major);
+    __syncwarp();
+    lp_phase_end(0);
+    lp_phase_begin(1);
+    unsigned int lane = threadIdx.x & 31u;
+    for (unsigned int cell = lane; cell < 64u; cell += 32u) {
+        unsigned int i = row0 + cell / 8u, j = col0 + cell % 8u;
+        if (rb == cb && i > j) continue;
+        int value = temporary[cell];
+#if GPU_PERSISTENT_SQ4_LEAF_SHARED_DISTANCE
+        unsigned int left = rb + i < count ? members[start + rb + i] : 0xffffffffu;
+        unsigned int right = cb + j < count ? members[start + cb + j] : 0xffffffffu;
+        float score = 3.402823466e+38F;
+        if (left < resident_rows && right < resident_rows && left != right)
+            score = gpu_persistent_sq4_leaf_pair_distance(
+                value, left, right, ids, norms, scales, center_ids, meta);
+        value = __float_as_int(score);
+#endif
+        dots[i * pitch + j] = value;
+        if (rb == cb && i != j) dots[j * pitch + i] = value;
+    }
+    // All lanes must finish reading temporary before the next accumulator store.
+    __syncwarp();
+    lp_phase_end(1);
+}
+
+static __device__ __forceinline__ void gpu_persistent_sq4_leaf_produce16(
+    const float* meta, const unsigned int* ids, const float* norms,
+    const signed char* codes, const float* scales, const float* center_ids,
+    unsigned int padded_dim, unsigned int stride,
+    const volatile unsigned int* members, unsigned int start, unsigned int count,
+    unsigned int resident_rows, unsigned int rb, unsigned int cb,
+    unsigned int r, unsigned int c, unsigned int pitch,
+    unsigned char* operands, int* dots
+) {
+    namespace wmma = nvcuda::wmma;
+    using s4 = wmma::experimental::precision::s4;
+    unsigned int lane = threadIdx.x & 31u;
+    unsigned int row = rb + r * 16u + lane / 4u;
+    unsigned int col = cb + c * 16u + lane / 4u;
+    unsigned int lhs0 = row < count ? members[start + row] : 0xffffffffu;
+    unsigned int lhs1 = row + 8u < count ? members[start + row + 8u] : 0xffffffffu;
+    unsigned int rhs0 = col < count ? members[start + col] : 0xffffffffu;
+    unsigned int rhs1 = col + 8u < count ? members[start + col + 8u] : 0xffffffffu;
+#if GPU_PERSISTENT_SQ4_LEAF_CUTLASS
+    GpuSq4LeafCutlassMma::FragmentA a;
+    GpuSq4LeafCutlassMma::FragmentB b0, b1;
+    GpuSq4LeafCutlassMma::FragmentC c0, c1;
+    c0.clear(); c1.clear();
+    unsigned int* aw = reinterpret_cast<unsigned int*>(&a);
+    unsigned int* b0w = reinterpret_cast<unsigned int*>(&b0);
+    unsigned int* b1w = reinterpret_cast<unsigned int*>(&b1);
+    const unsigned int* words = reinterpret_cast<const unsigned int*>(codes);
+    GpuSq4LeafCutlassMma mma;
+    lp_phase_begin(0);
+    // Packed s4 rows are already in PTX register order. Gather only codes;
+    // the point's primary centroid and the distance/top-k rules are unchanged.
+    // K is padded to 32, so the last 32 elements of a 64-wide MMA may be zero.
+    for (unsigned int axis = 0u; axis < padded_dim; axis += 64u) {
+        unsigned int offset = (axis >> 3) + (lane & 3u);
+        aw[0] = lhs0 < resident_rows ? words[(unsigned long long)lhs0 * (stride / 4u) + offset] : 0u;
+        aw[1] = lhs1 < resident_rows ? words[(unsigned long long)lhs1 * (stride / 4u) + offset] : 0u;
+        aw[2] = lhs0 < resident_rows && axis + 32u < padded_dim ? words[(unsigned long long)lhs0 * (stride / 4u) + offset + 4u] : 0u;
+        aw[3] = lhs1 < resident_rows && axis + 32u < padded_dim ? words[(unsigned long long)lhs1 * (stride / 4u) + offset + 4u] : 0u;
+        b0w[0] = rhs0 < resident_rows ? words[(unsigned long long)rhs0 * (stride / 4u) + offset] : 0u;
+        b0w[1] = rhs0 < resident_rows && axis + 32u < padded_dim ? words[(unsigned long long)rhs0 * (stride / 4u) + offset + 4u] : 0u;
+        b1w[0] = rhs1 < resident_rows ? words[(unsigned long long)rhs1 * (stride / 4u) + offset] : 0u;
+        b1w[1] = rhs1 < resident_rows && axis + 32u < padded_dim ? words[(unsigned long long)rhs1 * (stride / 4u) + offset + 4u] : 0u;
+        mma(c0, a, b0, c0);
+        mma(c1, a, b1, c1);
+    }
+    lp_phase_end(0);
+    lp_phase_begin(1);
+    gpu_persistent_sq4_leaf_cutlass_store16x8(c0, dots, meta, ids, norms, scales,
+        center_ids, members, start, count, resident_rows, rb, cb, r * 16u, c * 16u, pitch);
+    gpu_persistent_sq4_leaf_cutlass_store16x8(c1, dots, meta, ids, norms, scales,
+        center_ids, members, start, count, resident_rows, rb, cb, r * 16u, c * 16u + 8u, pitch);
+    lp_phase_end(1);
+#else
+    unsigned int* a = reinterpret_cast<unsigned int*>(operands);
+    unsigned int* b = a + 64u;
+    const unsigned int* words = reinterpret_cast<const unsigned int*>(codes);
+    bool diagonal = rb == cb && r == c;
+    wmma::fragment<wmma::matrix_a, 8, 8, 32, s4, wmma::row_major> a0, a1;
+    wmma::fragment<wmma::matrix_b, 8, 8, 32, s4, wmma::col_major> b0, b1;
+    GpuSq4LeafAcc8 c00, c01, c10, c11;
+    lp_phase_begin(0);
+    wmma::fill_fragment(c00, 0); wmma::fill_fragment(c01, 0);
+    wmma::fill_fragment(c10, 0); wmma::fill_fragment(c11, 0);
+    for (unsigned int axis = 0u; axis < padded_dim; axis += 32u) {
+        unsigned int offset = (axis >> 3) + (lane & 3u);
+        a[lane] = lhs0 < resident_rows ? words[(unsigned long long)lhs0 * (stride / 4u) + offset] : 0u;
+        a[lane + 32u] = lhs1 < resident_rows ? words[(unsigned long long)lhs1 * (stride / 4u) + offset] : 0u;
+        b[lane] = rhs0 < resident_rows ? words[(unsigned long long)rhs0 * (stride / 4u) + offset] : 0u;
+        b[lane + 32u] = rhs1 < resident_rows ? words[(unsigned long long)rhs1 * (stride / 4u) + offset] : 0u;
+        __syncwarp();
+        wmma::load_matrix_sync(a0, a, 32); wmma::load_matrix_sync(a1, a + 32u, 32);
+        wmma::load_matrix_sync(b0, b, 32); wmma::load_matrix_sync(b1, b + 32u, 32);
+        wmma::mma_sync(c00, a0, b0, c00); wmma::mma_sync(c01, a0, b1, c01);
+        if (!diagonal) wmma::mma_sync(c10, a1, b0, c10);
+        wmma::mma_sync(c11, a1, b1, c11);
+        __syncwarp();
+    }
+    // Accumulators now live in registers. Alias the dead A operands for each
+    // 8x8 store/recovery step, preserving the existing 512B per-warp allocation.
+    int* temporary = reinterpret_cast<int*>(operands);
+#define SQ4_STORE_ACC(fragment, dr, dc) \
+    gpu_persistent_sq4_leaf_store_acc8(fragment, temporary, dots, meta, ids, norms, \
+        scales, center_ids, members, start, count, resident_rows, rb, cb, \
+        r * 16u + dr, c * 16u + dc, pitch)
+    SQ4_STORE_ACC(c00, 0u, 0u);
+    lp_phase_begin(0); SQ4_STORE_ACC(c01, 0u, 8u);
+    if (!diagonal) { lp_phase_begin(0); SQ4_STORE_ACC(c10, 8u, 0u); }
+    lp_phase_begin(0); SQ4_STORE_ACC(c11, 8u, 8u);
+#undef SQ4_STORE_ACC
+#endif
+}
+#endif
+
+static __device__ void gpu_persistent_sq4_big_leaf_cta(
+    const float* meta, const unsigned int* ids, const float* norms,
+    const signed char* codes, const float* scales, const float* center_ids,
+    unsigned int padded_dim, unsigned int stride,
+    const volatile unsigned int* members, unsigned int start, unsigned int count,
+    unsigned int k, unsigned int* output_ids, float* output_scores,
+    unsigned long long* counters
+) {
+#if !GPU_PERSISTENT_SQ4_LEAF_MICRO16
+    unsigned int lane = threadIdx.x % 32u;
+#endif
+    unsigned int warp = threadIdx.x / 32u;
+    unsigned int resident_rows = gpu_persistent_resident_row_count(counters);
+#if !GPU_PERSISTENT_SQ4_LEAF_MICRO16
+    unsigned int* a = reinterpret_cast<unsigned int*>(sq4_leaf_cta_operands[warp]);
+    unsigned int* b = reinterpret_cast<unsigned int*>(sq4_leaf_cta_operands[warp] + 128u);
+    int* tile_dots = reinterpret_cast<int*>(sq4_leaf_cta_operands[warp] + 256u);
+#endif
+    int* dots = &sq4_primary_cta_tile[0][0];
+    // One thread retains up to five rows across every tile. No partial top-k
+    // merge: epsilon ties must observe the original ascending column order.
+    unsigned int points[5];
+    float scores[5][4];
+    unsigned int chosen[5][4];
+    #pragma unroll
+    for (unsigned int slot = 0u; slot < 5u; ++slot) {
+        unsigned int row = threadIdx.x + slot * 256u;
+        points[slot] = row < count ? members[start + row] : 0xffffffffu;
+        if (row < count) gpu_persistent_valid_resident_row(points[slot], resident_rows,
+            counters, GPU_PERSISTENT_INVALID_TOPK_ROW_ID);
+        #pragma unroll
+        for (unsigned int j = 0u; j < 4u; ++j) {
+            scores[slot][j] = 3.402823466e+38F;
+            chosen[slot][j] = 0xffffffffu;
+        }
+    }
+    unsigned long long begin = clock64();
+    constexpr unsigned int edge = GPU_PERSISTENT_SQ4_BIG_LEAF_TILE;
+#if GPU_PERSISTENT_SQ4_LEAF_MICRO16
+    static_assert(edge % 16u == 0u, "16x16 reuse requires an outer tile divisible by 16");
+    constexpr unsigned int blocks = edge / 16u;
+#else
+    constexpr unsigned int blocks = edge / 8u;
+#endif
+    constexpr unsigned int pitch = edge + 1u;
+    // Stream square tiles, visiting candidates in their original order. Visiting
+    // upper tiles lexicographically preserves ascending candidate order for
+    // both endpoints, including the order-sensitive epsilon tie handling.
+    // One padding column avoids row-reader shared-memory bank conflicts.
+    for (unsigned int rb = 0u; rb < count; rb += edge) {
+        for (unsigned int cb = rb; cb < count; cb += edge) {
+            unsigned int tasks = rb == cb ? blocks * (blocks + 1u) / 2u : blocks * blocks;
+            for (unsigned int task = warp; task < tasks; task += blockDim.x / 32u) {
+                unsigned int r = task / blocks, c = task % blocks;
+                if (rb == cb) {
+                    r = 0u; c = task;
+                    while (c >= blocks - r) { c -= blocks - r; ++r; }
+                    c += r;
+                }
+#if GPU_PERSISTENT_SQ4_LEAF_MICRO16
+                gpu_persistent_sq4_leaf_produce16(meta, ids, norms, codes, scales, center_ids,
+                    padded_dim, stride, members, start, count, resident_rows, rb, cb, r, c,
+                    pitch, sq4_leaf_cta_operands[warp], dots);
+#else
+                unsigned int left = rb + r * 8u + lane / 4u;
+                unsigned int right = cb + c * 8u + lane / 4u;
+                unsigned int lhs = left < count ? members[start + left] : 0xffffffffu;
+                unsigned int rhs = right < count ? members[start + right] : 0xffffffffu;
+                lp_phase_begin(0);
+                gpu_persistent_sq4_wmma_dot8x8(codes, stride, padded_dim, lhs, rhs,
+                    resident_rows, a, b, tile_dots, 8u);
+                __syncwarp();
+                lp_phase_end(0);
+                lp_phase_begin(1);
+                for (unsigned int cell = lane; cell < 64u; cell += 32u) {
+                    unsigned int i = r * 8u + cell / 8u;
+                    unsigned int j = c * 8u + cell % 8u;
+                    if (rb == cb && i > j) continue;
+                    int value = tile_dots[cell];
+#if GPU_PERSISTENT_SQ4_LEAF_SHARED_DISTANCE
+                    // Recover the full distance once per unordered pair. The
+                    // same shared slot serves both independent top-k owners;
+                    // no second projection/Gram lookup or distance recovery.
+                    unsigned int left = rb + i < count ? members[start + rb + i] : 0xffffffffu;
+                    unsigned int right = cb + j < count ? members[start + cb + j] : 0xffffffffu;
+                    float score = 3.402823466e+38F;
+                    if (left < resident_rows && right < resident_rows && left != right) {
+                        score = gpu_persistent_sq4_leaf_pair_distance(
+                            value, left, right, ids, norms, scales, center_ids, meta);
+                    }
+                    value = __float_as_int(score);
+#endif
+                    dots[i * pitch + j] = value;
+                    if (rb == cb && i != j) dots[j * pitch + i] = value;
+                }
+                __syncwarp();
+                lp_phase_end(1);
+#endif
+            }
+            lp_phase_begin(3);
+            __syncthreads();
+            lp_phase_end(3);
+            lp_phase_begin(2);
+            #pragma unroll
+            for (unsigned int slot = 0u; slot < 5u; ++slot) {
+                unsigned int row = threadIdx.x + slot * 256u;
+                unsigned int point = points[slot];
+                bool left_row = row >= rb && row < rb + edge;
+                bool right_row = cb != rb && row >= cb && row < cb + edge;
+                if (row < count && (left_row || right_row)) {
+                    unsigned int base = left_row ? cb : rb;
+                    for (unsigned int col = base; col < min(base + edge, count); ++col) {
+                        unsigned int candidate = members[start + col];
+                        if (point >= resident_rows || candidate >= resident_rows || point == candidate) continue;
+                        int dot = left_row ? dots[(row - rb) * pitch + col - cb]
+                                           : dots[(col - rb) * pitch + row - cb];
+#if GPU_PERSISTENT_SQ4_LEAF_SHARED_DISTANCE
+                        float score = __int_as_float(dot);
+#else
+                        float score = gpu_persistent_rotated_residual_sq8_l2_from_dot(
+                            dot, point, candidate, norms, scales, center_ids, meta);
+#endif
+                        gpu_persistent_insert_topk_candidate_fp32(score, ids[candidate], k, scores[slot], chosen[slot]);
+                    }
+                }
+            }
+            lp_phase_end(2);
+            lp_phase_begin(4);
+            __syncthreads();
+            lp_phase_end(4);
+        }
+    }
+    #pragma unroll
+    for (unsigned int slot = 0u; slot < 5u; ++slot) {
+        unsigned int row = threadIdx.x + slot * 256u;
+        if (row < count) {
+            unsigned long long offset = ((unsigned long long)start + row) * k;
+            for (unsigned int j = 0u; j < k; ++j) {
+                output_ids[offset + j] = chosen[slot][j];
+                output_scores[offset + j] = scores[slot][j];
+            }
+            atomicAdd(&counters[P_LEAF_DCO_PREFILTER_CLOCKS], clock64() - begin);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        unsigned long long pairs = (unsigned long long)count * (count - 1u);
+        unsigned int survivors = min(k, count - 1u);
+        atomicAdd(&counters[P_LEAF_SQ8_WMMA_TILES], 1ull);
+        atomicAdd(&counters[P_LEAF_DCO_ROWS], (unsigned long long)count);
+        atomicAdd(&counters[P_LEAF_DCO_PAIR_COUNT], pairs);
+        atomicAdd(&counters[P_LEAF_DCO_PREFILTER_PAIRS], pairs);
+        atomicAdd(&counters[P_LEAF_DCO_PRUNED_PAIRS], pairs - count * survivors);
+        atomicAdd(&counters[P_LEAF_DCO_SURVIVOR_PAIRS], (unsigned long long)count * survivors);
+        atomicAdd(&counters[P_LEAF_DCO_APPROX_OUTPUT_PAIRS], (unsigned long long)count * k);
+        atomicAdd(&counters[P_LEAF_DCO_PREFILTER_ROW_STARTED], (unsigned long long)count);
+        atomicAdd(&counters[P_LEAF_DCO_PREFILTER_ROW_DONE], (unsigned long long)count);
+        atomicAdd(&counters[P_LEAF_DCO_PROGRESS_HEARTBEAT], 2ull * count);
+        gpu_persistent_mark_progress(counters);
+    }
+}
+#endif
+
 #endif
 
 static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_filter(
@@ -10985,7 +12008,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_fi
     unsigned int col_task_base,
     unsigned int col_task_count,
     unsigned int staged_output,
-    unsigned long long* wmma_diag_counters
+    unsigned long long* wmma_diag_counters,
+    unsigned int distance_source
 ) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750) && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
     unsigned int tile_end = tile_offset + tile_rows;
@@ -11044,13 +12068,58 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_fi
             }
         }
 
+#if GPU_PERSISTENT_SQ4_LEAF_BIG_CTA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900
+        if (row_count > 384u && row_count <= 1280u && k <= 4u && blockDim.x == 256u
+            && GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_TILE_CALLS == 0
+            && GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_K_SLICES == 0
+            && col_task_base == 0u && task_col_count == row_count && staged_output == 0u
+            && distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL) {
+            // Keep queue scheduling unchanged: the first row task owns the full
+            // leaf, and the others only finish their existing task bookkeeping.
+            if (tile_offset == 0u) gpu_persistent_sq4_big_leaf_cta(
+                resident_x, resident_global_ids, resident_norms,
+                leaf_sq_int8_codes, leaf_sq_int8_scales, leaf_sq_int8_sums,
+                leaf_sq_int8_padded_dim, leaf_sq_int8_code_row_bytes,
+                leaf_row_ids, row_start, row_count, k, topk_ids, topk_dists, counters);
+            return;
+        }
+#endif
+#if GPU_PERSISTENT_SQ4_LEAF_CTA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900
+        if (row_count <= GPU_PERSISTENT_SQ4_LEAF_CTA_MAX_ROWS && k <= 4u && tile_offset == 0u && tile_rows == row_count
+            && GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_TILE_CALLS == 0
+            && GPU_PERSISTENT_TOPK_WMMA_DEBUG_ABORT_AFTER_K_SLICES == 0
+            && col_task_base == 0u && task_col_count == row_count && staged_output == 0u
+            && distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL) {
+            gpu_persistent_sq4_leaf_cta(resident_x, resident_global_ids, resident_norms,
+                leaf_sq_int8_codes, leaf_sq_int8_scales, leaf_sq_int8_sums,
+                leaf_sq_int8_padded_dim, leaf_sq_int8_code_row_bytes,
+                leaf_row_ids, row_start, row_count, k, topk_ids, topk_dists, counters);
+            return;
+        }
+#endif
         const unsigned char* leaf_sq_s4_codes =
             reinterpret_cast<const unsigned char*>(leaf_sq_int8_codes);
+#if (GPU_PERSISTENT_SQ4_LEAF_CTA || GPU_PERSISTENT_SQ4_LEAF_BIG_CTA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900
+        unsigned char* a_top_tile = sq4_leaf_cta_operands[warp];
+        unsigned char* a_bottom_tile = sq4_leaf_cta_operands[warp] + 128u;
+        unsigned char* b_left_tile = sq4_leaf_cta_operands[warp] + 256u;
+        unsigned char* b_right_tile = sq4_leaf_cta_operands[warp] + 384u;
+#else
         __shared__ __align__(32) unsigned char sq4_a_top[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][8u * 16u];
         __shared__ __align__(32) unsigned char sq4_a_bottom[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][8u * 16u];
         __shared__ __align__(32) unsigned char sq4_b_left[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][8u * 16u];
         __shared__ __align__(32) unsigned char sq4_b_right[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][8u * 16u];
+        unsigned char* a_top_tile = &sq4_a_top[warp][0];
+        unsigned char* a_bottom_tile = &sq4_a_bottom[warp][0];
+        unsigned char* b_left_tile = &sq4_b_left[warp][0];
+        unsigned char* b_right_tile = &sq4_b_right[warp][0];
+#endif
+#if (GPU_PERSISTENT_SQ4_PRIMARY_RECT8X32 || GPU_PERSISTENT_SQ4_LEAF_CTA || GPU_PERSISTENT_SQ4_LEAF_BIG_CTA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+        int* c_tile = sq4_primary_cta_tile[warp];
+#else
         __shared__ __align__(32) int sq4_c[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][GPU_PERSISTENT_TOPK_WMMA_M * GPU_PERSISTENT_TOPK_WMMA_N];
+        int* c_tile = &sq4_c[warp][0];
+#endif
         __shared__ unsigned int sq4_a_local_ids[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][GPU_PERSISTENT_TOPK_WMMA_M];
         __shared__ unsigned int sq4_b_local_ids[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][GPU_PERSISTENT_TOPK_WMMA_N];
         __shared__ unsigned int sq4_b_global_ids[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][GPU_PERSISTENT_TOPK_WMMA_N];
@@ -11059,11 +12128,7 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_fi
         __shared__ float sq4_a_sums[GPU_PERSISTENT_TOPK_WMMA_WARPS_PER_CTA][GPU_PERSISTENT_TOPK_WMMA_M];
         __shared__ unsigned int sq4_wmma_debug_abort_cta;
 
-        unsigned char* a_top_tile = &sq4_a_top[warp][0];
-        unsigned char* a_bottom_tile = &sq4_a_bottom[warp][0];
-        unsigned char* b_left_tile = &sq4_b_left[warp][0];
-        unsigned char* b_right_tile = &sq4_b_right[warp][0];
-        int* c_tile = &sq4_c[warp][0];
+
         unsigned int* a_local_ids = &sq4_a_local_ids[warp][0];
         unsigned int* b_local_ids = &sq4_b_local_ids[warp][0];
         unsigned int* b_global_ids = &sq4_b_global_ids[warp][0];
@@ -11144,6 +12209,7 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_fi
             }
             unsigned long long prefilter_start = clock64();
             for (unsigned int col_base = col_task_base; col_base < col_task_end; col_base += GPU_PERSISTENT_TOPK_WMMA_N) {
+                lp_phase_begin(0);
                 unsigned int active_cols = col_task_end - col_base;
                 if (active_cols > GPU_PERSISTENT_TOPK_WMMA_N) {
                     active_cols = GPU_PERSISTENT_TOPK_WMMA_N;
@@ -11289,6 +12355,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_fi
                     nvcuda::wmma::mem_row_major
                 );
                 __syncwarp();
+                lp_phase_end(0);
+                lp_phase_begin(2);
                 gpu_persistent_sq_wmma_consume_sq_filter_c_tile(
                     c_tile,
                     a_local_ids,
@@ -11303,11 +12371,16 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_fi
                     row_band_end,
                     active_cols,
                     survivor_limit,
+                    0u,
+                    0u,
                     survivor_dist,
                     survivor_local_id,
-                    survivor_id
+                    survivor_id,
+                    leaf_sq_int8_sums,
+                    distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL ? resident_x : 0
                 );
                 __syncwarp();
+                lp_phase_end(2);
             }
 
             if (active_row) {
@@ -11395,7 +12468,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int4_wmma_fi
         leaf_dco_audit,
         col_task_base,
         col_task_count,
-        staged_output
+        staged_output,
+        distance_source
     );
 }
 
@@ -11438,6 +12512,7 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_filter(
     unsigned int staged_output,
     unsigned int sq8_leaf_mode,
     unsigned int sq8_leaf_executor,
+    unsigned int distance_source,
     GpuPersistentSq8WmmaScratch* scratch,
     unsigned long long* wmma_diag_counters
 ) {
@@ -11546,7 +12621,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_filter(
             col_task_base,
             col_task_count,
             staged_output,
-            wmma_diag_counters
+            wmma_diag_counters,
+            distance_source
         );
         return;
     }
@@ -11604,7 +12680,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_filter(
             leaf_dco_audit,
             col_task_base,
             col_task_count,
-            staged_output
+            staged_output,
+            distance_source
         );
         return;
     }
@@ -11720,7 +12797,8 @@ static __device__ void gpu_persistent_compute_topk_leaf_tile_cta_sq_int8_filter(
             leaf_dco_audit,
             col_task_base,
             col_task_count,
-            staged_output
+            staged_output,
+            distance_source
         );
         return;
     }
@@ -11837,6 +12915,135 @@ static __device__ void gpu_persistent_push_leaf(
     gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_LEAF_INDEX, leaf_idx);
     gpu_persistent_mark_progress(counters);
 }
+
+#ifndef GPU_PERSISTENT_PUBLISH_CTA_COPY
+#define GPU_PERSISTENT_PUBLISH_CTA_COPY 0
+#endif
+#if GPU_PERSISTENT_PUBLISH_CTA_COPY
+// Only the lock-owning PUBLISH CTA calls this collectively. Allocation and
+// descriptor publication stay serial; member positions are copied in parallel.
+static __device__ void gpu_persistent_push_leaf_cta(
+    const unsigned int* rows,
+    unsigned int row_count,
+    unsigned int* leaf_row_ids,
+    unsigned int* row_leaf_ids,
+    unsigned long long* leaf_starts,
+    unsigned long long* leaf_sizes,
+    unsigned int* leaf_queue,
+    unsigned long long* counters,
+    unsigned int max_leaf_count,
+    unsigned int max_leaf_rows,
+    unsigned int leaf_tile_rows,
+    unsigned int partition_only,
+    unsigned int staged_leaf_dco
+) {
+    __shared__ unsigned long long shared_leaf_index, shared_row_begin;
+    __shared__ unsigned int shared_copy_valid;
+    if (leaf_tile_rows == 0u) leaf_tile_rows = 1u;
+    if (threadIdx.x == 0u) {
+        shared_copy_valid = 0u;
+        do {
+            unsigned long long leaf_idx = atomicAdd(&counters[P_OUTPUT_LEAF_COUNT], 1ull);
+            if (leaf_idx >= max_leaf_count) {
+                atomicOr(&counters[P_OVERFLOW_FLAGS], GPU_PERSISTENT_LEAF_DESC_OVERFLOW);
+                break;
+            }
+            unsigned long long row_start = atomicAdd(&counters[P_OUTPUT_ROWS], (unsigned long long)row_count);
+            if (row_start + row_count > max_leaf_rows) {
+                atomicOr(&counters[P_OVERFLOW_FLAGS], GPU_PERSISTENT_LEAF_ROW_OVERFLOW);
+                break;
+            }
+            gpu_persistent_record_leaf_size(counters, row_count);
+            ((volatile unsigned long long*)leaf_starts)[leaf_idx] = row_start;
+            ((volatile unsigned long long*)leaf_sizes)[leaf_idx] = row_count;
+            shared_leaf_index = leaf_idx;
+            shared_row_begin = row_start;
+            shared_copy_valid = 1u;
+        } while (false);
+    }
+    __syncthreads();
+    if (shared_copy_valid == 0u) return;
+    unsigned long long leaf_idx = shared_leaf_index;
+    unsigned long long row_start = shared_row_begin;
+    for (unsigned int i = threadIdx.x; i < row_count; i += blockDim.x) {
+        ((volatile unsigned int*)leaf_row_ids)[row_start + i] = rows[i];
+        ((volatile unsigned int*)row_leaf_ids)[row_start + i] = (unsigned int)leaf_idx;
+    }
+    // Every writer releases its global stores before the owner publishes ready.
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        volatile unsigned int* volatile_leaf_queue = (volatile unsigned int*)leaf_queue;
+        do {
+    atomicMax(&counters[P_LEAF_TAIL], leaf_idx + 1ull);
+    if (partition_only != 0u && partition_only != GPU_PERSISTENT_PARTITION_ONLY_EMIT_TASKS) {
+        gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_LEAF_ROWS, (unsigned long long)row_count);
+        gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_LEAF_INDEX, leaf_idx);
+        gpu_persistent_mark_progress(counters);
+        break;
+    }
+    unsigned int tile_count = (row_count + leaf_tile_rows - 1u) / leaf_tile_rows;
+    if (tile_count == 0u) {
+        tile_count = 1u;
+    }
+    unsigned int col_task_count = 1u;
+    if (staged_leaf_dco != 0u
+        && row_count > GPU_PERSISTENT_LEAF_DCO_STAGED_COL_COUNT * 4u) {
+        col_task_count =
+            (row_count + GPU_PERSISTENT_LEAF_DCO_STAGED_COL_COUNT - 1u)
+                / GPU_PERSISTENT_LEAF_DCO_STAGED_COL_COUNT;
+        if (col_task_count == 0u) {
+            col_task_count = 1u;
+        }
+    }
+    unsigned long long total_tasks =
+        ((unsigned long long)tile_count) * ((unsigned long long)col_task_count);
+    unsigned long long tile_base = atomicAdd(&counters[P_LEAF_PUSHES], total_tasks);
+    if (tile_base + total_tasks > max_leaf_count) {
+        atomicOr(&counters[P_OVERFLOW_FLAGS], GPU_PERSISTENT_LEAF_DESC_OVERFLOW);
+        break;
+    }
+    unsigned long long task_ordinal = 0ull;
+    for (unsigned int tile = 0u; tile < tile_count; ++tile) {
+        unsigned int tile_offset = tile * leaf_tile_rows;
+        unsigned int tile_rows = row_count - tile_offset;
+        if (tile_rows > leaf_tile_rows) {
+            tile_rows = leaf_tile_rows;
+        }
+        for (unsigned int col_task = 0u; col_task < col_task_count; ++col_task) {
+            unsigned int col_base = 0u;
+            unsigned int col_count = row_count;
+            if (staged_leaf_dco != 0u && col_task_count > 1u) {
+                col_base = col_task * GPU_PERSISTENT_LEAF_DCO_STAGED_COL_COUNT;
+                col_count = row_count - col_base;
+                if (col_count > GPU_PERSISTENT_LEAF_DCO_STAGED_COL_COUNT) {
+                    col_count = GPU_PERSISTENT_LEAF_DCO_STAGED_COL_COUNT;
+                }
+            }
+            volatile unsigned int* desc = volatile_leaf_queue
+                + (tile_base + task_ordinal) * GPU_PERSISTENT_LEAF_WORDS;
+            desc[5] = 0u;
+            desc[0] = (unsigned int)row_start;
+            desc[1] = row_count;
+            desc[2] = (unsigned int)leaf_idx;
+            desc[3] = tile_offset;
+            desc[4] = tile_rows;
+            desc[6] = col_base;
+            desc[7] = col_count;
+            __threadfence();
+            desc[5] = 1u;
+            __threadfence();
+            task_ordinal += 1ull;
+        }
+    }
+    gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_LEAF_ROWS, (unsigned long long)row_count);
+    gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_LEAF_INDEX, leaf_idx);
+    gpu_persistent_mark_progress(counters);
+        } while (false);
+    }
+    __syncthreads();
+}
+#endif
 
 static __device__ bool gpu_persistent_try_drain_leaf_tile_cta(
     const float* resident_x,
@@ -11972,6 +13179,9 @@ static __device__ bool gpu_persistent_try_drain_leaf_tile_cta(
                         }
 #endif
                         gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_LEAF_ROWS, (unsigned long long)shared_tile_rows);
+#if GPU_PERSISTENT_LEAF_PROFILE
+                        lp_begin_task(shared_row_start);
+#endif
                         shared_has_leaf = 1u;
                     }
                 }
@@ -11986,6 +13196,9 @@ static __device__ bool gpu_persistent_try_drain_leaf_tile_cta(
         return false;
     }
     unsigned long long topk_busy_start = clock64();
+#if GPU_PERSISTENT_LEAF_PROFILE
+    unsigned long long lp_task_start = threadIdx.x == 0 ? lp_now() : 0;
+#endif
 #if GPU_PERSISTENT_LEAF_DCO_ENABLE
     unsigned int turboquant_scoring_dim = gpu_persistent_turboquant_mse4_effective_dim(dim, leaf_dco_proj_dim);
     bool turboquant_filter_requested =
@@ -12183,6 +13396,7 @@ static __device__ bool gpu_persistent_try_drain_leaf_tile_cta(
             sq_int8_staged_output ? 1u : 0u,
             sq8_leaf_mode,
             sq8_leaf_executor,
+            quantized_distance_source,
             sq8_wmma_scratch,
             wmma_diag_counters
         );
@@ -12280,7 +13494,14 @@ static __device__ bool gpu_persistent_try_drain_leaf_tile_cta(
 #if GPU_PERSISTENT_LEAF_DCO_ENABLE
     }
 #endif
+#if GPU_PERSISTENT_LEAF_PROFILE
+    unsigned long long lp_barrier_start = threadIdx.x == 0 ? lp_now() : 0;
+#endif
     __syncthreads();
+#if GPU_PERSISTENT_LEAF_PROFILE
+    if (threadIdx.x == 0) lp_finish_task(shared_row_start, shared_row_count,
+        shared_tile_offset, shared_leaf_idx, lp_task_start, lp_barrier_start, lp_now());
+#endif
     if (threadIdx.x == 0u) {
         (void)shared_leaf_idx;
         atomicAdd(&counters[P_TOPK_BUSY_CLOCKS], clock64() - topk_busy_start);
@@ -12433,6 +13654,55 @@ static __device__ bool gpu_persistent_publish_partition_child(
     return true;
 }
 
+#if GPU_PERSISTENT_PUBLISH_CTA_COPY
+static __device__ bool gpu_persistent_publish_partition_child_cta(
+    const unsigned int* rows, unsigned int row_count, unsigned int depth,
+    unsigned long long seed, unsigned int* partition_queue,
+    unsigned int* partition_rows, unsigned int* partition_free_stack,
+    unsigned long long* counters, unsigned int max_queue_nodes,
+    unsigned int max_queue_rows
+) {
+    __shared__ unsigned long long shared_next_idx;
+    __shared__ unsigned int shared_next_start, shared_row_owned, shared_valid_copy;
+    if (threadIdx.x == 0u) {
+        shared_valid_copy = 0u;
+        unsigned long long next_idx = atomicAdd(&counters[P_PARTITION_TAIL], 1ull);
+        if (next_idx >= max_queue_nodes) {
+            atomicOr(&counters[P_OVERFLOW_FLAGS], GPU_PERSISTENT_QUEUE_NODE_OVERFLOW);
+        } else {
+            unsigned int next_start = 0u, row_owned = 0u;
+            if (gpu_persistent_alloc_partition_rows(row_count, partition_free_stack,
+                counters, max_queue_rows, &next_start, &row_owned)) {
+                shared_next_idx = next_idx;
+                shared_next_start = next_start;
+                shared_row_owned = row_owned;
+                shared_valid_copy = 1u;
+            }
+        }
+    }
+    __syncthreads();
+    if (shared_valid_copy == 0u) return false;
+    for (unsigned int i = threadIdx.x; i < row_count; i += blockDim.x)
+        partition_rows[shared_next_start + i] = rows[i];
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        unsigned long long next_idx = shared_next_idx;
+        unsigned int* out = partition_queue + next_idx * GPU_PERSISTENT_NODE_WORDS;
+        out[0] = shared_next_start; out[1] = row_count; out[2] = depth;
+        out[3] = (unsigned int)(seed & 0xffffffffull);
+        out[4] = (unsigned int)(seed >> 32); out[5] = 0u; out[6] = shared_row_owned;
+        __threadfence(); out[5] = 1u; __threadfence();
+        gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_NODE_ROWS, (unsigned long long)row_count);
+        gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_NODE_DEPTH, (unsigned long long)depth);
+        gpu_persistent_counter_store(counters, P_SNAPSHOT_LAST_NODE_INDEX, next_idx);
+        gpu_persistent_mark_progress(counters);
+    }
+    __syncthreads();
+    return true;
+}
+#endif
+
 static __device__ void gpu_persistent_large_lock(
     unsigned int* large_scratch_lock,
     unsigned long long* counters
@@ -12452,6 +13722,161 @@ static __device__ void gpu_persistent_large_unlock(unsigned int* large_scratch_l
     __threadfence();
     atomicExch(large_scratch_lock, 0u);
 }
+
+#if GPU_PERSISTENT_TARGET_LEAVES
+// One owner CTA repairs siblings after SCATTER, before any child is published.
+// Dynamic shared memory is also used by leaf kernels, but never concurrently by a CTA.
+struct GpuTargetLeafScratch {
+    unsigned int parent[128], sizes[128], output[128], merged[128];
+    float distance[128];
+    unsigned int sorted[2048], warp_counts[8];
+    unsigned int total, unique, round_base;
+};
+static_assert(sizeof(GpuTargetLeafScratch) <= 12u * 1024u, "leaf policy scratch size");
+
+static __device__ void gpu_persistent_merge_leaf_siblings(
+    const float* x, const float* norms, const signed char* codes,
+    const float* scales, const float* sums, unsigned int dim,
+    unsigned int padded_dim, unsigned int row_bytes, unsigned int layout,
+    unsigned int op, unsigned int source, const unsigned int* leaders,
+    const unsigned int* input, unsigned int* output, unsigned int slots,
+    unsigned int limit, unsigned int* counts, unsigned int* offsets,
+    unsigned int* output_flags, unsigned long long* counters
+) {
+    extern __shared__ __align__(32) unsigned char target_leaf_shared[];
+    GpuTargetLeafScratch& s = *reinterpret_cast<GpuTargetLeafScratch*>(target_leaf_shared);
+    unsigned int tid = threadIdx.x;
+    unsigned long long started = clock64();
+    // 1280 is the validated maximum; larger configured leaves may be destinations
+    // only up to 2048 so the bounded scratch can sort their union safely.
+    unsigned int merge_limit = min(limit, 2048u);
+    for (unsigned int j = tid; j < slots; j += blockDim.x) {
+        s.parent[j] = j;
+        s.sizes[j] = counts[j];
+        s.merged[j] = 0u;
+        output_flags[j] = 0u;
+    }
+    __syncthreads();
+    for (unsigned int i = 0; i < slots; ++i) {
+        if (s.parent[i] != i || s.sizes[i] == 0u || s.sizes[i] >= 128u) continue;
+        if (tid < slots) {
+            bool candidate = tid != i && s.parent[tid] == tid && s.sizes[tid] > 0u
+                && (unsigned long long)s.sizes[i] + s.sizes[tid] <= merge_limit;
+            s.distance[tid] = candidate ? gpu_persistent_assignment_distance(
+                x, norms, codes, scales, sums, dim, padded_dim, row_bytes, layout,
+                leaders[i], leaders[tid], op, source) : __int_as_float(0x7f800000);
+        }
+        __syncthreads();
+        if (tid == 0u) {
+            unsigned int best = 0xffffffffu;
+            float best_dist = __int_as_float(0x7f800000);
+            for (unsigned int j = 0; j < slots; ++j) {
+                if (j == i || s.parent[j] != j || s.sizes[j] == 0u
+                    || (unsigned long long)s.sizes[i] + s.sizes[j] > merge_limit) continue;
+                float d = s.distance[j];
+                if (best == 0xffffffffu || d < best_dist
+                    || (d == best_dist && (leaders[j] < leaders[best]
+                        || (leaders[j] == leaders[best] && j < best)))) {
+                    best = j; best_dist = d;
+                }
+            }
+            if (best != 0xffffffffu) {
+                s.parent[i] = best;
+                s.sizes[best] += s.sizes[i];
+                s.sizes[i] = 0u;
+                s.merged[best] = 1u;
+                atomicAdd(&counters[P_LEAF_POLICY_MERGES], 1ull);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        s.total = 0u;
+        for (unsigned int j = 0; j < slots; ++j) {
+            unsigned int root = j;
+            while (s.parent[root] != root) root = s.parent[root];
+            s.parent[j] = root;
+        }
+        for (unsigned int j = 0; j < slots; ++j) {
+            s.output[j] = s.total;
+            if (s.parent[j] == j && s.merged[j]) s.total += s.sizes[j];
+        }
+    }
+    __syncthreads();
+    // Only merged groups are copied. Large recursive children keep their existing storage.
+    // Sum of reserved union lengths <= original fanout memberships, so the now-dead
+    // assignment-slot array is sufficient without allocating another matrix/buffer.
+    for (unsigned int root = 0; root < slots; ++root) {
+        if (s.parent[root] != root || !s.merged[root]) continue;
+        unsigned int n = s.sizes[root], padded = 1u;
+        while (padded < n) padded <<= 1u;
+        for (unsigned int j = tid; j < padded; j += blockDim.x) s.sorted[j] = 0xffffffffu;
+        __syncthreads();
+        unsigned int pos = 0u;
+        for (unsigned int child = 0; child < slots; ++child) {
+            if (s.parent[child] != root) continue;
+            for (unsigned int j = tid; j < counts[child]; j += blockDim.x)
+                s.sorted[pos + j] = input[offsets[child] + j];
+            pos += counts[child];
+        }
+        __syncthreads();
+        for (unsigned int width = 2u; width <= padded; width <<= 1u) {
+            for (unsigned int stride = width >> 1u; stride; stride >>= 1u) {
+                for (unsigned int j = tid; j < padded; j += blockDim.x) {
+                    unsigned int other = j ^ stride;
+                    if (other > j) {
+                        unsigned int a = s.sorted[j], b = s.sorted[other];
+                        if (((j & width) == 0u && a > b) || ((j & width) != 0u && a < b)) {
+                            s.sorted[j] = b; s.sorted[other] = a;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        if (tid == 0u) s.unique = 0u;
+        __syncthreads();
+        for (unsigned int base = 0; base < n; base += blockDim.x) {
+            unsigned int j = base + tid, lane = tid & 31u, warp = tid >> 5;
+            bool keep = j < n && (j == 0u || s.sorted[j] != s.sorted[j - 1u]);
+            unsigned int mask = __ballot_sync(0xffffffffu, keep);
+            if (lane == 0u) s.warp_counts[warp] = __popc(mask);
+            __syncthreads();
+            if (tid == 0u) {
+                s.round_base = s.unique;
+                unsigned int sum = 0u;
+                for (unsigned int w = 0; w < blockDim.x / 32u; ++w) {
+                    unsigned int c = s.warp_counts[w]; s.warp_counts[w] = sum; sum += c;
+                }
+                s.unique += sum;
+            }
+            __syncthreads();
+            if (keep) {
+                unsigned int rank = __popc(mask & ((1u << lane) - 1u));
+                output[s.output[root] + s.round_base + s.warp_counts[warp] + rank] = s.sorted[j];
+            }
+            __syncthreads();
+        }
+        if (tid == 0u) {
+            atomicAdd(&counters[P_LEAF_POLICY_DEDUP_ROWS], (unsigned long long)(n - s.unique));
+            atomicAdd(&counters[P_LEAF_POLICY_MERGED_GROUPS], 1ull);
+            s.sizes[root] = s.unique;
+        }
+        __syncthreads();
+    }
+    for (unsigned int j = tid; j < slots; j += blockDim.x) {
+        if (s.parent[j] != j) counts[j] = 0u;
+        else {
+            counts[j] = s.sizes[j];
+            if (s.merged[j]) { offsets[j] = s.output[j]; output_flags[j] = 1u; }
+            if (counts[j] > 0u && counts[j] < 128u)
+                atomicAdd(&counters[P_LEAF_POLICY_SMALL_EXCEPTIONS], 1ull);
+        }
+    }
+    __syncthreads();
+    if (tid == 0u) atomicAdd(&counters[P_LEAF_POLICY_MERGE_CLOCKS], clock64() - started);
+}
+#endif
 
 static __device__ bool gpu_persistent_stage_large_node(
     const unsigned int* node_rows,
@@ -12549,6 +13974,17 @@ static __device__ bool gpu_persistent_stage_large_node(
             if (base_leaders > max_leaders) {
                 base_leaders = max_leaders;
             }
+#if GPU_PERSISTENT_TARGET_LEAVES
+            if (!use_root_leaders) {
+                unsigned int f = relative_depth == 0u ? max(1u, fanout_second) : 1u;
+                base_leaders = gpu_persistent_target_leaders(point_len, f, max_leaders);
+                unsigned int cap = min(retry_max_leaders, (unsigned int)(((unsigned long long)point_len * f) / 128u));
+                if (cap > f) retry_max_leaders = cap;
+                atomicAdd(&counters[P_LEAF_POLICY_SPLITS], 1ull);
+                atomicAdd(&counters[P_LEAF_POLICY_LEADERS], (unsigned long long)base_leaders);
+                atomicMax(&counters[P_LEAF_POLICY_MAX_DEPTH], (unsigned long long)depth);
+            }
+#endif
             unsigned int shared_num_leaders = use_root_leaders ? root_leader_count : base_leaders;
             if (shared_num_leaders > max_leaders) {
                 shared_num_leaders = max_leaders;
@@ -12767,6 +14203,18 @@ static __device__ void gpu_persistent_process_node(
     bool split_ok = false;
     unsigned int relative_depth = depth >= root_depth ? depth - root_depth : 0u;
     bool use_root_leaders = relative_depth == 0u && root_leader_count > 0u;
+#if GPU_PERSISTENT_TARGET_LEAVES
+    merge_min = 128u;
+    if (!use_root_leaders) {
+        unsigned int f = relative_depth == 0u ? max(1u, fanout_second) : 1u;
+        base_leaders = gpu_persistent_target_leaders(n, f, max_leaders);
+        unsigned int cap = min(max_leaders, (unsigned int)(((unsigned long long)n * f) / 128u));
+        if (cap > f) max_leaders = cap;
+        atomicAdd(&counters[P_LEAF_POLICY_SPLITS], 1ull);
+        atomicAdd(&counters[P_LEAF_POLICY_LEADERS], (unsigned long long)base_leaders);
+        atomicMax(&counters[P_LEAF_POLICY_MAX_DEPTH], (unsigned long long)depth);
+    }
+#endif
     unsigned int attempt_count = use_root_leaders ? 1u : 6u;
     for (unsigned int attempt = 0; attempt < attempt_count; ++attempt) {
         unsigned int num_leaders = use_root_leaders ? root_leader_count : (base_leaders << attempt);
@@ -13242,6 +14690,18 @@ static __device__ void gpu_persistent_process_large_node(
     bool split_ok = false;
     unsigned int relative_depth = depth >= root_depth ? depth - root_depth : 0u;
     bool use_root_leaders = relative_depth == 0u && root_leader_count > 0u;
+#if GPU_PERSISTENT_TARGET_LEAVES
+    merge_min = 128u;
+    if (!use_root_leaders) {
+        unsigned int f = relative_depth == 0u ? max(1u, fanout_second) : 1u;
+        base_leaders = gpu_persistent_target_leaders(n, f, max_leaders);
+        unsigned int cap = min(max_leaders, (unsigned int)(((unsigned long long)n * f) / 128u));
+        if (cap > f) max_leaders = cap;
+        atomicAdd(&counters[P_LEAF_POLICY_SPLITS], 1ull);
+        atomicAdd(&counters[P_LEAF_POLICY_LEADERS], (unsigned long long)base_leaders);
+        atomicMax(&counters[P_LEAF_POLICY_MAX_DEPTH], (unsigned long long)depth);
+    }
+#endif
     unsigned int attempt_count = use_root_leaders ? 1u : 6u;
     for (unsigned int attempt = 0; attempt < attempt_count; ++attempt) {
         unsigned int num_leaders = use_root_leaders ? root_leader_count : (base_leaders << attempt);
@@ -14576,6 +16036,7 @@ static __device__ void gpu_persistent_large_best_slots4(
 }
 
 static __device__ void gpu_persistent_large_task_rabitq_warp_best_slots4(
+    const float* resident_x,
     const float* resident_norms,
     const signed char* rabitq_codes,
     const float* rabitq_deltas,
@@ -14645,7 +16106,8 @@ static __device__ void gpu_persistent_large_task_rabitq_warp_best_slots4(
             }
             const signed char* leader_code =
                 rabitq_codes + ((unsigned long long)leader) * rabitq_code_row_bytes;
-            int dot = distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+            int dot = (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+                || distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL)
                 ? gpu_persistent_assignment_dot_sq_quantized_warp(
                     point_code,
                     leader_code,
@@ -14671,6 +16133,10 @@ static __device__ void gpu_persistent_large_task_rabitq_warp_best_slots4(
                         rabitq_sums[leader],
                         resident_norms[leader],
                         dim
+                    );
+                } else if (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL) {
+                    dist = gpu_persistent_rotated_residual_sq8_l2_from_dot(
+                        dot, point, leader, resident_norms, rabitq_deltas, rabitq_sums, resident_x
                     );
                 } else {
                     dist = resident_norms[point]
@@ -14726,12 +16192,15 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
     unsigned int lane = threadIdx.x & 31u;
     unsigned int warp = threadIdx.x >> 5;
     unsigned int range_offset = warp;
+#if !GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
     if (range_offset >= tile_count) {
         return;
     }
+#endif
     unsigned int tile = range_tile_begin + range_offset;
     unsigned int row_idx = tile * GPU_PERSISTENT_LARGE_TILE_ROWS + lane;
-    bool active_row = lane < GPU_PERSISTENT_LARGE_TILE_ROWS && row_idx < point_len;
+    bool active_row = range_offset < tile_count
+        && lane < GPU_PERSISTENT_LARGE_TILE_ROWS && row_idx < point_len;
     unsigned int resident_rows = gpu_persistent_resident_row_count(counters);
     unsigned int point = 0xffffffffu;
     if (active_row) {
@@ -14754,8 +16223,12 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
 
     signed char* a_tile = scratch->a
         + warp * GPU_PERSISTENT_TOPK_WMMA_M * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+    signed char* b_tile = scratch->b_cta;
+#else
     signed char* b_tile = scratch->b
         + warp * GPU_PERSISTENT_TOPK_WMMA_N * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+#endif
     int* c_tile = scratch->c
         + warp * GPU_PERSISTENT_TOPK_WMMA_M * GPU_PERSISTENT_TOPK_WMMA_N;
     unsigned int* a_local_ids = scratch->a_local_ids
@@ -14806,7 +16279,11 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
                 b_local_ids[lane] = 0xffffffffu;
             }
         }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+        __syncthreads();
+#else
         __syncwarp();
+#endif
 
         nvcuda::wmma::fragment<
             nvcuda::wmma::matrix_a,
@@ -14825,6 +16302,65 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
         nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, int> acc_frag;
         nvcuda::wmma::fill_fragment(acc_frag, 0);
 
+#if GPU_PERSISTENT_SQ8_WMMA_O3B_ASSIGNMENT
+        // Reuse C's per-warp 1024 bytes until the accumulator is stored.
+        signed char* a_wide = reinterpret_cast<signed char*>(c_tile);
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+        signed char* b_wide = scratch->b_cta;
+#else
+        signed char* b_wide = a_wide + GPU_PERSISTENT_TOPK_WMMA_M * 32u;
+#endif
+        for (unsigned int axis_base = 0u; axis_base < sq8_padded_dim; axis_base += 32u) {
+            for (unsigned int idx = lane; idx < GPU_PERSISTENT_TOPK_WMMA_M * 32u; idx += 32u) {
+                unsigned int local_row = idx / 32u;
+                unsigned int axis = axis_base + (idx % 32u);
+                unsigned int row_point = a_local_ids[local_row];
+                a_wide[idx] = row_point < resident_rows && axis < sq8_padded_dim
+                    ? sq8_codes[((unsigned long long)row_point) * sq8_code_row_bytes + axis]
+                    : 0;
+            }
+            for (unsigned int idx =
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+                     threadIdx.x;
+#else
+                     lane;
+#endif
+                 idx < GPU_PERSISTENT_TOPK_WMMA_N * 32u;
+                 idx +=
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+                     blockDim.x
+#else
+                     32u
+#endif
+            ) {
+                unsigned int local_col = idx / 32u;
+                unsigned int axis = axis_base + (idx % 32u);
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+                unsigned int leader = scratch->b_local_ids[local_col];
+#else
+                unsigned int leader = b_local_ids[local_col];
+#endif
+                b_wide[idx] = leader < resident_rows && axis < sq8_padded_dim
+                    ? sq8_codes[((unsigned long long)leader) * sq8_code_row_bytes + axis]
+                    : 0;
+            }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+            __syncthreads();
+#else
+            __syncwarp();
+#endif
+            for (unsigned int slice = 0u; slice < 32u; slice += GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K) {
+                nvcuda::wmma::load_matrix_sync(a_frag, a_wide + slice, 32u);
+                nvcuda::wmma::load_matrix_sync(b_frag, b_wide + slice, 32u);
+                nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+            }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+            __syncthreads();
+#else
+            __syncwarp();
+#endif
+        }
+#else
         for (unsigned int axis_base = 0u;
              axis_base < sq8_padded_dim;
              axis_base += GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K) {
@@ -14843,6 +16379,19 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
                     : 0;
                 a_tile[idx] = value;
             }
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+            for (unsigned int idx = threadIdx.x;
+                 idx < GPU_PERSISTENT_TOPK_WMMA_N * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+                 idx += blockDim.x) {
+                unsigned int local_col = idx / GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+                unsigned int local_axis = idx - local_col * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
+                unsigned int leader = scratch->b_local_ids[local_col];
+                b_tile[idx] = leader < resident_rows
+                    ? sq8_codes[((unsigned long long)leader) * sq8_code_row_bytes
+                        + axis_base + local_axis]
+                    : 0;
+            }
+#else
             for (unsigned int idx = lane;
                  idx < GPU_PERSISTENT_TOPK_WMMA_N * GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K;
                  idx += 32u) {
@@ -14858,7 +16407,12 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
                     : 0;
                 b_tile[idx] = value;
             }
+#endif
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+            __syncthreads();
+#else
             __syncwarp();
+#endif
             nvcuda::wmma::load_matrix_sync(
                 a_frag,
                 a_tile,
@@ -14870,29 +16424,77 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
                 GPU_PERSISTENT_TOPK_SQ_INT8_WMMA_K
             );
             nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+#if GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT
+            __syncthreads();
+#else
             __syncwarp();
+#endif
         }
+#endif
         nvcuda::wmma::store_matrix_sync(
             c_tile,
             acc_frag,
             GPU_PERSISTENT_TOPK_WMMA_N,
+#if GPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT
+            nvcuda::wmma::mem_col_major
+#else
             nvcuda::wmma::mem_row_major
+#endif
         );
         __syncwarp();
 
+#if GPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT
+        // The upper half-warp restores odd columns for the same 16 rows.
+        // Each lane owns distinct C elements, then the row owner inserts in
+        // the original column order. C is no longer needed as integer dots.
+        unsigned int distance_row = lane & 15u;
+        unsigned int distance_point = a_local_ids[distance_row];
+        for (unsigned int local_col = lane >> 4; local_col < active_leaders; local_col += 2u) {
+            unsigned int leader = b_local_ids[local_col];
+            if (distance_point >= resident_rows || leader >= resident_rows) {
+                continue;
+            }
+            unsigned int c_index =
+#if GPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT
+                local_col * GPU_PERSISTENT_TOPK_WMMA_M + distance_row;
+#else
+                distance_row * GPU_PERSISTENT_TOPK_WMMA_N + local_col;
+#endif
+            int dot = c_tile[c_index];
+            float dist = resident_norms[distance_point]
+                + resident_norms[leader]
+                - 2.0f * sq8_scales[distance_point] * sq8_scales[leader] * (float)dot;
+            if (dist <= 0.0f) {
+                dist = 0.0f;
+            }
+            c_tile[c_index] = __float_as_int(dist);
+        }
+        __syncwarp();
+#endif
         if (active_row) {
             for (unsigned int local_col = 0u; local_col < active_leaders; ++local_col) {
                 unsigned int leader = b_local_ids[local_col];
                 if (leader >= resident_rows) {
                     continue;
                 }
-                int dot = c_tile[lane * GPU_PERSISTENT_TOPK_WMMA_N + local_col];
-                float dist = resident_norms[point]
+                int c_value = c_tile[
+#if GPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT
+                    local_col * GPU_PERSISTENT_TOPK_WMMA_M + lane
+#else
+                    lane * GPU_PERSISTENT_TOPK_WMMA_N + local_col
+#endif
+                ];
+                float dist =
+#if GPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT
+                    __int_as_float(c_value);
+#else
+                    resident_norms[point]
                     + resident_norms[leader]
-                    - 2.0f * sq8_scales[point] * sq8_scales[leader] * (float)dot;
+                    - 2.0f * sq8_scales[point] * sq8_scales[leader] * (float)c_value;
                 if (dist <= 0.0f) {
                     dist = 0.0f;
                 }
+#endif
                 gpu_persistent_assignment_insert_candidate4(
                     dist,
                     point,
@@ -14912,6 +16514,162 @@ static __device__ void gpu_persistent_large_task_sq8_wmma_range_slots4(
         for (unsigned int k = 0u; k < local_fanout; ++k) {
             large_best_slots[((unsigned long long)row_idx) * (unsigned long long)local_fanout + k] =
                 best_slot[k];
+        }
+    }
+}
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+// One warp produces eight point rows by eight centers. Each lane stages eight packed
+// dimensions (four bytes), so all 32 lanes together fill one K=32 slice.
+static __device__ void gpu_persistent_sq4_wmma_dot8x8(
+    const signed char* codes, unsigned int stride, unsigned int padded_dim,
+    unsigned int point, unsigned int center, unsigned int resident_rows,
+    unsigned int* a, unsigned int* b, int* dots, unsigned int leading_dim
+) {
+    namespace wmma = nvcuda::wmma;
+    using s4 = wmma::experimental::precision::s4;
+    wmma::fragment<wmma::matrix_a, 8, 8, 32, s4, wmma::row_major> af;
+    wmma::fragment<wmma::matrix_b, 8, 8, 32, s4, wmma::col_major> bf;
+    wmma::fragment<wmma::accumulator, 8, 8, 32, int> acc;
+    wmma::fill_fragment(acc, 0);
+    unsigned int lane = threadIdx.x & 31u;
+    unsigned int word = lane & 3u;
+    const unsigned int* words = reinterpret_cast<const unsigned int*>(codes);
+    for (unsigned int k = 0; k < padded_dim; k += 32u) {
+        unsigned int offset = (k >> 3) + word;
+        a[lane] = point < resident_rows ? words[(unsigned long long)point * (stride / 4u) + offset] : 0u;
+        b[lane] = center < resident_rows ? words[(unsigned long long)center * (stride / 4u) + offset] : 0u;
+        __syncwarp();
+        wmma::load_matrix_sync(af, a, 32);
+        wmma::load_matrix_sync(bf, b, 32);
+        wmma::mma_sync(acc, af, bf, acc);
+        __syncwarp();
+    }
+    wmma::store_matrix_sync(dots, acc, leading_dim, wmma::mem_row_major);
+}
+
+static __device__ void gpu_persistent_large_task_sq4_wmma_slots4(
+    const float* resident_x, const float* norms, const signed char* codes,
+    const float* scales, const float* center_ids, unsigned int padded_dim,
+    unsigned int stride, unsigned int distance_source, unsigned int rows,
+    const unsigned int* points, const unsigned int* leaders, unsigned int leader_count,
+    unsigned int fanout, unsigned int* slots, unsigned long long* counters,
+    unsigned int* large_task
+) {
+    __shared__ __align__(32) unsigned int a[8][32], b[8][32];
+    __shared__ __align__(32) int dots[16][32];
+    unsigned int tid = threadIdx.x;
+    unsigned int warp = tid >> 5;
+    unsigned int lane = tid & 31u;
+    unsigned int resident_rows = gpu_persistent_resident_row_count(counters);
+    unsigned int point = tid < rows ? points[tid] : 0xffffffffu;
+#if GPU_PERSISTENT_SQ4_PRIMARY_TILE_PROJECTIONS
+    unsigned int centers = distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL
+        ? __float_as_uint(resident_x[1]) : 0u;
+    bool reuse_projections = centers > 0u && centers <= 64u;
+    // One warp owns two point projection rows. Each lane retains at most two
+    // center entries per row, reused across all batches of candidate leaders.
+    unsigned int tile_point[2], primary[2];
+    float low[2], high[2];
+    if (reuse_projections) {
+        #pragma unroll
+        for (unsigned int k = 0; k < 2; ++k) {
+            unsigned int row = warp + 8u * k;
+            unsigned int id = row < rows ? points[row] : 0xffffffffu;
+            tile_point[k] = id;
+            primary[k] = id < resident_rows ? (unsigned int)center_ids[id] : 0u;
+            unsigned long long offset = 2ull + (unsigned long long)id * centers + lane;
+            low[k] = id < resident_rows && lane < centers ? resident_x[offset] : 0.0f;
+            high[k] = id < resident_rows && lane + 32u < centers ? resident_x[offset + 32u] : 0.0f;
+        }
+    }
+#endif
+    float best_dist[4];
+    unsigned int best_slot[4], best_leader[4];
+    if (tid < rows) {
+        gpu_persistent_valid_resident_row(point, resident_rows, counters, GPU_PERSISTENT_INVALID_ASSIGN_POINT_ID);
+        gpu_persistent_assignment_reset_best4(fanout, best_dist, best_slot, best_leader);
+    }
+    for (unsigned int base = 0u; base < leader_count; base += 32u) {
+        if (tid == 0u) {
+            gpu_persistent_watchdog_tick(counters, large_task);
+        }
+        if (tid < 32u && base + tid < leader_count) {
+            gpu_persistent_valid_resident_row(leaders[base + tid], resident_rows, counters, GPU_PERSISTENT_INVALID_ASSIGN_LEADER_ID);
+        }
+        // Each of the eight warps owns one 8x8 quadrant of the 16x32 dot matrix.
+        unsigned int band = (warp / 4u) * 8u;
+        unsigned int col = (warp % 4u) * 8u;
+        unsigned int group = lane / 4u;
+        if (base + col < leader_count && band < rows) {
+            unsigned int left = band + group < rows ? points[band + group] : 0xffffffffu;
+            unsigned int right = base + col + group < leader_count ? leaders[base + col + group] : 0xffffffffu;
+            gpu_persistent_sq4_wmma_dot8x8(codes, stride, padded_dim, left, right,
+                resident_rows, a[warp], b[warp], &dots[band][col], 32u);
+        }
+        __syncthreads();
+#if GPU_PERSISTENT_SQ4_PRIMARY_TILE_PROJECTIONS
+        if (reuse_projections) {
+            unsigned int leader = base + lane < leader_count ? leaders[base + lane] : 0xffffffffu;
+            bool valid = leader < resident_rows;
+            unsigned int other = valid ? (unsigned int)center_ids[leader] : 0u;
+            const float* projections = resident_x + 2;
+            const float* gram = projections + (unsigned long long)resident_rows * centers;
+            float leader_projection = 0.0f;
+            #pragma unroll
+            for (unsigned int k = 0; k < 2; ++k) {
+                unsigned int id = tile_point[k];
+                if (id < resident_rows) {
+                    // All lanes participate, including those past the final leader.
+                    float lo = __shfl_sync(0xffffffffu, low[k], other & 31u);
+                    float hi = __shfl_sync(0xffffffffu, high[k], other & 31u);
+                    if (valid) {
+                        if (k == 0u || tile_point[0] >= resident_rows || primary[0] != primary[k]) {
+                            leader_projection = projections[(unsigned long long)leader * centers + primary[k]];
+                        }
+                        unsigned int row = warp + 8u * k;
+                        float full_dot = scales[id] * scales[leader] * (float)dots[row][lane]
+                            + (other < 32u ? lo : hi) + leader_projection + gram[primary[k] * centers + other];
+                        float dist = norms[id] + norms[leader] - 2.0f * full_dot;
+                        dots[row][lane] = __float_as_int(dist > 0.0f ? dist : 0.0f);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+#endif
+        if (point < resident_rows) {
+            for (unsigned int col_idx = 0u; col_idx < 32u && base + col_idx < leader_count; ++col_idx) {
+                unsigned int leader = leaders[base + col_idx];
+                if (leader >= resident_rows) {
+                    continue;
+                }
+                int dot = dots[tid][col_idx];
+                float dist;
+#if GPU_PERSISTENT_SQ4_PRIMARY_TILE_PROJECTIONS
+                if (reuse_projections) {
+                    dist = __int_as_float(dot);
+                } else
+#endif
+                if (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL) {
+                    dist = gpu_persistent_rotated_residual_sq8_l2_from_dot(
+                        dot, point, leader, norms, scales, center_ids, resident_x);
+                } else {
+                    dist = norms[point] + norms[leader] - 2.0f * scales[point] * scales[leader] * (float)dot;
+                    if (dist <= 0.0f) {
+                        dist = 0.0f;
+                    }
+                }
+                gpu_persistent_assignment_insert_candidate4(dist, point, leader, base + col_idx,
+                    fanout, best_dist, best_slot, best_leader);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < rows) {
+        for (unsigned int k = 0u; k < fanout; ++k) {
+            slots[tid * 4u + k] = best_slot[k];
         }
     }
 }
@@ -14942,15 +16700,31 @@ static __device__ void gpu_persistent_large_task_compute_tile_slots4(
     unsigned int assignment_dco_audit,
     unsigned int* tile_slots,
     unsigned long long* counters,
-    unsigned int* large_task
+    unsigned int* large_task,
+    bool native_sq4_wmma = false
 ) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+    if (native_sq4_wmma) {
+        gpu_persistent_large_task_sq4_wmma_slots4(
+            resident_x, resident_norms, rabitq_codes, rabitq_deltas, rabitq_sums,
+            rabitq_padded_dim, rabitq_code_row_bytes, distance_source, tile_end - tile_begin,
+            tile_points, leaders, num_leaders, local_fanout, tile_slots, counters, large_task
+        );
+        if (threadIdx.x == 0u) {
+            atomicAdd(&counters[P_LARGE_SQ8_WMMA_TILES], 1ull);
+        }
+        return;
+    }
+#endif
     if ((distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_RABITQ_PLUS
-            || distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8)
+            || distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+            || distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL)
         && assignment_dco_mode == GPU_PERSISTENT_ASSIGNMENT_DCO_NONE) {
         if (threadIdx.x == 0u && distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8) {
             atomicAdd(&counters[P_LARGE_SQ8_DP4A_TILES], 1ull);
         }
         gpu_persistent_large_task_rabitq_warp_best_slots4(
+            resident_x,
             resident_norms,
             rabitq_codes,
             rabitq_deltas,
@@ -15043,6 +16817,134 @@ static __device__ void gpu_persistent_large_task_compute_tile_slots4(
         );
     }
 }
+
+#if GPU_PERSISTENT_SQ4_PRIMARY_RECT8X32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+// One warp handles 8 points x 32 leaders, with four native 8x8x32 s4
+// accumulators sharing each point fragment. Tickets retain their 16-row unit.
+template<bool partition_residual = false>
+static __device__ void gpu_persistent_sq4_primary_rect8x32(
+    const float* meta, const float* norms, const signed char* codes, const float* scales,
+    const float* center_ids, unsigned int dim, unsigned int stride,
+    unsigned int tile_begin, unsigned int tile_count, unsigned int point_len,
+    const unsigned int* members, unsigned int start, unsigned int retry,
+    unsigned int* saved_rows, const unsigned int* leaders, unsigned int leader_count,
+    unsigned int fanout, unsigned int* output, unsigned long long* counters,
+    unsigned int* large_task
+) {
+    namespace wmma = nvcuda::wmma;
+    using s4 = wmma::experimental::precision::s4;
+    unsigned int lane = threadIdx.x % 32u, warp = threadIdx.x / 32u;
+    unsigned int rows = partition_residual ? gpu_persistent_resident_row_count(counters) : __float_as_uint(meta[0]);
+    unsigned int centers = partition_residual ? 0u : __float_as_uint(meta[1]);
+    const float* projections = partition_residual ? nullptr : meta + 2;
+    const float* gram = partition_residual ? nullptr : projections + (unsigned long long)rows * centers;
+    const unsigned int* words = reinterpret_cast<const unsigned int*>(codes);
+    int* dots = sq4_primary_cta_tile[warp];
+    unsigned int* shared_words = reinterpret_cast<unsigned int*>(dots);
+    unsigned int end = min(point_len, (tile_begin + tile_count) * GPU_PERSISTENT_LARGE_TILE_ROWS);
+    for (unsigned int base = tile_begin * GPU_PERSISTENT_LARGE_TILE_ROWS + 8u * warp;
+         base < end; base += 8u * (blockDim.x / 32u)) {
+        unsigned int point = 0xffffffffu;
+        if (lane < 8u && base + lane < end) {
+            point = retry == 0u ? members[start + base + lane] : saved_rows[base + lane];
+            if (retry == 0u) saved_rows[base + lane] = point;
+            gpu_persistent_valid_resident_row(point, rows, counters, GPU_PERSISTENT_INVALID_ASSIGN_POINT_ID);
+        }
+        unsigned int left = __shfl_sync(0xffffffffu, point, lane / 4u);
+        float low[8], high[8];
+        if constexpr (!partition_residual) {
+        #pragma unroll
+        for (unsigned int i = 0; i < 8u; ++i) {
+            unsigned int id = __shfl_sync(0xffffffffu, point, i);
+            unsigned long long offset = (unsigned long long)id * centers + lane;
+            low[i] = id < rows && lane < centers ? projections[offset] : 0.0f;
+            high[i] = id < rows && lane + 32u < centers ? projections[offset + 32u] : 0.0f;
+        }
+        }
+        float best[4];
+        unsigned int slots[4], best_ids[4];
+        gpu_persistent_assignment_reset_best4(fanout, best, slots, best_ids);
+        for (unsigned int col = 0; col < leader_count; col += 32u) {
+            if (lane == 0u) gpu_persistent_watchdog_tick(counters, large_task);
+            unsigned int leader = col + lane < leader_count ? leaders[col + lane] : 0xffffffffu;
+            if (col + lane < leader_count)
+                gpu_persistent_valid_resident_row(leader, rows, counters, GPU_PERSISTENT_INVALID_ASSIGN_LEADER_ID);
+            wmma::fragment<wmma::accumulator,8,8,32,int> acc[4];
+            unsigned int right[4];
+            #pragma unroll
+            for (unsigned int j = 0; j < 4; ++j) {
+                right[j] = __shfl_sync(0xffffffffu, leader, j * 8u + lane / 4u);
+                wmma::fill_fragment(acc[j],0);
+            }
+            for (unsigned int axis = 0; axis < dim; axis += 32u) {
+                unsigned int w = axis / 8u + lane % 4u;
+                shared_words[lane] = left < rows ? words[(unsigned long long)left * (stride / 4u) + w] : 0u;
+                #pragma unroll
+                for (unsigned int j = 0; j < 4; ++j)
+                    shared_words[32u + 32u*j + lane] = right[j] < rows
+                        ? words[(unsigned long long)right[j] * (stride / 4u) + w] : 0u;
+                __syncwarp();
+                wmma::fragment<wmma::matrix_a,8,8,32,s4,wmma::row_major> af;
+                wmma::load_matrix_sync(af,shared_words,32);
+                #pragma unroll
+                for (unsigned int j = 0; j < 4u; ++j) {
+                    wmma::fragment<wmma::matrix_b,8,8,32,s4,wmma::col_major> bf;
+                    wmma::load_matrix_sync(bf,shared_words + 32u + j*32u,32);
+                    wmma::mma_sync(acc[j],af,bf,acc[j]);
+                }
+                __syncwarp();
+            }
+            #pragma unroll
+            for (unsigned int j = 0; j < 4; ++j)
+                wmma::store_matrix_sync(dots + j*8u,acc[j],32,wmma::mem_row_major);
+            __syncwarp();
+            if constexpr (partition_residual) {
+                #pragma unroll
+                for (unsigned int i = 0; i < 8u; ++i) {
+                    unsigned int id = __shfl_sync(0xffffffffu, point, i);
+                    if (id < rows && leader < rows) {
+                        // Match the original common-center expression, including
+                        // multiplication order. Do not regroup into a full dot.
+                        float dist = norms[id] + norms[leader]
+                            - 2.0f * scales[id] * scales[leader] * (float)dots[i*32u + lane];
+                        if (dist <= 0.0f) dist = 0.0f;
+                        dots[i*32u + lane] = __float_as_int(dist);
+                    }
+                }
+            } else {
+            unsigned int other = leader < rows ? (unsigned int)center_ids[leader] : 0u;
+            #pragma unroll
+            for (unsigned int i = 0; i < 8u; ++i) {
+                unsigned int id = __shfl_sync(0xffffffffu, point, i);
+                float lo = __shfl_sync(0xffffffffu, low[i], other % 32u);
+                float hi = __shfl_sync(0xffffffffu, high[i], other % 32u);
+                if (id < rows && leader < rows) {
+                    unsigned int own = (unsigned int)center_ids[id];
+                    float dot = scales[id] * scales[leader] * (float)dots[i*32u + lane]
+                        + (other < 32u ? lo : hi) + projections[(unsigned long long)leader * centers + own]
+                        + gram[own * centers + other];
+                    float dist = norms[id] + norms[leader] - 2.0f * dot;
+                    dots[i*32u + lane] = __float_as_int(dist > 0.0f ? dist : 0.0f);
+                }
+            }
+            }
+            __syncwarp();
+            if (point < rows) {
+                for (unsigned int j = 0; j < 32u && col+j < leader_count; ++j) {
+                    unsigned int candidate = leaders[col+j];
+                    if (candidate < rows)
+                        gpu_persistent_assignment_insert_candidate4(__int_as_float(dots[lane*32u+j]),
+                            point, candidate, col+j, fanout, best, slots, best_ids);
+                }
+            }
+            __syncwarp();
+        }
+        if (point < rows)
+            for (unsigned int j=0; j<fanout; ++j)
+                output[(unsigned long long)(base+lane)*fanout+j] = slots[j];
+    }
+}
+#endif
 
 static __device__ bool gpu_persistent_process_large_task_cta(
     const float* resident_x,
@@ -15174,7 +17076,14 @@ static __device__ bool gpu_persistent_process_large_task_cta(
         if (shared_valid == 0u) {
             return true;
         }
-        if (shared_use_sq8_wmma != 0u) {
+        bool rect8x32 = false;
+#if GPU_PERSISTENT_SQ4_PRIMARY_RECT8X32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+        rect8x32 = sq8_assignment_kernel == GPU_PERSISTENT_SQ4_ASSIGNMENT_KERNEL_WMMA
+            && (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+                || (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL
+                    && __float_as_uint(resident_x[1]) <= 64u));
+#endif
+        if (shared_use_sq8_wmma != 0u || rect8x32) {
             if (threadIdx.x == 0u) {
                 for (unsigned int range_offset = 0u;
                      range_offset < shared_tile_count;
@@ -15202,6 +17111,23 @@ static __device__ bool gpu_persistent_process_large_task_cta(
             }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 720)
             unsigned long long count_distance_start = clock64();
+#if GPU_PERSISTENT_SQ4_PRIMARY_RECT8X32 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900 && GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE
+            if (rect8x32) {
+                if (threadIdx.x == 0u)
+                    atomicAdd(&counters[P_SQ4_RECT8X32_TILES], (unsigned long long)shared_tile_count);
+                if (distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8) {
+                gpu_persistent_sq4_primary_rect8x32<true>(resident_x,resident_norms,rabitq_codes,rabitq_deltas,
+                    rabitq_sums,rabitq_padded_dim,rabitq_code_row_bytes,shared_tile,shared_tile_count,
+                    point_len,partition_rows,large_task[L_ROW_START],large_task[L_RETRY_ATTEMPT],
+                    large_rows,large_leaders,num_leaders,local_fanout,large_best_slots,counters,large_task);
+                } else {
+                gpu_persistent_sq4_primary_rect8x32(resident_x,resident_norms,rabitq_codes,rabitq_deltas,
+                    rabitq_sums,rabitq_padded_dim,rabitq_code_row_bytes,shared_tile,shared_tile_count,
+                    point_len,partition_rows,large_task[L_ROW_START],large_task[L_RETRY_ATTEMPT],
+                    large_rows,large_leaders,num_leaders,local_fanout,large_best_slots,counters,large_task);
+                }
+            } else
+#endif
             gpu_persistent_large_task_sq8_wmma_range_slots4(
                 resident_norms,
                 rabitq_codes,
@@ -15332,7 +17258,8 @@ static __device__ bool gpu_persistent_process_large_task_cta(
                 assignment_dco_audit,
                 shared_tile_slots,
                 counters,
-                large_task
+                large_task,
+                sq8_assignment_kernel == GPU_PERSISTENT_SQ4_ASSIGNMENT_KERNEL_WMMA
             );
             __syncthreads();
             if (threadIdx.x == 0u) {
@@ -15650,7 +17577,114 @@ static __device__ bool gpu_persistent_process_large_task_cta(
         return true;
     }
     if (phase == GPU_PERSISTENT_LARGE_TASK_PUBLISH) {
+#if GPU_PERSISTENT_PUBLISH_CTA_COPY && !GPU_PERSISTENT_TARGET_LEAVES
+        if (threadIdx.x == 0u) {
+            shared_valid = atomicCAS(&large_task[L_EMIT_LOCK], 0u, 1u) == 0u;
+            if (shared_valid && !gpu_persistent_large_task_still_current(large_task, phase, shared_generation)) {
+                large_task[L_EMIT_LOCK] = 0u;
+                shared_valid = 0u;
+            }
+        }
+        __syncthreads();
+        if (!shared_valid) return false;
+        unsigned long long publish_start = threadIdx.x == 0u ? clock64() : 0ull;
+        if (threadIdx.x == 0u) shared_valid = gpu_persistent_counter_load(counters, P_OVERFLOW_FLAGS) == 0ull;
+        __syncthreads();
+        if (shared_valid) {
+            unsigned long long seed = ((unsigned long long)large_task[L_SEED_HI] << 32)
+                | (unsigned long long)large_task[L_SEED_LO];
+            if (threadIdx.x == 0u) {
+                atomicAdd(&counters[P_ASSIGNMENT_PASSES], 1ull);
+                atomicAdd(&counters[P_LARGE_NODE_SPLITS], 1ull);
+#if GPU_PERSISTENT_ASSIGNMENT_DCO_ENABLE
+                if (assignment_dco_mode != GPU_PERSISTENT_ASSIGNMENT_DCO_NONE)
+                    atomicAdd(&counters[P_ASSIGNMENT_DCO_NODES], 1ull);
+#endif
+            }
+                for (unsigned int child_idx = 0; child_idx < num_leaders; ++child_idx) {
+                    unsigned int child_len = large_child_counts[child_idx];
+                    if (child_len == 0u) {
+                        continue;
+                    }
+                    unsigned int child_start = large_child_offsets[child_idx];
+                    const unsigned int* child_rows = large_clustered + child_start;
+#if GPU_PERSISTENT_TARGET_LEAVES
+                    if (large_child_write[child_idx]) child_rows = large_best_slots + child_start;
+#endif
+                    if (child_len <= terminal_limit) {
+                        gpu_persistent_push_leaf_cta(
+                            child_rows,
+                            child_len,
+                            leaf_row_ids,
+                            row_leaf_ids,
+                            leaf_starts,
+                            leaf_sizes,
+                            leaf_queue,
+                            counters,
+                            max_leaf_count,
+                            max_leaf_rows,
+                            leaf_tile_rows,
+                            partition_only,
+                            staged_leaf_dco
+                        );
+                    } else if (depth + 1u >= max_depth) {
+                        if (threadIdx.x == 0u) atomicOr(&counters[P_OVERFLOW_FLAGS], GPU_PERSISTENT_OVERSIZED_TERMINAL_NODE);
+                        break;
+                    } else {
+                        unsigned long long child_seed = seed
+                            ^ ((unsigned long long)child_idx * 0x94d049bb133111ebull)
+                            ^ (((unsigned long long)child_len) << 23);
+                        if (!gpu_persistent_publish_partition_child_cta(
+                            child_rows,
+                            child_len,
+                            depth + 1u,
+                            child_seed,
+                            partition_queue,
+                            partition_rows,
+                            partition_free_stack,
+                            counters,
+                            max_queue_nodes,
+                            max_queue_rows
+                        )) {
+                            break;
+                        }
+                    }
+                }
+        }
+        if (threadIdx.x == 0u) {
+            __threadfence();
+            large_task[L_PHASE] = GPU_PERSISTENT_LARGE_TASK_EMPTY;
+            large_task[L_EMIT_LOCK] = 0u;
+            atomicAdd(&counters[P_ACTIVE_LARGE], 0xffffffffffffffffull);
+            gpu_persistent_mark_progress(counters);
+            atomicAdd(&counters[P_LARGE_PUBLISH_CLOCKS], clock64() - publish_start);
+        }
+        return true;
+#else
+#if GPU_PERSISTENT_TARGET_LEAVES
+        if (threadIdx.x == 0u) {
+            shared_valid = atomicCAS(&large_task[L_EMIT_LOCK], 0u, 1u) == 0u;
+            if (shared_valid && !gpu_persistent_large_task_still_current(large_task, phase, shared_generation)) {
+                large_task[L_EMIT_LOCK] = 0u;
+                shared_valid = 0u;
+            }
+        }
+        __syncthreads();
+        if (!shared_valid) return false;
+        if (threadIdx.x == 0u) shared_valid = gpu_persistent_counter_load(counters, P_OVERFLOW_FLAGS) == 0ull;
+        __syncthreads();
+        if (shared_valid) {
+            gpu_persistent_merge_leaf_siblings(
+                resident_x, resident_norms, rabitq_codes, rabitq_deltas, rabitq_sums,
+                dim, rabitq_padded_dim, rabitq_code_row_bytes, rabitq_code_layout,
+                assignment_operator, distance_source, large_leaders,
+                large_clustered, large_best_slots, num_leaders, terminal_limit,
+                large_child_counts, large_child_offsets, large_child_write, counters);
+        }
+        if (threadIdx.x == 0u) {
+#else
         if (threadIdx.x == 0u && atomicCAS(&large_task[L_EMIT_LOCK], 0u, 1u) == 0u) {
+#endif
             unsigned long long publish_start = clock64();
             if (!gpu_persistent_large_task_still_current(large_task, phase, shared_generation)) {
                 large_task[L_EMIT_LOCK] = 0u;
@@ -15673,9 +17707,13 @@ static __device__ bool gpu_persistent_process_large_task_cta(
                         continue;
                     }
                     unsigned int child_start = large_child_offsets[child_idx];
+                    const unsigned int* child_rows = large_clustered + child_start;
+#if GPU_PERSISTENT_TARGET_LEAVES
+                    if (large_child_write[child_idx]) child_rows = large_best_slots + child_start;
+#endif
                     if (child_len <= terminal_limit) {
                         gpu_persistent_push_leaf(
-                            large_clustered + child_start,
+                            child_rows,
                             child_len,
                             leaf_row_ids,
                             row_leaf_ids,
@@ -15697,7 +17735,7 @@ static __device__ bool gpu_persistent_process_large_task_cta(
                             ^ ((unsigned long long)child_idx * 0x94d049bb133111ebull)
                             ^ (((unsigned long long)child_len) << 23);
                         if (!gpu_persistent_publish_partition_child(
-                            large_clustered + child_start,
+                            child_rows,
                             child_len,
                             depth + 1u,
                             child_seed,
@@ -15722,6 +17760,7 @@ static __device__ bool gpu_persistent_process_large_task_cta(
             return true;
         }
         return false;
+#endif
     }
     return false;
 }
@@ -16440,13 +18479,23 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
     unsigned int* capture_leaders,
     unsigned long long* wmma_diag_counters
 ) {
+#if GPU_PERSISTENT_LEAF_PROFILE
+    if (blockIdx.x >= 256u) return; // host enforces grid <= 256 for diagnostics
+    for (unsigned int i = threadIdx.x; i < LP_TRACE_BASE; i += blockDim.x)
+        shear_leaf_profile[blockIdx.x][i] = 0ull;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        shear_leaf_profile[blockIdx.x][0] = lp_now();
+        shear_leaf_profile[blockIdx.x][15] = gridDim.x;
+    }
+#endif
     GpuPersistentSq8WmmaScratch* sq8_wmma_scratch = 0;
 #if GPU_PERSISTENT_LEAF_SQ_INT8_WMMA_ENABLE
     __shared__ GpuPersistentSq8WmmaScratch sq8_wmma_scratch_storage;
     sq8_wmma_scratch = &sq8_wmma_scratch_storage;
 #endif
     unsigned int distance_source =
-        quantized_distance_source <= GPU_PERSISTENT_DISTANCE_SOURCE_TURBOQUANT_MSE4
+        quantized_distance_source <= GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL
             ? quantized_distance_source
             : GPU_PERSISTENT_DISTANCE_SOURCE_RAW;
     unsigned long long capture_seed = ((unsigned long long)capture_seed_hi << 32)
@@ -16552,6 +18601,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
         }
     }
 
+#if GPU_PERSISTENT_LEAF_PROFILE
+    if (threadIdx.x == 0) shear_leaf_profile[blockIdx.x][1] = lp_now();
+#endif
     if (blockIdx.x < partition_worker_blocks) {
         __shared__ unsigned int shared_has_node;
         __shared__ unsigned int shared_should_exit;
@@ -16614,6 +18666,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
                             __threadfence();
                             if (atomicCAS(&counters[P_DONE], 0ull, 1ull) == 0ull) {
                                 atomicAdd(&counters[P_DONE_CAS_WINS], 1ull);
+#if GPU_PERSISTENT_LEAF_PROFILE
+                                shear_leaf_profile[blockIdx.x][3] = lp_now();
+#endif
                             }
                         } else {
                             unsigned long long partition_wait_start = clock64();
@@ -16767,6 +18822,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
                     break;
                 }
                 unsigned long long large_help_start = clock64();
+#if GPU_PERSISTENT_LEAF_PROFILE
+                unsigned long long lp_help_start = threadIdx.x == 0 ? lp_now() : 0;
+#endif
                 bool helped_large = gpu_persistent_process_large_task_cta(
                     resident_x,
                     resident_global_ids,
@@ -16828,6 +18886,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
                     capture_leaders
                 );
                 if (helped_large && threadIdx.x == 0u) {
+#if GPU_PERSISTENT_LEAF_PROFILE
+                    shear_leaf_profile[blockIdx.x][4] += lp_now() - lp_help_start;
+#endif
                     atomicAdd(&counters[P_LARGE_HELP_CLOCKS], clock64() - large_help_start);
                 }
                 __syncthreads();
@@ -16923,6 +18984,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
                         break;
                     }
                     unsigned long long large_help_start = clock64();
+#if GPU_PERSISTENT_LEAF_PROFILE
+                unsigned long long lp_help_start = threadIdx.x == 0 ? lp_now() : 0;
+#endif
                     bool helped_large = gpu_persistent_process_large_task_cta(
                         resident_x,
                         resident_global_ids,
@@ -16984,6 +19048,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
                         capture_leaders
                     );
                     if (helped_large && threadIdx.x == 0u) {
+#if GPU_PERSISTENT_LEAF_PROFILE
+                    shear_leaf_profile[blockIdx.x][4] += lp_now() - lp_help_start;
+#endif
                         atomicAdd(&counters[P_LARGE_HELP_CLOCKS], clock64() - large_help_start);
                     }
                     __syncthreads();
@@ -17261,6 +19328,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
             __syncthreads();
             if (shared_try_large_help != 0u) {
                 unsigned long long large_help_start = clock64();
+#if GPU_PERSISTENT_LEAF_PROFILE
+                unsigned long long lp_help_start = threadIdx.x == 0 ? lp_now() : 0;
+#endif
                 bool helped_large = gpu_persistent_process_large_task_cta(
                     resident_x,
                     resident_global_ids,
@@ -17323,6 +19393,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
                 );
                 __syncthreads();
                 if (helped_large && threadIdx.x == 0u) {
+#if GPU_PERSISTENT_LEAF_PROFILE
+                    shear_leaf_profile[blockIdx.x][4] += lp_now() - lp_help_start;
+#endif
 #if GPU_PERSISTENT_TOPK_LOCAL_COUNTERS
                     shared_topk_local_counters.large_help_clocks +=
                         clock64() - large_help_start;
@@ -17375,6 +19448,9 @@ extern "C" __global__ void gpu_persistent_subtree_topk(
 #endif
     }
     if (threadIdx.x == 0u) {
+#if GPU_PERSISTENT_LEAF_PROFILE
+        shear_leaf_profile[blockIdx.x][2] = lp_now();
+#endif
         gpu_persistent_snapshot(counters, large_scratch_lock);
     }
 }
@@ -17949,6 +20025,52 @@ extern "C" __global__ void rabitq_residual_code_centroid_dot_kernel(
     }
     if (tid == 0) {
         out_dots[row * (unsigned long long)centroid_count + centroid] = shared[0];
+    }
+}
+
+extern "C" __global__ void sq8_rotated_residual_d0_kernel(
+    const signed char* __restrict__ codes,
+    const float* __restrict__ scales,
+    const unsigned int* __restrict__ centroid_ids,
+    const float* __restrict__ rotated_centroids,
+    unsigned long long rows,
+    unsigned int dim,
+    unsigned int padded_dim,
+    unsigned int centroid_count,
+    unsigned int fanout,
+    unsigned int* __restrict__ out_centroid_ids)
+{
+    unsigned long long row = (unsigned long long)blockIdx.x;
+    unsigned int leader = threadIdx.x;
+    if (row >= rows || centroid_count > blockDim.x || fanout > 32u) return;
+    extern __shared__ float distances[];
+    float dist = 3.402823466e+38F;
+    if (leader < centroid_count) {
+        unsigned int own_id = centroid_ids[row];
+        dist = 0.0f;
+        for (unsigned int axis = 0; axis < dim; ++axis) {
+            float center = rotated_centroids[(unsigned long long)leader * dim + axis];
+            float own = rotated_centroids[(unsigned long long)own_id * dim + axis];
+            float residual = scales[row] * (float)codes[row * (unsigned long long)padded_dim + axis];
+            float delta = own + residual - center;
+            dist += delta * delta;
+        }
+    }
+    distances[leader] = dist;
+    __syncthreads();
+    if (leader == 0u) {
+        for (unsigned int slot = 0; slot < fanout; ++slot) {
+            unsigned int best = 0u;
+            float best_dist = distances[0];
+            for (unsigned int candidate = 1u; candidate < centroid_count; ++candidate) {
+                if (distances[candidate] < best_dist) {
+                    best = candidate;
+                    best_dist = distances[candidate];
+                }
+            }
+            out_centroid_ids[row * (unsigned long long)fanout + slot] = best;
+            distances[best] = 3.402823466e+38F;
+        }
     }
 }
 
@@ -19172,10 +21294,32 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         wmma_debug_abort_after_topk_claims: u64,
         disable_topk_help_large: bool,
         scheduler_mode: PiPNNGpuSubtreePersistentSchedulerMode,
+        sq8_wmma_opt_mask: u32,
     }
 
     impl PersistentSubtreeCompileEnvironment {
-        fn current(scheduler_mode: PiPNNGpuSubtreePersistentSchedulerMode) -> Self {
+        fn sq4_big_leaf_tile(self) -> usize {
+            if self.sq8_wmma_opt_mask & (16384 | 65536) == 0 { 32 }
+            else if self.sq8_wmma_opt_mask & 2097152 != 0 { 96 }
+            else if self.sq8_wmma_opt_mask & 1048576 != 0 { 80 }
+            else { 64 }
+        }
+
+        fn sq4_big_leaf_shared_bytes(self, native_int4: bool) -> usize {
+            if native_int4 && self.sq8_wmma_opt_mask & (16384 | 65536) != 0 {
+                let tile = self.sq4_big_leaf_tile();
+                tile * (tile + 1) * std::mem::size_of::<i32>()
+            } else if native_int4 && self.sq8_wmma_opt_mask & 32768 != 0 {
+                12 * 1024
+            } else {
+                0
+            }
+        }
+
+        fn current(
+            scheduler_mode: PiPNNGpuSubtreePersistentSchedulerMode,
+            native_int4: bool,
+        ) -> Self {
             debug_assert_ne!(scheduler_mode, PiPNNGpuSubtreePersistentSchedulerMode::Auto);
             Self {
                 wmma_debug_abort_after_tile_calls:
@@ -19185,6 +21329,12 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     persistent_leaf_wmma_debug_abort_after_topk_claims(),
                 disable_topk_help_large: persistent_disable_topk_help_large_enabled(),
                 scheduler_mode,
+                sq8_wmma_opt_mask: std::env::var("SHEAR_PIPNN_SQ8_WMMA_OPT_MASK")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    // Validated projection reuse, 8x32 assignment and CTA member copies.
+                    // Explicit masks, including 0, retain precedence; SQ8 stays unchanged.
+                    .unwrap_or(if native_int4 { 512 | 1024 | 524288 } else { 0 }),
             }
         }
     }
@@ -19215,12 +21365,13 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
              leaf_sq_int4_wmma_source={leaf_sq_int4_wmma_source};\
              leaf_sq_int8_scalar_diagnostic_source={leaf_sq_int8_scalar_diagnostic_source};\
              wmma_debug_abort_after_tile_calls={};wmma_debug_abort_after_k_slices={};\
-             wmma_debug_abort_after_topk_claims={};disable_topk_help_large={};scheduler_mode={}",
+             wmma_debug_abort_after_topk_claims={};disable_topk_help_large={};scheduler_mode={};sq8_wmma_opt_mask={}",
             compile_environment.wmma_debug_abort_after_tile_calls,
             compile_environment.wmma_debug_abort_after_k_slices,
             compile_environment.wmma_debug_abort_after_topk_claims,
             compile_environment.disable_topk_help_large,
             compile_environment.scheduler_mode,
+            compile_environment.sq8_wmma_opt_mask,
         )
     }
 
@@ -19322,6 +21473,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                         wmma_debug_abort_after_topk_claims: 0,
                         disable_topk_help_large: false,
                         scheduler_mode: SchedulerMode::Baseline,
+                        sq8_wmma_opt_mask: 0,
                     },
                 }
             }
@@ -19346,7 +21498,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         fn persistent_compile_specialization_changes_for_every_nvrtc_input() {
             let baseline_inputs = SpecializationInputs::default();
             let baseline = specialization(baseline_inputs);
-            let toggles: [(&str, fn(&mut SpecializationInputs)); 13] = [
+            let toggles: [(&str, fn(&mut SpecializationInputs)); 14] = [
                 ("wmma_diagnostics", |inputs| inputs.wmma_diagnostics = true),
                 ("wmma_exec_diagnostics", |inputs| {
                     inputs.wmma_exec_diagnostics = true
@@ -19382,6 +21534,9 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 ("disable_topk_help_large", |inputs| {
                     inputs.compile_environment.disable_topk_help_large = true
                 }),
+                ("sq8_wmma_opt_mask", |inputs| {
+                    inputs.compile_environment.sq8_wmma_opt_mask = 1
+                }),
             ];
 
             for (name, toggle) in toggles {
@@ -19410,6 +21565,76 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         }
     }
 
+    #[derive(Default)]
+    struct Sq4PrimaryTriangleBatch {
+        tasks: Vec<u64>,
+        leaves: Vec<u64>,
+        entries: usize,
+    }
+
+    impl Sq4PrimaryTriangleBatch {
+        fn bytes(&self) -> usize {
+            self.entries * size_of::<i32>() + (self.tasks.len() + self.leaves.len()) * size_of::<u64>()
+        }
+    }
+
+    #[derive(Default)]
+    struct Sq4PrimaryTriangleProfile {
+        compute: Duration,
+        merge: Duration,
+        scratch_bytes: usize,
+        block_tasks: usize,
+        dot_tiles: usize,
+        full_dot_tiles: usize,
+    }
+
+    fn plan_sq4_primary_triangle_batches(
+        starts: &[u64], sizes: &[u64], leaf_rows: usize, k: usize, budget: usize,
+    ) -> AnnResult<Option<Vec<Sq4PrimaryTriangleBatch>>> {
+        if starts.len() != sizes.len() || !(1..=4).contains(&k) || leaf_rows > u32::MAX as usize {
+            return Err(AnnError::log_index_error("Invalid SQ4+ triangle leaf metadata".into()));
+        }
+        if sizes.iter().try_fold(0u64, |sum, &size| sum.checked_add(size)) != Some(leaf_rows as u64) {
+            return Err(AnnError::log_index_error("SQ4+ triangle leaf sizes do not cover output rows".into()));
+        }
+        let mut batches = Vec::new();
+        let mut batch = Sq4PrimaryTriangleBatch::default();
+        for (&start, &size) in starts.iter().zip(sizes) {
+            if start > leaf_rows as u64 || size > leaf_rows as u64 - start {
+                return Err(AnnError::log_index_error("SQ4+ triangle leaf range exceeds output rows".into()));
+            }
+            if size == 0 {
+                continue;
+            }
+            let count = size as usize;
+            let groups = count.div_ceil(64);
+            let blocks = count.div_ceil(8);
+            let entries = blocks.checked_mul(blocks + 1).and_then(|v| (v / 2).checked_mul(64))
+                .ok_or_else(|| AnnError::log_index_error("SQ4+ triangle scratch size overflow".into()))?;
+            let task_words = groups * (groups + 1) / 2 * 5;
+            let bytes = entries.saturating_mul(4).saturating_add((task_words + 3).saturating_mul(8));
+            if bytes > budget {
+                return Ok(None);
+            }
+            if batch.bytes() + bytes > budget {
+                batches.push(batch);
+                batch = Sq4PrimaryTriangleBatch::default();
+            }
+            let base = batch.entries as u64;
+            batch.leaves.extend_from_slice(&[start, size, base]);
+            for first in (0..count).step_by(64) {
+                for second in (first..count).step_by(64) {
+                    batch.tasks.extend_from_slice(&[start, size, first as u64, second as u64, base]);
+                }
+            }
+            batch.entries += entries;
+        }
+        if !batch.leaves.is_empty() {
+            batches.push(batch);
+        }
+        Ok(Some(batches))
+    }
+
     struct CudaGemmEngine {
         stream: Arc<CudaStream>,
         blas: CudaBlas,
@@ -19417,7 +21642,9 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         compact_topk_function: Option<Arc<CudaFunction>>,
         gram_select_topk_function: Option<Arc<CudaFunction>>,
         compact_lune_witness_function: Option<Arc<CudaFunction>>,
+        rotated_residual_sq8_prepare_function: Option<(Arc<CudaFunction>, Arc<CudaFunction>)>,
         persistent_subtree_function_default: Option<Arc<CudaFunction>>,
+        leaf_profile_module: Option<Arc<CudaModule>>,
         persistent_subtree_function_wmma_diag: Option<Arc<CudaFunction>>,
         persistent_subtree_function_wmma_exec_diag: Option<Arc<CudaFunction>>,
         persistent_subtree_function_wmma_shape_exec_diag: Option<Arc<CudaFunction>>,
@@ -19432,6 +21659,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         persistent_subtree_leaf_sq_int4_wmma_source_enabled: Option<bool>,
         persistent_subtree_leaf_sq_int8_scalar_diagnostic_source_enabled: Option<bool>,
         persistent_subtree_compile_environment: Option<PersistentSubtreeCompileEnvironment>,
+        sq4_primary_triangle_functions: Option<(CudaFunction, CudaFunction)>,
         persistent_topk_only_function: Option<Arc<CudaFunction>>,
         persistent_topk_only_function_key: Option<(bool, bool, bool, bool, bool, bool, bool, bool)>,
         persistent_multileaf_replay_function_default: Option<Arc<CudaFunction>>,
@@ -19445,6 +21673,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         rabitq_residual_global_d0_wmma_partial_function: Option<Arc<CudaFunction>>,
         rabitq_residual_global_d0_tiled_merge_function: Option<Arc<CudaFunction>>,
         sq8_quantize_function: Option<Arc<CudaFunction>>,
+        sq8_rotated_residual_d0_function: Option<Arc<CudaFunction>>,
         sq8_global_d0_tiled_partial_function: Option<Arc<CudaFunction>>,
         sq8_global_d0_wmma_partial_function: Option<Arc<CudaFunction>>,
         rabitq_residual_child_topk_function: Option<Arc<CudaFunction>>,
@@ -20825,6 +23054,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
     #[derive(Default)]
     struct CudaSubtreePartitionWorkspace {
         x_dev: Option<CudaSlice<f32>>,
+        rotated_centers_dev: Option<CudaSlice<f32>>,
         global_ids_dev: Option<CudaSlice<u32>>,
         norms_dev: Option<CudaSlice<f32>>,
         leaf_dco_x_dev: Option<CudaSlice<f32>>,
@@ -21091,6 +23321,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
     impl CudaSubtreePartitionWorkspace {
         fn clear(&mut self) {
             self.x_dev = None;
+            self.rotated_centers_dev = None;
             self.global_ids_dev = None;
             self.norms_dev = None;
             self.leaf_dco_x_dev = None;
@@ -21589,7 +23820,9 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 compact_topk_function: None,
                 gram_select_topk_function: None,
                 compact_lune_witness_function: None,
+                rotated_residual_sq8_prepare_function: None,
                 persistent_subtree_function_default: None,
+                leaf_profile_module: None,
                 persistent_subtree_function_wmma_diag: None,
                 persistent_subtree_function_wmma_exec_diag: None,
                 persistent_subtree_function_wmma_shape_exec_diag: None,
@@ -21604,6 +23837,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 persistent_subtree_leaf_sq_int4_wmma_source_enabled: None,
                 persistent_subtree_leaf_sq_int8_scalar_diagnostic_source_enabled: None,
                 persistent_subtree_compile_environment: None,
+                sq4_primary_triangle_functions: None,
                 persistent_topk_only_function: None,
                 persistent_topk_only_function_key: None,
                 persistent_multileaf_replay_function_default: None,
@@ -21617,6 +23851,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 rabitq_residual_global_d0_wmma_partial_function: None,
                 rabitq_residual_global_d0_tiled_merge_function: None,
                 sq8_quantize_function: None,
+                sq8_rotated_residual_d0_function: None,
                 sq8_global_d0_tiled_partial_function: None,
                 sq8_global_d0_wmma_partial_function: None,
                 rabitq_residual_child_topk_function: None,
@@ -21813,6 +24048,21 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 .clone())
         }
 
+        fn sq8_rotated_residual_d0_function(&mut self) -> AnnResult<Arc<CudaFunction>> {
+            if self.sq8_rotated_residual_d0_function.is_none() {
+                self.sq8_rotated_residual_d0_function =
+                    Some(Arc::new(Self::load_rabitq_residual_staging_function(
+                        &self.stream,
+                        "sq8_rotated_residual_d0_kernel",
+                    )?));
+            }
+            Ok(self
+                .sq8_rotated_residual_d0_function
+                .as_ref()
+                .unwrap()
+                .clone())
+        }
+
         fn sq8_global_d0_tiled_partial_function(&mut self) -> AnnResult<Arc<CudaFunction>> {
             if self.sq8_global_d0_tiled_partial_function.is_none() {
                 self.sq8_global_d0_tiled_partial_function =
@@ -21948,8 +24198,9 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         fn refresh_persistent_subtree_compile_environment(
             &mut self,
             scheduler_mode: PiPNNGpuSubtreePersistentSchedulerMode,
+            native_int4: bool,
         ) -> PersistentSubtreeCompileEnvironment {
-            let current = PersistentSubtreeCompileEnvironment::current(scheduler_mode);
+            let current = PersistentSubtreeCompileEnvironment::current(scheduler_mode, native_int4);
             if self.persistent_subtree_compile_environment != Some(current) {
                 self.clear_persistent_subtree_function_cache();
                 self.persistent_subtree_compile_environment = Some(current);
@@ -21971,7 +24222,9 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             scheduler_mode: PiPNNGpuSubtreePersistentSchedulerMode,
         ) -> AnnResult<(Arc<CudaFunction>, GpuKernelCaps)> {
             let compile_environment =
-                self.refresh_persistent_subtree_compile_environment(scheduler_mode);
+                self.refresh_persistent_subtree_compile_environment(
+                    scheduler_mode, leaf_sq_int4_wmma_source_enabled,
+                );
             let compile_specialization = persistent_compile_specialization(
                 wmma_diagnostics_enabled,
                 wmma_exec_diagnostics_enabled,
@@ -22034,7 +24287,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     .is_none(),
             };
             if needs_compile {
-                let func = Arc::new(Self::load_persistent_subtree_function(
+                let (func, module) = Self::load_persistent_subtree_function(
                     &self.stream,
                     nvrtc_arch,
                     wmma_diagnostics_enabled,
@@ -22047,7 +24300,11 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     leaf_sq_int4_wmma_source_enabled,
                     leaf_sq_int8_scalar_diagnostic_source_enabled,
                     compile_environment,
-                )?);
+                )?;
+                self.leaf_profile_module = if compile_environment.sq8_wmma_opt_mask & 131072 != 0 {
+                    Some(module)
+                } else { None };
+                let func = Arc::new(func);
                 let caps = query_gpu_kernel_caps(
                     func.as_ref(),
                     &self.hardware_adaptation_profile.device,
@@ -22055,7 +24312,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     nvrtc_arch_label,
                     compile_specialization.clone(),
                     256,
-                    0,
+                    compile_environment.sq4_big_leaf_shared_bytes(leaf_sq_int4_wmma_source_enabled),
                 )?;
                 self.hardware_adaptation_profile.upsert_kernel_caps(caps);
                 match (
@@ -22115,7 +24372,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                         && caps.nvrtc_arch == nvrtc_arch_label
                         && caps.compile_specialization == compile_specialization
                         && caps.block_threads == 256
-                        && caps.dynamic_shared_bytes == 0
+                        && caps.dynamic_shared_bytes == compile_environment.sq4_big_leaf_shared_bytes(leaf_sq_int4_wmma_source_enabled)
                 })
                 .cloned()
                 .ok_or_else(|| {
@@ -22132,6 +24389,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         ) -> AnnResult<Arc<CudaFunction>> {
             let compile_environment = self.refresh_persistent_subtree_compile_environment(
                 PiPNNGpuSubtreePersistentSchedulerMode::Baseline,
+                false,
             );
             let leaf_wmma_topk_enabled = persistent_leaf_wmma_topk_enabled();
             if self.persistent_multileaf_replay_leaf_wmma_topk_enabled
@@ -22182,6 +24440,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         ) -> AnnResult<Arc<CudaFunction>> {
             let compile_environment = self.refresh_persistent_subtree_compile_environment(
                 PiPNNGpuSubtreePersistentSchedulerMode::Baseline,
+                leaf_sq_int4_wmma_source_enabled,
             );
             let key = (
                 wmma_diagnostics_enabled,
@@ -22222,6 +24481,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
         }
 
         fn clear_persistent_subtree_function_cache(&mut self) {
+            self.leaf_profile_module = None;
             self.persistent_subtree_function_default = None;
             self.persistent_subtree_function_wmma_diag = None;
             self.persistent_subtree_function_wmma_exec_diag = None;
@@ -22250,7 +24510,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             leaf_sq_int4_wmma_source_enabled: bool,
             leaf_sq_int8_scalar_diagnostic_source_enabled: bool,
             compile_environment: PersistentSubtreeCompileEnvironment,
-        ) -> AnnResult<CudaFunction> {
+        ) -> AnnResult<(CudaFunction, Arc<CudaModule>)> {
             Self::load_persistent_subtree_named_function_with_arch(
                 stream,
                 arch,
@@ -22297,7 +24557,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 _leaf_sq_int8_scalar_diagnostic_source_enabled,
                 compile_environment,
                 function_name,
-            )
+            ).map(|(function, _module)| function)
         }
 
         fn load_persistent_subtree_named_function_with_arch(
@@ -22314,8 +24574,18 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             _leaf_sq_int8_scalar_diagnostic_source_enabled: bool,
             compile_environment: PersistentSubtreeCompileEnvironment,
             function_name: &str,
-        ) -> AnnResult<CudaFunction> {
+        ) -> AnnResult<(CudaFunction, Arc<CudaModule>)> {
             let mut options = vec!["--std=c++17".to_string()];
+            if compile_environment.sq8_wmma_opt_mask & 524288 != 0 {
+                options.push("-DGPU_PERSISTENT_PUBLISH_CTA_COPY=1".to_string());
+                tracing::info!("SQ4 PUBLISH cooperative member copies enabled");
+            }
+            if compile_environment.sq8_wmma_opt_mask & 131072 != 0 {
+                options.push("-DGPU_PERSISTENT_LEAF_PROFILE=1".to_string());
+                if compile_environment.sq8_wmma_opt_mask & 262144 != 0 {
+                    options.push("-DGPU_PERSISTENT_LEAF_PROFILE_PHASES=1".to_string());
+                }
+            }
             if wmma_diagnostics_enabled {
                 options.push("-DGPU_PERSISTENT_TOPK_WMMA_DIAGNOSTICS=1".to_string());
             }
@@ -22379,6 +24649,81 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             if leaf_sq_int8_wmma_source_enabled {
                 options.push("-DGPU_PERSISTENT_LEAF_SQ_INT8_WMMA_ENABLE=1".to_string());
             }
+            if compile_environment.sq8_wmma_opt_mask & 1 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 2 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O1_LEAF=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 4 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O2_LEAF=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 8 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 16 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O3A_LEAF=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 32 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O3B_ASSIGNMENT=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 64 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O3B_LEAF=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 128 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT=1".to_string());
+            }
+            if compile_environment.sq8_wmma_opt_mask & 256 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ8_WMMA_O4_LEAF=1".to_string());
+            }
+            if leaf_sq_int4_wmma_source_enabled && compile_environment.sq8_wmma_opt_mask & (8192 | 16384 | 65536) != 0 {
+                let tile = compile_environment.sq4_big_leaf_tile();
+                options.push("-DGPU_PERSISTENT_SQ4_LEAF_BIG_CTA=1".to_string());
+                options.push(format!("-DGPU_PERSISTENT_SQ4_BIG_LEAF_TILE={tile}"));
+                tracing::info!("SQ4+ fused triangular big leaf enabled: rows=385..1280 tile={tile}");
+            }
+            if leaf_sq_int4_wmma_source_enabled && compile_environment.sq8_wmma_opt_mask & 4194304 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ4_LEAF_MICRO16=1".to_string());
+                tracing::info!("SQ4+ triangular 16x16 operand reuse enabled: native 8x8 INT4 WMMA, same shared footprint");
+            }
+            if leaf_sq_int4_wmma_source_enabled && compile_environment.sq8_wmma_opt_mask & 65536 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ4_LEAF_SHARED_DISTANCE=1".to_string());
+                tracing::info!("SQ4+ triangular full-distance reuse enabled: global-ID order, one score per unordered pair");
+            }
+            if leaf_sq_int4_wmma_source_enabled
+                && compile_environment.sq8_wmma_opt_mask & (65536 | 4194304 | 16777216)
+                    == (65536 | 4194304 | 16777216)
+                && matches!(arch, Some("compute_80" | "compute_86" | "compute_89"))
+            {
+                options.push("-DGPU_PERSISTENT_SQ4_LEAF_CUTLASS=1".to_string());
+                options.push("--device-as-default-execution-space".to_string());
+                options.push(format!("-I{}/third_party/cutlass/include", env!("CARGO_MANIFEST_DIR")));
+                tracing::info!("SQ4+ triangular CUTLASS INT4 MMA enabled: m16n8k64, original distance and top-k order");
+            }
+            if leaf_sq_int4_wmma_source_enabled
+                && compile_environment.sq8_wmma_opt_mask & (2048 | 4096) != 0
+            {
+                let max_rows = if compile_environment.sq8_wmma_opt_mask & 4096 != 0 {
+                    128
+                } else {
+                    64
+                };
+                options.push("-DGPU_PERSISTENT_SQ4_LEAF_CTA=1".to_string());
+                options.push(format!("-DGPU_PERSISTENT_SQ4_LEAF_CTA_MAX_ROWS={max_rows}"));
+                tracing::info!("SQ4+ single-CTA triangular leaf enabled: max_rows={max_rows}");
+            }
+            if leaf_sq_int4_wmma_source_enabled && compile_environment.sq8_wmma_opt_mask & 32768 != 0 {
+                options.push("-DGPU_PERSISTENT_TARGET_LEAVES=1".to_string());
+                tracing::info!("SQ4 target-sized leaf policy enabled: soft_min=128 target=256 same-parent merge");
+            }
+            if leaf_sq_int4_wmma_source_enabled && compile_environment.sq8_wmma_opt_mask & 1024 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ4_PRIMARY_RECT8X32=1".to_string());
+                tracing::info!("SQ4+ primary large INT4 point x leader shape: 8x32");
+            }
+            if leaf_sq_int4_wmma_source_enabled && compile_environment.sq8_wmma_opt_mask & 512 != 0 {
+                options.push("-DGPU_PERSISTENT_SQ4_PRIMARY_TILE_PROJECTIONS=1".to_string());
+                tracing::info!("SQ4+ large INT4 WMMA projection reuse enabled for tiles with up to 64 primary centers");
+            }
             if leaf_sq_int4_wmma_source_enabled {
                 options.push("-DGPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE=1".to_string());
             }
@@ -22401,11 +24746,49 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     "Failed to load CUDA persistent subtree kernel: {err}"
                 ))
             })?;
-            module.load_function(function_name).map_err(|err| {
+            let function = module.load_function(function_name).map_err(|err| {
                 AnnError::log_index_error(format!(
                     "Failed to load CUDA persistent subtree function {function_name}: {err}"
                 ))
-            })
+            })?;
+            let shared_bytes = compile_environment.sq4_big_leaf_shared_bytes(leaf_sq_int4_wmma_source_enabled);
+            if shared_bytes != 0 {
+                function.set_attribute(sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_bytes as i32).map_err(|err| AnnError::log_index_error(format!(
+                        "Failed to opt in to SQ4 shared memory: {err}")))?;
+            }
+            Ok((function, module))
+        }
+
+        fn download_leaf_profile(&self, resident_rows: usize, kernel_wall: Duration) -> AnnResult<()> {
+            let Some(module) = &self.leaf_profile_module else { return Ok(()); };
+            let path = std::env::var_os("SHEAR_PIPNN_LEAF_PROFILE_OUT").ok_or_else(||
+                AnnError::log_index_error("leaf profiling requires SHEAR_PIPNN_LEAF_PROFILE_OUT".to_string()))?;
+            let symbol = module.get_global("shear_leaf_profile", &self.stream)
+                .map_err(|e| AnnError::log_index_error(format!("leaf profile symbol: {e}")))?;
+            let data = self.stream.clone_dtoh(&symbol)
+                .map_err(|e| AnnError::log_index_error(format!("leaf profile download: {e}")))?;
+            self.stream.synchronize()
+                .map_err(|e| AnnError::log_index_error(format!("leaf profile synchronize: {e}")))?;
+            let words: Vec<u64> = data.chunks_exact(8)
+                .map(|v| u64::from_le_bytes(v.try_into().unwrap())).collect();
+            let mut blocks = Vec::new();
+            for (cta, row) in words.chunks_exact(4352).take(words[15] as usize).enumerate() {
+                if row[0] == 0 { continue; }
+                blocks.push(serde_json::json!({"cta": cta, "header": &row[..16],
+                    "buckets": row[16..256].chunks_exact(20).collect::<Vec<_>>(),
+                    "trace": row[256..256 + row[6].min(512) as usize * 8]
+                        .chunks_exact(8).collect::<Vec<_>>() }));
+            }
+            let record = serde_json::json!({"schema": 1, "resident_rows": resident_rows,
+                "kernel_ms": kernel_wall.as_secs_f64() * 1000.0, "blocks": blocks});
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)
+                .map_err(|e| AnnError::log_index_error(format!("leaf profile output: {e}")))?;
+            serde_json::to_writer(&mut file, &record)
+                .map_err(|e| AnnError::log_index_error(format!("leaf profile JSON: {e}")))?;
+            writeln!(file).map_err(|e| AnnError::log_index_error(format!("leaf profile newline: {e}")))?;
+            Ok(())
         }
 
         fn load_compact_topk_function(stream: &Arc<CudaStream>) -> AnnResult<CudaFunction> {
@@ -22424,6 +24807,33 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     "Failed to load CUDA compact top-k function: {err}"
                 ))
             })
+        }
+
+        fn rotated_residual_sq8_prepare_function(&mut self, packed: bool) -> AnnResult<Arc<CudaFunction>> {
+            if self.rotated_residual_sq8_prepare_function.is_none() {
+                let ptx = compile_ptx(ROTATED_RESIDUAL_SQ8_PREPARE_KERNEL_SRC).map_err(|err| {
+                    AnnError::log_index_error(format!(
+                        "Failed to compile rotated residual SQ8 preparation kernel: {err}"
+                    ))
+                })?;
+                let module = self.stream.context().load_module(ptx).map_err(|err| {
+                    AnnError::log_index_error(format!(
+                        "Failed to load rotated residual SQ8 preparation kernel: {err}"
+                    ))
+                })?;
+                let function = module
+                    .load_function("rotated_residual_sq8_prepare")
+                    .map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "Failed to load rotated residual SQ8 preparation function: {err}"
+                        ))
+                    })?;
+                let packed_function = module.load_function("sq4_primary_prepare").map_err(|err|
+                    AnnError::log_index_error(format!("Failed to load SQ4+ projection kernel: {err}")))?;
+                self.rotated_residual_sq8_prepare_function = Some((Arc::new(function), Arc::new(packed_function)));
+            }
+            let pair = self.rotated_residual_sq8_prepare_function.as_ref().unwrap();
+            Ok(if packed { pair.1.clone() } else { pair.0.clone() })
         }
 
         fn load_gram_select_topk_function(stream: &Arc<CudaStream>) -> AnnResult<CudaFunction> {
@@ -24237,6 +26647,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                         global_d0_leader_ids: &center_ids,
                         global_d0_leader_vectors_row_major: &centers,
                         leader_payload: None,
+                        rotated_residual: None,
                         dim: request.dim,
                         fanout_top: 1,
                     },
@@ -24283,6 +26694,173 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             request: SqGpuD0QuantizeAssignRequest<'_>,
             params: &PiPNNParams,
         ) -> AnnResult<SqGpuD0QuantizeAssignResult> {
+            if let Some(rotated) = request.rotated_residual {
+                let rows = request.global_ids.len();
+                let dim = request.dim;
+                let leaders = request.global_d0_leader_ids.len();
+                let rows_u32 = u32::try_from(rows).map_err(|_| {
+                    AnnError::log_index_error(
+                        "CUDA rotated residual SQ8 D0 shard exceeds u32 rows".to_string(),
+                    )
+                })?;
+                if rows == 0
+                    || leaders == 0
+                    || leaders > 256
+                    || request.fanout_top == 0
+                    || request.fanout_top > leaders
+                    || request.fanout_top > 32
+                    || request.leader_payload.is_some()
+                    || rotated.centroids_row_major != request.global_d0_leader_vectors_row_major
+                    || request
+                        .global_d0_leader_ids
+                        .iter()
+                        .enumerate()
+                        .any(|(idx, &id)| id as usize != idx)
+                {
+                    return Err(AnnError::log_index_error(
+                        "CUDA rotated residual SQ8 D0 requires 1..=256 coarse centers as indexed leaders, fanout <= 32, and no leader payload".to_string(),
+                    ));
+                }
+                let quantize_start = Instant::now();
+                let encoded = quantize_sq8_rotated_residual_matrix(
+                    request.raw_vectors_row_major,
+                    rows,
+                    dim,
+                    rotated.centroids_row_major,
+                    rotated.seed,
+                )?;
+                let quantize_wall = quantize_start.elapsed();
+                let upload_start = Instant::now();
+                let mut codes_dev: CudaSlice<i8> = self
+                    .stream
+                    .alloc_zeros(encoded.residuals.codes.len())
+                    .map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "CUDA rotated residual codes allocation failed: {err}"
+                        ))
+                    })?;
+                let mut scales_dev: CudaSlice<f32> =
+                    self.stream.alloc_zeros(rows).map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "CUDA rotated residual scales allocation failed: {err}"
+                        ))
+                    })?;
+                let mut ids_dev: CudaSlice<u32> = self.stream.alloc_zeros(rows).map_err(|err| {
+                    AnnError::log_index_error(format!(
+                        "CUDA rotated residual center IDs allocation failed: {err}"
+                    ))
+                })?;
+                let mut centers_dev: CudaSlice<f32> = self
+                    .stream
+                    .alloc_zeros(encoded.rotated_centroids.len())
+                    .map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "CUDA rotated residual centers allocation failed: {err}"
+                        ))
+                    })?;
+                let mut out_dev: CudaSlice<u32> = self
+                    .stream
+                    .alloc_zeros(rows.saturating_mul(request.fanout_top))
+                    .map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "CUDA rotated residual output allocation failed: {err}"
+                        ))
+                    })?;
+                for (src, dst) in [
+                    (&encoded.residuals.scales, &mut scales_dev),
+                    (&encoded.rotated_centroids, &mut centers_dev),
+                ] {
+                    self.stream.memcpy_htod(src, dst).map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "CUDA rotated residual metadata upload failed: {err}"
+                        ))
+                    })?;
+                }
+                self.stream
+                    .memcpy_htod(&encoded.residuals.codes, &mut codes_dev)
+                    .map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "CUDA rotated residual code upload failed: {err}"
+                        ))
+                    })?;
+                self.stream
+                    .memcpy_htod(&encoded.centroid_ids, &mut ids_dev)
+                    .map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "CUDA rotated residual IDs upload failed: {err}"
+                        ))
+                    })?;
+                let upload_wall = upload_start.elapsed();
+                let function = self.sq8_rotated_residual_d0_function()?;
+                let rows_u64 = rows as u64;
+                let dim_u32 = dim as u32;
+                let padded_dim_u32 = encoded.residuals.padded_dim as u32;
+                let leaders_u32 = leaders as u32;
+                let fanout_u32 = request.fanout_top as u32;
+                let assign_start = Instant::now();
+                let mut launch = self.stream.launch_builder(&function);
+                launch
+                    .arg(&codes_dev)
+                    .arg(&scales_dev)
+                    .arg(&ids_dev)
+                    .arg(&centers_dev)
+                    .arg(&rows_u64)
+                    .arg(&dim_u32)
+                    .arg(&padded_dim_u32)
+                    .arg(&leaders_u32)
+                    .arg(&fanout_u32)
+                    .arg(&mut out_dev);
+                unsafe {
+                    launch
+                        .launch(LaunchConfig {
+                            grid_dim: (rows_u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+                        })
+                        .map_err(|err| {
+                            AnnError::log_index_error(format!(
+                                "CUDA rotated residual D0 launch failed: {err}"
+                            ))
+                        })?;
+                }
+                self.stream.synchronize().map_err(|err| {
+                    AnnError::log_index_error(format!(
+                        "CUDA rotated residual D0 synchronize failed: {err}"
+                    ))
+                })?;
+                let assign_wall = assign_start.elapsed();
+                let mut out = vec![0_u32; rows.saturating_mul(request.fanout_top)];
+                self.stream.memcpy_dtoh(&out_dev, &mut out).map_err(|err| {
+                    AnnError::log_index_error(format!(
+                        "CUDA rotated residual D0 output download failed: {err}"
+                    ))
+                })?;
+                let fragments = out
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, child_id)| D0AssignmentFragment {
+                        child_id: child_id as usize,
+                        point_id: request.global_ids[index / request.fanout_top],
+                    })
+                    .collect();
+                return Ok(SqGpuD0QuantizeAssignResult {
+                    matrix: encoded.residuals,
+                    centroid_ids: Some(encoded.centroid_ids),
+                    fragments,
+                    profile: SqGpuD0StagingProfile {
+                        raw_h2d_wall: upload_wall,
+                        host_rotated_quantize_wall: quantize_wall,
+                        gpu_d0_assign_wall: assign_wall,
+                        d0_assign_kernel_requested: "rotated-residual",
+                        d0_assign_kernel_mode: "rotated-residual-scalar",
+                        d0_assign_rows: rows,
+                        d0_assign_leaders: leaders,
+                        d0_assign_pair_count: rows.saturating_mul(leaders),
+                        d0_assign_fanout: request.fanout_top,
+                        ..SqGpuD0StagingProfile::default()
+                    },
+                });
+            }
             let rows = request.global_ids.len();
             let dim = request.dim;
             let leader_count = request.global_d0_leader_ids.len();
@@ -24817,9 +27395,11 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     scales,
                     norms,
                 },
+                centroid_ids: None,
                 fragments,
                 profile: SqGpuD0StagingProfile {
                     raw_h2d_wall,
+                    host_rotated_quantize_wall: Duration::ZERO,
                     gpu_quantize_wall,
                     qcode_d2h_wall,
                     gpu_d0_assign_wall,
@@ -26849,6 +29429,34 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             if rows == 0 {
                 return Ok((Duration::ZERO, Duration::ZERO, Duration::ZERO, 0, 0));
             }
+            let rotated = match (quantized.rotated_center_ids, quantized.rotated_centers) {
+                (Some(ids), Some(centers)) => {
+                    if !matches!(
+                        quantized.distance_kind,
+                        GpuSubtreeQuantizedDistanceKind::SqInt8
+                    ) || quantized.dim == 0
+                        || ids.len() != rows
+                        || centers.is_empty()
+                        || centers.len() % quantized.dim != 0
+                        || centers.len() / quantized.dim > 256
+                        || ids
+                            .iter()
+                            .any(|&id| id as usize >= centers.len() / quantized.dim)
+                    {
+                        return Err(AnnError::log_index_error(
+                            "Invalid rotated residual SQ8 GPU payload".to_string(),
+                        ));
+                    }
+                    Some((ids, centers))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(AnnError::log_index_error(
+                        "Rotated residual SQ8 GPU payload requires both center IDs and centers"
+                            .to_string(),
+                    ));
+                }
+            };
             let expected_code_row_bytes = match quantized.code_layout {
                 GpuSubtreeQuantizedCodeLayout::DenseI8 => quantized.padded_dim,
                 GpuSubtreeQuantizedCodeLayout::PackedS4 => {
@@ -27001,13 +29609,106 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     .as_mut()
                     .expect("CUDA dense-i8 RabitQ+ resident code sum buffer initialized");
                 let mut view = sums_dev.slice_mut(0..quantized.code_sums.len());
+                let rotated_ids;
+                let sums = if let Some((ids, _)) = rotated {
+                    rotated_ids = ids.iter().map(|&id| id as f32).collect::<Vec<_>>();
+                    rotated_ids.as_slice()
+                } else {
+                    quantized.code_sums
+                };
+                self.stream.memcpy_htod(sums, &mut view).map_err(|err| {
+                    AnnError::log_index_error(format!(
+                        "Failed to upload dense-i8 RabitQ+ resident code sums to CUDA device: {err}"
+                    ))
+                })?;
+            }
+            if let Some((_, centers)) = rotated {
+                let center_count = centers.len() / quantized.dim;
+                let projection_count = rows.saturating_mul(center_count);
+                let output_len = 2usize
+                    .saturating_add(projection_count)
+                    .saturating_add(center_count.saturating_mul(center_count));
+                let mut centers_dev =
+                    self.stream
+                        .alloc_zeros::<f32>(centers.len())
+                        .map_err(|err| {
+                            AnnError::log_index_error(format!(
+                                "Failed to allocate rotated SQ8 centers: {err}"
+                            ))
+                        })?;
                 self.stream
-                    .memcpy_htod(quantized.code_sums, &mut view)
+                    .memcpy_htod(centers, &mut centers_dev)
                     .map_err(|err| {
                         AnnError::log_index_error(format!(
-                            "Failed to upload dense-i8 RabitQ+ resident code sums to CUDA device: {err}"
+                            "Failed to upload rotated SQ8 centers: {err}"
                         ))
                     })?;
+                let projection_dev = self.stream.alloc_zeros::<f32>(output_len).map_err(|err| {
+                    AnnError::log_index_error(format!(
+                        "Failed to allocate rotated SQ8 projections: {err}"
+                    ))
+                })?;
+                self.subtree_workspace.rotated_centers_dev = Some(centers_dev);
+                self.subtree_workspace.x_dev = Some(projection_dev);
+                let packed = quantized.code_layout == GpuSubtreeQuantizedCodeLayout::PackedS4;
+                let function = self.rotated_residual_sq8_prepare_function(packed)?;
+                let slots =
+                    projection_count.saturating_add(center_count.saturating_mul(center_count));
+                let grid_x = u32::try_from(slots.div_ceil(256)).map_err(|_| {
+                    AnnError::log_index_error("Rotated SQ8 projection grid exceeds u32".to_string())
+                })?;
+                let cfg = if packed {
+                    LaunchConfig {
+                        grid_dim: ((rows + center_count).div_ceil(16) as u32, center_count.div_ceil(16) as u32, 1),
+                        block_dim: (16, 16, 1), shared_mem_bytes: 0,
+                    }
+                } else { LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                } };
+                let rows_u32 = u32::try_from(rows).map_err(|_| {
+                    AnnError::log_index_error("Rotated SQ8 rows exceed u32".to_string())
+                })?;
+                let dim_u32 = u32::try_from(quantized.dim).map_err(|_| {
+                    AnnError::log_index_error("Rotated SQ8 dimension exceeds u32".to_string())
+                })?;
+                let padded_dim_u32 = u32::try_from(quantized.padded_dim).map_err(|_| {
+                    AnnError::log_index_error(
+                        "Rotated SQ8 padded dimension exceeds u32".to_string(),
+                    )
+                })?;
+                let center_count_u32 = center_count as u32;
+                let profile_projection = packed && std::env::var_os("SHEAR_PIPNN_PROFILE").is_some();
+                let record = || self.stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(|err| AnnError::log_index_error(format!("SQ4+ projection event: {err}")));
+                let start_event = profile_projection.then(&record).transpose()?;
+                let workspace = &mut self.subtree_workspace;
+                let mut launch = self.stream.launch_builder(&function);
+                launch
+                    .arg(workspace.leaf_sq_int8_codes_dev.as_ref().unwrap())
+                    .arg(workspace.leaf_sq_int8_scales_dev.as_ref().unwrap())
+                    .arg(workspace.leaf_sq_int8_sums_dev.as_ref().unwrap())
+                    .arg(workspace.rotated_centers_dev.as_ref().unwrap())
+                    .arg(workspace.norms_dev.as_mut().unwrap())
+                    .arg(&rows_u32)
+                    .arg(&dim_u32)
+                    .arg(&padded_dim_u32)
+                    .arg(&center_count_u32)
+                    .arg(workspace.x_dev.as_mut().unwrap());
+                unsafe {
+                    launch.launch(cfg).map_err(|err| {
+                        AnnError::log_index_error(format!(
+                            "Rotated residual SQ8 projection kernel failed: {err}"
+                        ))
+                    })?;
+                }
+                if let Some(start) = start_event {
+                    let end = record()?;
+                    end.synchronize().map_err(|err| AnnError::log_index_error(format!("SQ4+ projection sync: {err}")))?;
+                    tracing::info!("SQ4+ GPU projection: rows={} centers={} device_us={} extra_h2d_bytes={}",
+                        rows, center_count, cuda_event_elapsed_duration(&start, &end)?.as_micros(), centers.len() * 4);
+                }
             }
             let quantized_h2d_wall = quantized_upload_start.elapsed();
             let metadata_bytes = quantized
@@ -27991,7 +30692,11 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             let quantized_distance_source_u32 = if rabitq_plus_build {
                 GPU_PERSISTENT_DISTANCE_SOURCE_RABITQ_PLUS
             } else if sq_wmma_build {
-                GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+                if params.gpu_subtree_sq8_rotated_residual_d1_int8 || params.gpu_subtree_sq4_primary_center {
+                    GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL
+                } else {
+                    GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+                }
             } else if turboquant_build {
                 GPU_PERSISTENT_DISTANCE_SOURCE_TURBOQUANT_MSE4
             } else {
@@ -28050,10 +30755,14 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             };
             let partition_worker_blocks_u32 = partition_worker_blocks as u32;
             let worker_blocks_u32 = (partition_worker_blocks + topk_worker_blocks) as u32;
+            if PersistentSubtreeCompileEnvironment::current(scheduler_config.actual_mode, leaf_sq_int4_wmma_source_enabled).sq8_wmma_opt_mask & 131072 != 0 && worker_blocks_u32 > 256 {
+                return Err(AnnError::log_index_error("leaf profiling supports at most 256 CTAs".to_string()));
+            }
             let cfg = LaunchConfig {
                 grid_dim: (worker_blocks_u32, 1, 1),
                 block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: PersistentSubtreeCompileEnvironment::current(scheduler_config.actual_mode, leaf_sq_int4_wmma_source_enabled)
+                    .sq4_big_leaf_shared_bytes(leaf_sq_int4_wmma_source_enabled) as u32,
             };
             let effective_leaf_wmma_topk_enabled = leaf_wmma_topk_enabled
                 && !leaf_sq_int8_wmma_source_enabled
@@ -28139,7 +30848,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                         "Failed to create null CUDA persistent resident vector pointer: {err}"
                     ))
                 })?;
-                let x_dev = if quantized_build {
+                let x_dev = if quantized_build && !params.gpu_subtree_sq8_rotated_residual_d1_int8 && !params.gpu_subtree_sq4_primary_center {
                     &null_resident_x
                 } else {
                     workspace.x_dev.as_ref().ok_or_else(|| {
@@ -28287,15 +30996,29 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     leaf_dco_rerank_mode_u32 == GPU_PERSISTENT_LEAF_DCO_RERANK_NONE
                         && leaf_dco_audit_u32 == 0,
                 )?;
-                let sq8_assignment_kernel_u32 = persistent_sq8_assignment_kernel_code(
-                    params.gpu_subtree_sq8_assignment_kernel,
-                    sq_wmma_build
-                        && workspace.leaf_sq_int8_code_layout
-                            == GpuSubtreeQuantizedCodeLayout::DenseI8,
-                    workspace.leaf_sq_int8_padded_dim,
-                    sm72_plus,
-                    assignment_dco_mode_u32 == GPU_PERSISTENT_ASSIGNMENT_DCO_NONE,
-                )?;
+                let native_sq4_assignment = leaf_sq_int4_wmma_source_enabled
+                    && workspace.leaf_sq_int8_code_layout == GpuSubtreeQuantizedCodeLayout::PackedS4
+                    && (75..90).contains(&(compute_capability_major * 10 + compute_capability_minor))
+                    && workspace.leaf_sq_int8_padded_dim > 0
+                    && workspace.leaf_sq_int8_padded_dim % 32 == 0
+                    && workspace.leaf_sq_int8_code_row_bytes % 4 == 0
+                    && assignment_dco_mode_u32 == GPU_PERSISTENT_ASSIGNMENT_DCO_NONE;
+                let sq8_assignment_kernel_u32 = if native_sq4_assignment
+                    && params.gpu_subtree_sq8_assignment_kernel
+                        != PiPNNGpuSubtreeSq8AssignmentKernel::WarpDp4a
+                {
+                    GPU_PERSISTENT_SQ4_ASSIGNMENT_KERNEL_WMMA
+                } else {
+                    persistent_sq8_assignment_kernel_code(
+                        params.gpu_subtree_sq8_assignment_kernel,
+                        sq_wmma_build
+                            && workspace.leaf_sq_int8_code_layout
+                                == GpuSubtreeQuantizedCodeLayout::DenseI8,
+                        workspace.leaf_sq_int8_padded_dim,
+                        sm72_plus,
+                        assignment_dco_mode_u32 == GPU_PERSISTENT_ASSIGNMENT_DCO_NONE,
+                    )?
+                };
                 let large_ticket_batch_u32 = gpu_persistent_large_ticket_batch_size(
                     params.gpu_subtree_persistent_large_ticket_batch,
                     sq_wmma_build
@@ -28834,6 +31557,8 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 persistent_total_wall.as_millis(),
             );
 
+            self.download_leaf_profile(resident_rows, persistent_kernel_event_wall)?;
+
             let mut counters_host = vec![0_u64; GPU_QUEUE_COUNTER_WORDS];
             {
                 let counters = self.subtree_workspace.persistent_output_slots[0]
@@ -28924,6 +31649,10 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 }
             }
 
+            if counters_host[167] > 0 {
+                tracing::info!("SQ4 8x32 assignment executed: distance_source={} tiles={}",
+                    quantized_distance_source_u32, counters_host[167]);
+            }
             let overflow_flags = counters_host[7] as u32;
             let leaf_rows = counters_host[12] as usize;
             let leaf_count = counters_host[13] as usize;
@@ -29047,7 +31776,14 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 persistent_leaf_sq8_wmma_tiles: counters_host[158] as usize,
                 persistent_leaf_row_owned_tasks: counters_host[148] as usize,
                 persistent_leaf_staged_tasks: counters_host[149] as usize,
-                persistent_leaf_score_clocks: counters_host[150] as usize,
+                persistent_leaf_score_clocks: {
+                    if counters_host[162] > 0 {
+                        tracing::info!("SQ4 leaf policy counters: merges={} dedup_rows={} small_exceptions={} sized_splits={} leaders={} max_depth={} merge_clocks={} merged_groups={}",
+                            counters_host[159], counters_host[160], counters_host[161], counters_host[162],
+                            counters_host[163], counters_host[164], counters_host[165], counters_host[166]);
+                    }
+                    counters_host[150] as usize
+                },
                 persistent_leaf_row_lock_merge_clocks: counters_host[151] as usize,
                 persistent_topk_local_counter_flushes: counters_host[152] as usize,
                 persistent_topk_idle_backoff_calls: counters_host[153] as usize,
@@ -29388,6 +32124,139 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             .into_complete()
         }
 
+        fn sq4_primary_triangle_functions(&mut self) -> AnnResult<(CudaFunction, CudaFunction)> {
+            if let Some(functions) = &self.sq4_primary_triangle_functions {
+                return Ok(functions.clone());
+            }
+            let source = format!(
+                "#define GPU_PERSISTENT_LEAF_SQ_INT4_WMMA_ENABLE 1\n{}\n{}",
+                GPU_PERSISTENT_SUBTREE_KERNEL_SRC, include_str!("sq4_primary_triangle.cu"),
+            );
+            let ptx = compile_ptx_with_opts(&source, CompileOptions {
+                arch: persistent_subtree_nvrtc_arch(&self.stream)?,
+                include_paths: persistent_subtree_nvrtc_include_paths(),
+                options: vec!["--std=c++17".into()],
+                ..CompileOptions::default()
+            }).map_err(|err| AnnError::log_index_error(format!("Compile SQ4+ triangle kernels: {err}")))?;
+            let module = self.stream.context().load_module(ptx)
+                .map_err(|err| AnnError::log_index_error(format!("Load SQ4+ triangle module: {err}")))?;
+            let functions = (
+                module.load_function("sq4_primary_triangle_blocks")
+                    .map_err(|err| AnnError::log_index_error(format!("Load SQ4+ block kernel: {err}")))?,
+                module.load_function("sq4_primary_triangle_merge")
+                    .map_err(|err| AnnError::log_index_error(format!("Load SQ4+ merge kernel: {err}")))?,
+            );
+            self.sq4_primary_triangle_functions = Some(functions.clone());
+            Ok(functions)
+        }
+
+        fn run_sq4_primary_triangle_batches(
+            &mut self, batches: &[Sq4PrimaryTriangleBatch], functions: &(CudaFunction, CudaFunction),
+            leaf_rows: usize, leaf_task_count: usize, k: usize, reuse_partition_queue: bool,
+        ) -> AnnResult<Sq4PrimaryTriangleProfile> {
+            let stream = &self.stream;
+            let workspace = &mut self.subtree_workspace;
+            let resident_rows = workspace.resident_shape().unwrap().0;
+            let output = &mut workspace.persistent_output_slots[0];
+            let mut counters = vec![0u64; GPU_QUEUE_COUNTER_WORDS];
+            // The replacement completes all original row-task descriptors.
+            // Physical triangle block tasks are recorded separately in its profile.
+            counters[9] = leaf_task_count as u64;
+            counters[10] = leaf_task_count as u64;
+            counters[12] = leaf_rows as u64;
+            counters[21] = resident_rows as u64;
+            counters[24] = leaf_task_count as u64;
+            counters[33] = u64::MAX;
+            let mut profile = Sq4PrimaryTriangleProfile::default();
+            for batch in batches {
+                profile.scratch_bytes = profile.scratch_bytes.max(batch.bytes());
+                profile.block_tasks += batch.tasks.len() / 5;
+                for leaf in batch.leaves.chunks_exact(3) {
+                    let count = leaf[1];
+                    counters[13] += 1;
+                    counters[33] = counters[33].min(count);
+                    counters[34] = counters[34].max(count);
+                    counters[35] += count;
+                    counters[36] += 1;
+                    counters[79] += 1;
+                    counters[80] += count;
+                    counters[81] += count * count.saturating_sub(1);
+                    counters[86] += count * k as u64;
+                    let blocks = (count as usize).div_ceil(8);
+                    profile.dot_tiles += blocks * (blocks + 1) / 2;
+                    profile.full_dot_tiles += blocks * blocks;
+                }
+            }
+            counters[82] = counters[81];
+            counters[158] = profile.block_tasks as u64;
+            stream.memcpy_htod(&counters, output.persistent_counters_dev.as_mut().unwrap())
+                .map_err(|err| AnnError::log_index_error(format!("Initialize SQ4+ triangle counters: {err}")))?;
+            let k = k as u32;
+            let padded_dim = workspace.leaf_sq_int8_padded_dim as u32;
+            let stride = workspace.leaf_sq_int8_code_row_bytes as u32;
+            for batch in batches {
+                // The partition stage has finished. Its descriptor queue is distinct from
+                // the leaf descriptors and is reinitialized by the next partition launch.
+                let mut fresh;
+                let storage = if reuse_partition_queue {
+                    workspace.persistent_partition_queue_dev.as_mut().unwrap()
+                } else {
+                    fresh = unsafe { stream.alloc::<u32>(batch.bytes() / size_of::<u32>()) }
+                        .map_err(|err| AnnError::log_index_error(format!("Allocate SQ4+ triangle scratch: {err}")))?;
+                    &mut fresh
+                };
+                let (mut task_words, mut rest) = storage.split_at_mut(batch.tasks.len() * 2);
+                let (mut leaf_words, mut dot_words) = rest.split_at_mut(batch.leaves.len() * 2);
+                // Both u64 descriptor arrays start at an 8-byte aligned offset. The
+                // remaining i32 dot entries are written by the block kernel before use.
+                let mut task_data = unsafe { task_words.transmute_mut::<u64>(batch.tasks.len()) }.unwrap();
+                let mut leaf_data = unsafe { leaf_words.transmute_mut::<u64>(batch.leaves.len()) }.unwrap();
+                let mut dots = unsafe { dot_words.transmute_mut::<i32>(batch.entries) }.unwrap();
+                stream.memcpy_htod(&batch.tasks, &mut task_data)
+                    .map_err(|err| AnnError::log_index_error(format!("Upload SQ4+ block tasks: {err}")))?;
+                stream.memcpy_htod(&batch.leaves, &mut leaf_data)
+                    .map_err(|err| AnnError::log_index_error(format!("Upload SQ4+ merge tasks: {err}")))?;
+                let tasks = task_data.as_view();
+                let leaves = leaf_data.as_view();
+                let resident_count = resident_rows as u32;
+                let start = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(|err| AnnError::log_index_error(format!("Record SQ4+ block start: {err}")))?;
+                let mut launch = stream.launch_builder(&functions.0);
+                launch.arg(&tasks).arg(output.row_ids_dev.as_ref().unwrap())
+                    .arg(workspace.leaf_sq_int8_codes_dev.as_ref().unwrap()).arg(&resident_count)
+                    .arg(&padded_dim).arg(&stride).arg(&mut dots);
+                unsafe { launch.launch(LaunchConfig {
+                    grid_dim: ((batch.tasks.len() / 5) as u32, 1, 1),
+                    block_dim: (256, 1, 1), shared_mem_bytes: 0,
+                }) }.map_err(|err| AnnError::log_index_error(format!("Launch SQ4+ block kernel: {err}")))?;
+                let middle = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(|err| AnnError::log_index_error(format!("Record SQ4+ block end: {err}")))?;
+                let mut launch = stream.launch_builder(&functions.1);
+                let dot_values = dots.as_view();
+                launch.arg(&leaves).arg(&k).arg(&dot_values).arg(output.row_ids_dev.as_ref().unwrap())
+                    .arg(workspace.global_ids_dev.as_ref().unwrap()).arg(workspace.norms_dev.as_ref().unwrap())
+                    .arg(workspace.leaf_sq_int8_scales_dev.as_ref().unwrap())
+                    .arg(workspace.leaf_sq_int8_sums_dev.as_ref().unwrap()).arg(workspace.x_dev.as_ref().unwrap())
+                    .arg(output.topk_ids_dev.as_mut().unwrap())
+                    .arg(output.topk_dists_dev.as_mut().unwrap());
+                unsafe { launch.launch(LaunchConfig {
+                    grid_dim: ((batch.leaves.len() / 3) as u32, 1, 1),
+                    block_dim: (128, 1, 1), shared_mem_bytes: 0,
+                }) }.map_err(|err| AnnError::log_index_error(format!("Launch SQ4+ merge kernel: {err}")))?;
+                let end = stream.record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(|err| AnnError::log_index_error(format!("Record SQ4+ merge end: {err}")))?;
+                // Bound live scratch to one batch, including asynchronous allocations.
+                stream.synchronize().map_err(|err|
+                    AnnError::log_index_error(format!("Synchronize SQ4+ triangle batch: {err}")))?;
+                profile.compute += cuda_event_elapsed_duration(&start, &middle)?;
+                profile.merge += cuda_event_elapsed_duration(&middle, &end)?;
+            }
+            tracing::info!("SQ4+ triangle leaf stage: batches={} block_tasks={} compute_us={} merge_us={} scratch_bytes={} dot_tiles={} full_dot_tiles={} reused_partition_queue={}",
+                batches.len(), profile.block_tasks, profile.compute.as_micros(),
+                profile.merge.as_micros(), profile.scratch_bytes, profile.dot_tiles, profile.full_dot_tiles, reuse_partition_queue);
+            Ok(profile)
+        }
+
         fn run_persistent_subtree_topk_only(
             &mut self,
             params: &PiPNNParams,
@@ -29494,7 +32363,11 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             let quantized_distance_source_u32 = if rabitq_plus_build {
                 GPU_PERSISTENT_DISTANCE_SOURCE_RABITQ_PLUS
             } else if sq_wmma_build {
-                GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+                if params.gpu_subtree_sq8_rotated_residual_d1_int8 || params.gpu_subtree_sq4_primary_center {
+                    GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL
+                } else {
+                    GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
+                }
             } else if turboquant_build {
                 GPU_PERSISTENT_DISTANCE_SOURCE_TURBOQUANT_MSE4
             } else {
@@ -29563,9 +32436,47 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             let cfg = LaunchConfig {
                 grid_dim: (worker_blocks as u32, 1, 1),
                 block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: PersistentSubtreeCompileEnvironment::current(PiPNNGpuSubtreePersistentSchedulerMode::Baseline, leaf_sq_int4_wmma_source_enabled)
+                    .sq4_big_leaf_shared_bytes(leaf_sq_int4_wmma_source_enabled) as u32,
             };
-            let function = self.persistent_topk_only_function(
+            let triangle_requested = params.gpu_subtree_sq4_primary_center
+                && params.gpu_subtree_sq_native_int4 && sq_wmma_build
+                && std::env::var("SHEAR_PIPNN_SQ4_PRIMARY_TRIANGULAR").as_deref() == Ok("1")
+                && k <= 4 && (8..9).contains(&device.compute_capability_major)
+                && self.subtree_workspace.leaf_sq_int8_padded_dim % 32 == 0;
+            let mut reuse_partition_queue = false;
+            let triangle_batches = if triangle_requested {
+                let (free, total) = self.device_memory_info_after_sync()?;
+                // Include cached allocations from earlier, larger partitions.
+                // Counting all device usage is conservative when other contexts exist.
+                let occupied = total.saturating_sub(free)
+                    .max(plan.device_admission_required_bytes).max(plan.required_bytes);
+                let batch_cap = 256 * 1024 * 1024;
+                let fresh_budget = plan.budget_bytes.saturating_sub(occupied).min(free / 2).min(batch_cap);
+                let queue_budget = self.subtree_workspace.persistent_partition_queue_dev
+                    .as_ref().map_or(0, |queue| queue.len() * size_of::<u32>()).min(batch_cap);
+                reuse_partition_queue = queue_budget >= fresh_budget;
+                let scratch_budget = queue_budget.max(fresh_budget);
+                // Partition-only execution keeps leaf descriptors on the device.
+                // Read just the small start/size arrays to plan bounded scratch batches.
+                let output = &self.subtree_workspace.persistent_output_slots[0];
+                let leaf_starts = self.stream.clone_dtoh(
+                    &output.leaf_starts_dev.as_ref().unwrap().slice(0..leaf_count))
+                    .map_err(|err| AnnError::log_index_error(format!("Read SQ4+ leaf starts: {err}")))?;
+                let leaf_sizes = self.stream.clone_dtoh(
+                    &output.leaf_sizes_dev.as_ref().unwrap().slice(0..leaf_count))
+                    .map_err(|err| AnnError::log_index_error(format!("Read SQ4+ leaf sizes: {err}")))?;
+                let batches = plan_sq4_primary_triangle_batches(&leaf_starts, &leaf_sizes, leaf_rows, k, scratch_budget)?;
+                if batches.is_none() {
+                    tracing::info!("SQ4+ triangle scratch does not fit, using directed leaf executor: scratch_budget={}", scratch_budget);
+                }
+                batches
+            } else { None };
+            let triangle_functions = if triangle_batches.is_some() {
+                Some(self.sq4_primary_triangle_functions()?)
+            } else { None };
+            let function = if triangle_batches.is_none() {
+                Some(self.persistent_topk_only_function(
                 wmma_diagnostics_enabled,
                 wmma_exec_diagnostics_enabled,
                 wmma_cta_shared_b_enabled,
@@ -29574,7 +32485,8 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 leaf_sq_int8_wmma_source_enabled,
                 leaf_sq_int4_wmma_source_enabled,
                 leaf_sq_int8_scalar_diagnostic_source_enabled,
-            )?;
+            )?)
+            } else { None };
             let kernel_start_event = self
                 .stream
                 .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -29584,14 +32496,19 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                     ))
                 })?;
             let total_start = Instant::now();
-            {
+            let mut triangle_profile = Sq4PrimaryTriangleProfile::default();
+            if let Some(batches) = &triangle_batches {
+                triangle_profile = self.run_sq4_primary_triangle_batches(
+                    batches, triangle_functions.as_ref().unwrap(), leaf_rows, leaf_task_count, k, reuse_partition_queue,
+                )?;
+            } else {
                 let workspace = &mut self.subtree_workspace;
                 let null_resident_x = self.stream.null::<f32>().map_err(|err| {
                     AnnError::log_index_error(format!(
                         "Failed to create null CUDA persistent top-k-only resident vector pointer: {err}"
                     ))
                 })?;
-                let x_dev = if quantized_build {
+                let x_dev = if quantized_build && !params.gpu_subtree_sq8_rotated_residual_d1_int8 && !params.gpu_subtree_sq4_primary_center {
                     &null_resident_x
                 } else {
                     workspace.x_dev.as_ref().ok_or_else(|| {
@@ -29944,7 +32861,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 let leaf_rows_u32 = leaf_rows as u32;
                 let leaf_count_u32 = leaf_count as u32;
                 let leaf_task_count_u64 = leaf_task_count as u64;
-                let mut launch = self.stream.launch_builder(&function);
+                let mut launch = self.stream.launch_builder(function.as_ref().unwrap());
                 launch
                     .arg(x_dev)
                     .arg(global_ids_dev)
@@ -30176,6 +33093,9 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 leaf_dco,
                 ..GpuSubtreeTopKProfile::default()
             };
+            if !reuse_partition_queue {
+                profile.workspace_peak_bytes += triangle_profile.scratch_bytes;
+            }
             profile.refresh_aggregate_timings();
             if overflow_flags != 0 {
                 return Err(AnnError::log_index_error(
@@ -30542,6 +33462,22 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 partition_profile.persistent_large_node_serialized_wait_cycles;
             combined.persistent_large_ticket_batch_actual =
                 partition_profile.persistent_large_ticket_batch_actual;
+            combined.persistent_large_count_distance_clocks =
+                partition_profile.persistent_large_count_distance_clocks;
+            combined.persistent_large_count_commit_clocks =
+                partition_profile.persistent_large_count_commit_clocks;
+            combined.persistent_large_scatter_clocks =
+                partition_profile.persistent_large_scatter_clocks;
+            combined.persistent_large_publish_clocks =
+                partition_profile.persistent_large_publish_clocks;
+            combined.persistent_large_ticket_range_claims =
+                partition_profile.persistent_large_ticket_range_claims;
+            combined.persistent_large_physical_tiles =
+                partition_profile.persistent_large_physical_tiles;
+            combined.persistent_large_sq8_dp4a_tiles =
+                partition_profile.persistent_large_sq8_dp4a_tiles;
+            combined.persistent_large_sq8_wmma_tiles =
+                partition_profile.persistent_large_sq8_wmma_tiles;
             combined.persistent_queue_overflow_flags = partition_profile
                 .persistent_queue_overflow_flags
                 | topk_profile.persistent_queue_overflow_flags;
@@ -32570,6 +35506,14 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
             let sq_wmma_build = params.gpu_subtree_sq_wmma_mode == PiPNNGpuSubtreeSqWmmaMode::Build;
             let turboquant_build =
                 params.gpu_subtree_turboquant_mode == PiPNNGpuSubtreeTurboQuantMode::Build;
+            if (params.gpu_subtree_sq8_rotated_residual_d1_int8 || params.gpu_subtree_sq4_primary_center)
+                && (quantized.rotated_center_ids.is_none() || quantized.rotated_centers.is_none())
+            {
+                return Err(AnnError::log_index_error(
+                    "Direct rotated residual quantization requires center IDs and rotated centers"
+                        .to_string(),
+                ));
+            }
             match quantized.distance_kind {
                 GpuSubtreeQuantizedDistanceKind::RabitqPlus if !rabitq_plus_build => {
                     return Err(AnnError::log_index_error(
@@ -34646,6 +37590,31 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
     }
 
     impl TessaCudaReplaySession {
+        pub(crate) fn kernel_resource_attributes(&self) -> AnnResult<serde_json::Value> {
+            let read = |function: &CudaFunction| -> AnnResult<serde_json::Value> {
+                let attribute = |name: &str, value: Result<i32, _>| {
+                    value.map_err(|err| {
+                        tessa_cuda_error(format!("failed to read {name} kernel attribute: {err}"))
+                    })
+                };
+                Ok(serde_json::json!({
+                    "registers_per_thread": attribute("registers", function.num_regs())?,
+                    "static_shared_bytes": attribute("shared memory", function.shared_size_bytes())?,
+                    "local_bytes_per_thread": attribute("local memory", function.local_size_bytes())?,
+                    "active_blocks_per_sm_at_256_threads": function
+                        .occupancy_max_active_blocks_per_multiprocessor(256, 0, None)
+                        .map_err(|err| tessa_cuda_error(format!(
+                            "failed to query replay kernel occupancy: {err}"
+                        )))?,
+                }))
+            };
+            Ok(serde_json::json!({
+                "assignment": read(&self.assignment_function)?,
+                "raw_leaf": read(&self.raw_leaf_function)?,
+                "sq8_leaf": read(&self.sq8_leaf_function)?,
+            }))
+        }
+
         pub(crate) fn new(device_id: usize, prepared: &TessaPreparedReplay) -> AnnResult<Self> {
             if prepared.global_ids.is_empty()
                 || prepared.assignment_layouts.is_empty()
@@ -34667,6 +37636,7 @@ extern "C" __global__ void rabitq_residual_split_ex_refine_topk_kernel(
                 let stream = Arc::clone(&engine.stream);
                 let compile_environment = engine.refresh_persistent_subtree_compile_environment(
                     PiPNNGpuSubtreePersistentSchedulerMode::Baseline,
+                    false,
                 );
                 let assignment_function =
                     Arc::new(CudaGemmEngine::load_persistent_subtree_named_function(
@@ -35633,6 +38603,7 @@ mod tests {
     #[test]
     fn owned_gpu_subtree_quantized_input_clone_reuses_backing_allocations() {
         let owned = OwnedGpuSubtreeQuantizedInput {
+            rotated: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: Arc::new(vec![3, 7]),
             codes: Arc::new(vec![1, 2, 3, 4]),
@@ -35675,6 +38646,7 @@ mod tests {
             memory_budget_bytes: None,
         };
         let owned = OwnedGpuSubtreeQuantizedInput {
+            rotated: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: Arc::new(point_ids.clone()),
             codes: Arc::new(vec![1, 2, 3, 4]),
@@ -37514,7 +40486,7 @@ mod tests {
         ] {
             assert!(source.contains(declaration), "missing {declaration}");
         }
-        assert_eq!(super::GPU_QUEUE_COUNTER_WORDS, 159);
+        assert_eq!(super::GPU_QUEUE_COUNTER_WORDS, 167);
         assert!(source.contains("GPU_PERSISTENT_COUNTER_WORDS = 159u"));
     }
 
@@ -39294,7 +42266,7 @@ extern "C" __global__ void gpu_persistent_watchdog_contract_test(unsigned int* o
             plan.leaf_max,
             params.c_max.max(super::GPU_PERSISTENT_LEAF_MAX)
         );
-        assert_eq!(super::GPU_QUEUE_COUNTER_WORDS, 159);
+        assert_eq!(super::GPU_QUEUE_COUNTER_WORDS, 167);
         assert_eq!(plan.large_child_slots, super::GPU_QUEUE_LEADER_STRIDE);
         assert!(plan.required_bytes <= plan.budget_bytes);
     }
@@ -41357,6 +44329,9 @@ extern "C" __global__ void gpu_persistent_watchdog_contract_test(unsigned int* o
             },
         )
         .expect("persistent CUDA test harness should compile");
+        if let Ok(path) = std::env::var("SHEAR_CUDA_TEST_PTX_DUMP") {
+            std::fs::write(path, ptx.to_src()).expect("write CUDA test PTX");
+        }
         let context = CudaContext::new(0).expect("CUDA device 0 context");
         let stream = context.default_stream();
         let module = context
@@ -41385,6 +44360,37 @@ extern "C" __global__ void gpu_persistent_watchdog_contract_test(unsigned int* o
         stream
             .clone_dtoh(&output)
             .expect("download persistent CUDA test output")
+    }
+
+    #[cfg(feature = "pipnn_cuda")]
+    #[test]
+    fn gpu_rotated_residual_sq8_cross_center_distance_matches_reconstruction() {
+        let source = super::cuda_backend::GPU_PERSISTENT_SUBTREE_KERNEL_SRC;
+        let harness = r#"
+extern "C" __global__ void gpu_rotated_residual_sq8_cross_center_probe(unsigned int* out) {
+    float norms[2] = {1.0f, 10404.0f};
+    float scales[2] = {1.0f, 1.0f};
+    float center_ids[2] = {0.0f, 1.0f};
+    float projections_and_gram[10] = {
+        __uint_as_float(2u), __uint_as_float(2u),
+        0.0f, 100.0f, 0.0f, 200.0f,
+        0.0f, 0.0f, 0.0f, 10000.0f
+    };
+    out[0] = __float_as_uint(gpu_persistent_rotated_residual_sq8_l2_from_dot(
+        2, 0u, 1u, norms, scales, center_ids, projections_and_gram
+    ));
+    out[1] = __float_as_uint(gpu_persistent_rotated_residual_sq8_l2_from_dot(
+        1, 0u, 0u, norms, scales, center_ids, projections_and_gram
+    ));
+}
+"#;
+        let output = run_persistent_cuda_u32_harness(
+            format!("{source}\n{harness}"),
+            "gpu_rotated_residual_sq8_cross_center_probe",
+            2,
+        );
+        assert_eq!(f32::from_bits(output[0]), (1.0_f32 - 102.0).powi(2));
+        assert_eq!(f32::from_bits(output[1]), 0.0);
     }
 
     #[cfg(feature = "pipnn_cuda")]
@@ -41669,6 +44675,8 @@ extern "C" __global__ void gpu_persistent_tessa_capture_contract_test(unsigned i
         .expect("SQ8 quantization");
         let code_sums = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &sq.codes,
@@ -41839,6 +44847,7 @@ extern "C" __global__ void gpu_persistent_large_sq8_wmma_diff_test(unsigned int*
                     rows = 16u;
                 }
                 gpu_persistent_large_task_rabitq_warp_best_slots4(
+                    (const float*)0,
                     assignment_norms,
                     assignment_codes,
                     assignment_scales,
@@ -41896,22 +44905,35 @@ extern "C" __global__ void gpu_persistent_large_sq8_wmma_diff_test(unsigned int*
                                     (int)assignment_codes[point * 1024u + axis]
                                     * (int)assignment_codes[leader * 1024u + axis];
                             }
-                            int wmma_dot = assignment_scratch.c[row * 16u + col];
-                            if (scalar_dot != wmma_dot) {
+                            int c_value = assignment_scratch.c[
+#if GPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT
+                                col * 16u + row
+#else
+                                row * 16u + col
+#endif
+                            ];
+#if !GPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT
+                            if (scalar_dot != c_value) {
                                 out[3] += 1u;
                             }
+#endif
                             float scalar_dist = assignment_norms[point]
                                 + assignment_norms[leader]
                                 - 2.0f
                                     * assignment_scales[point]
                                     * assignment_scales[leader]
                                     * (float)scalar_dot;
-                            float wmma_dist = assignment_norms[point]
+                            float wmma_dist =
+#if GPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT
+                                __int_as_float(c_value);
+#else
+                                assignment_norms[point]
                                 + assignment_norms[leader]
                                 - 2.0f
                                     * assignment_scales[point]
                                     * assignment_scales[leader]
-                                    * (float)wmma_dot;
+                                    * (float)c_value;
+#endif
                             if (scalar_dist <= 0.0f) {
                                 scalar_dist = 0.0f;
                             }
@@ -41939,13 +44961,34 @@ extern "C" __global__ void gpu_persistent_large_sq8_wmma_diff_test(unsigned int*
     }
 }
 "#;
-        let output = run_persistent_cuda_u32_harness_with_block(
-            format!("{source}\n{harness}"),
-            "gpu_persistent_large_sq8_wmma_diff_test",
-            5,
-            256,
-        );
-        assert_eq!(output, vec![0, 20, 0, 0, 0]);
+        let only_mask = std::env::var("SHEAR_CUDA_SQ8_WMMA_TEST_ONLY_MASK")
+            .ok()
+            .map(|value| value.parse::<u32>().expect("numeric assignment optimization mask"));
+        let mut tested_variants = 0;
+        for (o1_assignment, o3a_assignment, o3b_assignment, o4_assignment) in
+            [(0, 0, 0, 0), (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1), (0, 1, 1, 0)]
+        {
+            let mask = o1_assignment | (o3a_assignment << 3)
+                | (o3b_assignment << 5) | (o4_assignment << 7);
+            if only_mask.is_some_and(|selected| selected != mask) {
+                continue;
+            }
+            tested_variants += 1;
+            let output = run_persistent_cuda_u32_harness_with_block(
+                format!(
+                    "#define GPU_PERSISTENT_SQ8_WMMA_O1_ASSIGNMENT {o1_assignment}\n#define GPU_PERSISTENT_SQ8_WMMA_O3A_ASSIGNMENT {o3a_assignment}\n#define GPU_PERSISTENT_SQ8_WMMA_O3B_ASSIGNMENT {o3b_assignment}\n#define GPU_PERSISTENT_SQ8_WMMA_O4_ASSIGNMENT {o4_assignment}\n{source}\n{harness}"
+                ),
+                "gpu_persistent_large_sq8_wmma_diff_test",
+                5,
+                256,
+            );
+            assert_eq!(
+                output,
+                vec![0, 20, 0, 0, 0],
+                "O1-P={o1_assignment} O3-A-P={o3a_assignment} O3-B-P={o3b_assignment} O4-P={o4_assignment}"
+            );
+        }
+        assert!(tested_variants > 0, "no matching SQ8 assignment test variant");
     }
 
     #[cfg(feature = "pipnn_cuda")]
@@ -41982,7 +45025,7 @@ extern "C" __global__ void gpu_persistent_sq8_leaf_executor_diff_test(unsigned i
         float scale = 0.0078125f * (float)(1u + (source_row % 5u));
         int sum = 0;
         int square_sum = 0;
-        for (unsigned int axis = 0u; axis < 1024u; ++axis) {
+        for (unsigned int axis = 0u; axis < LEAF_DIFF_PADDED_DIM; ++axis) {
             int value = (int)leaf_diff_codes[row * 1024u + axis];
             sum += value;
             square_sum += value * value;
@@ -42023,7 +45066,7 @@ extern "C" __global__ void gpu_persistent_sq8_leaf_executor_diff_test(unsigned i
         leaf_diff_codes,
         leaf_diff_scales,
         leaf_diff_sums,
-        1024u,
+        LEAF_DIFF_PADDED_DIM,
         1024u,
         GPU_PERSISTENT_SQ_CODE_LAYOUT_DENSE_I8,
         (const unsigned char*)0,
@@ -42040,7 +45083,7 @@ extern "C" __global__ void gpu_persistent_sq8_leaf_executor_diff_test(unsigned i
         20u,
         0u,
         20u,
-        1024u,
+        LEAF_DIFF_PADDED_DIM,
         4u,
         leaf_diff_dp4a_ids,
         leaf_diff_dp4a_dists,
@@ -42052,7 +45095,8 @@ extern "C" __global__ void gpu_persistent_sq8_leaf_executor_diff_test(unsigned i
         0u,
         0u,
         20u,
-        0u
+        0u,
+        GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8
     );
     __syncthreads();
 #else
@@ -42063,7 +45107,7 @@ extern "C" __global__ void gpu_persistent_sq8_leaf_executor_diff_test(unsigned i
         leaf_diff_codes,
         leaf_diff_scales,
         leaf_diff_sums,
-        1024u,
+        LEAF_DIFF_PADDED_DIM,
         1024u,
         GPU_PERSISTENT_SQ_CODE_LAYOUT_DENSE_I8,
         (const unsigned char*)0,
@@ -42080,7 +45124,7 @@ extern "C" __global__ void gpu_persistent_sq8_leaf_executor_diff_test(unsigned i
         20u,
         0u,
         20u,
-        1024u,
+        LEAF_DIFF_PADDED_DIM,
         4u,
         leaf_diff_wmma_ids,
         leaf_diff_wmma_dists,
@@ -42117,21 +45161,73 @@ extern "C" __global__ void gpu_persistent_sq8_leaf_executor_diff_test(unsigned i
     }
 }
 "#;
-        let run_variant = |use_wmma: u32| {
+        let run_variant = |use_wmma: u32, o1_leaf: u32, o2_leaf: u32, o3a_leaf: u32, o3b_leaf: u32, o4_leaf: u32, padded_dim: u32| {
             run_persistent_cuda_u32_harness_with_block(
                 format!(
-                    "#define GPU_PERSISTENT_LEAF_DCO_ENABLE 1\n#define GPU_PERSISTENT_LEAF_SQ_INT8_WMMA_ENABLE 1\n#define LEAF_DIFF_USE_WMMA {use_wmma}\n{source}\n{harness}"
+                    "#define GPU_PERSISTENT_LEAF_DCO_ENABLE 1\n#define GPU_PERSISTENT_LEAF_SQ_INT8_WMMA_ENABLE 1\n#define GPU_PERSISTENT_SQ8_WMMA_O1_LEAF {o1_leaf}\n#define GPU_PERSISTENT_SQ8_WMMA_O2_LEAF {o2_leaf}\n#define GPU_PERSISTENT_SQ8_WMMA_O3A_LEAF {o3a_leaf}\n#define GPU_PERSISTENT_SQ8_WMMA_O3B_LEAF {o3b_leaf}\n#define GPU_PERSISTENT_SQ8_WMMA_O4_LEAF {o4_leaf}\n#define LEAF_DIFF_USE_WMMA {use_wmma}\n#define LEAF_DIFF_PADDED_DIM {padded_dim}u\n{source}\n{harness}"
                 ),
                 "gpu_persistent_sq8_leaf_executor_diff_test",
                 161,
                 256,
             )
         };
-        let dp4a = run_variant(0);
-        let wmma = run_variant(1);
+        if let Ok(value) = std::env::var("SHEAR_CUDA_SQ8_WMMA_TEST_ONLY_MASK") {
+            let mask = value.parse::<u32>().expect("numeric leaf optimization mask");
+            assert_eq!(mask & !(2 | 4 | 16 | 64 | 256), 0);
+            let scalar = run_variant(0, 0, 0, 0, 0, 0, 1024);
+            let selected = run_variant(
+                1,
+                u32::from(mask & 2 != 0),
+                u32::from(mask & 4 != 0),
+                u32::from(mask & 16 != 0),
+                u32::from(mask & 64 != 0),
+                u32::from(mask & 256 != 0),
+                1024,
+            );
+            assert_eq!(scalar[160], 0);
+            assert_eq!(selected[160], 0);
+            assert_eq!(&scalar[..160], &selected[..160]);
+            return;
+        }
+        if std::env::var_os("SHEAR_CUDA_SQ8_WMMA_TEST_TAILS_ONLY").is_some() {
+            for padded_dim in [112] {
+                let scalar = run_variant(0, 0, 0, 0, 0, 0, padded_dim);
+                let wide = run_variant(1, 0, 0, 0, 1, 0, padded_dim);
+                let shared_wide = run_variant(1, 0, 0, 1, 1, 0, padded_dim);
+                assert_eq!(scalar[160], 0, "padded_dim={padded_dim}");
+                assert_eq!(wide[160], 0, "padded_dim={padded_dim}");
+                assert_eq!(shared_wide[160], 0, "padded_dim={padded_dim}");
+                assert_eq!(&scalar[..160], &wide[..160], "padded_dim={padded_dim}");
+                assert_eq!(&scalar[..160], &shared_wide[..160], "padded_dim={padded_dim}");
+            }
+            return;
+        }
+        let dp4a = run_variant(0, 0, 0, 0, 0, 0, 1024);
+        let wmma = run_variant(1, 0, 0, 0, 0, 0, 1024);
+        let o1_wmma = run_variant(1, 1, 0, 0, 0, 0, 1024);
+        let o2_wmma = run_variant(1, 0, 1, 0, 0, 0, 1024);
+        let o3a_wmma = run_variant(1, 0, 0, 1, 0, 0, 1024);
+        let o3b_wmma = run_variant(1, 0, 0, 0, 1, 0, 1024);
+        let o3ab_wmma = run_variant(1, 0, 0, 1, 1, 0, 1024);
+        let o1_o3a_wmma = run_variant(1, 1, 0, 1, 0, 0, 1024);
+        let o4_wmma = run_variant(1, 0, 0, 0, 0, 1, 1024);
         assert_eq!(dp4a[160], 0);
         assert_eq!(wmma[160], 0);
         assert_eq!(&dp4a[..160], &wmma[..160]);
+        assert_eq!(o1_wmma[160], 0);
+        assert_eq!(&dp4a[..160], &o1_wmma[..160]);
+        assert_eq!(o2_wmma[160], 0);
+        assert_eq!(&dp4a[..160], &o2_wmma[..160]);
+        assert_eq!(o3a_wmma[160], 0);
+        assert_eq!(&dp4a[..160], &o3a_wmma[..160]);
+        assert_eq!(o3b_wmma[160], 0);
+        assert_eq!(&dp4a[..160], &o3b_wmma[..160]);
+        assert_eq!(o3ab_wmma[160], 0);
+        assert_eq!(&dp4a[..160], &o3ab_wmma[..160]);
+        assert_eq!(o1_o3a_wmma[160], 0);
+        assert_eq!(&dp4a[..160], &o1_o3a_wmma[..160]);
+        assert_eq!(o4_wmma[160], 0);
+        assert_eq!(&dp4a[..160], &o4_wmma[..160]);
     }
 
     #[cfg(feature = "pipnn_cuda")]
@@ -42688,7 +45784,7 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         assert!(kernel.contains("unsigned int quantized_distance_source"));
         assert!(kernel.contains("unsigned int* large_best_slots"));
         assert!(kernel.contains(
-            "quantized_distance_source <= GPU_PERSISTENT_DISTANCE_SOURCE_TURBOQUANT_MSE4"
+            "quantized_distance_source <= GPU_PERSISTENT_DISTANCE_SOURCE_SQ_INT8_ROTATED_RESIDUAL"
         ));
         assert!(
             large_task_dispatcher.contains("distance_source == GPU_PERSISTENT_DISTANCE_SOURCE_RAW")
@@ -43890,6 +46986,7 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
             global_d0_leader_ids: &leader_ids,
             global_d0_leader_vectors_row_major: &leaders,
             leader_payload: None,
+            rotated_residual: None,
             dim,
             fanout_top,
         };
@@ -43936,6 +47033,60 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
             assert_eq!(wmma.profile.d0_assign_partial_r, fanout_top.max(8));
             assert_eq!(auto.profile.d0_assign_kernel_requested, "auto");
             assert_eq!(auto.profile.d0_assign_kernel_mode, "cuda-wmma-batch");
+        }
+    }
+
+    #[cfg(feature = "pipnn_cuda")]
+    #[test]
+    fn cuda_rotated_residual_sq8_d0_matches_cpu_reference() {
+        use crate::algorithm::pipnn::dco_sq_int8::{
+            Sq8RotatedResidualRequest, SqGpuD0QuantizeAssignRequest,
+            quantize_sq8_and_assign_global_d0_reference,
+        };
+
+        let dim = 32usize;
+        let centers_at = [0.0_f32, 3.0, 8.0, 14.0, 23.0];
+        let mut centers = vec![0.0_f32; centers_at.len() * dim];
+        for (center, &position) in centers_at.iter().enumerate() {
+            centers[center * dim] = position;
+        }
+        let positions = [0.1_f32, 2.9, 7.8, 13.7, 22.7, 1.1, 10.4];
+        let mut raw = vec![0.0_f32; positions.len() * dim];
+        for (row, &position) in positions.iter().enumerate() {
+            raw[row * dim] = position;
+            raw[row * dim + 1] = row as f32 * 0.03;
+        }
+        let ids = (0..positions.len())
+            .map(|row| row as u32)
+            .collect::<Vec<_>>();
+        let leader_ids = (0..centers_at.len())
+            .map(|center| center as u32)
+            .collect::<Vec<_>>();
+        let request = |fanout_top| SqGpuD0QuantizeAssignRequest {
+            raw_vectors_row_major: &raw,
+            global_ids: &ids,
+            global_d0_leader_ids: &leader_ids,
+            global_d0_leader_vectors_row_major: &centers,
+            leader_payload: None,
+            rotated_residual: Some(Sq8RotatedResidualRequest {
+                centroids_row_major: &centers,
+                seed: 42,
+            }),
+            dim,
+            fanout_top,
+        };
+        let params = crate::algorithm::pipnn::PiPNNParams::default();
+        let backend = super::cuda_backend::CudaComputeBackend::new(0, &params).unwrap();
+        for fanout in [1, 3, 5] {
+            let expected = quantize_sq8_and_assign_global_d0_reference(request(fanout)).unwrap();
+            let actual = backend
+                .quantize_sq8_and_assign_global_d0(request(fanout), &params)
+                .unwrap();
+            assert_eq!(actual.fragments, expected.fragments, "fanout={fanout}");
+            assert_eq!(
+                actual.profile.d0_assign_kernel_mode,
+                "rotated-residual-scalar"
+            );
         }
     }
 
@@ -45057,6 +48208,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
             .expect("SQ8 quantization");
         let code_sums = vec![0.0_f32; rows];
         let borrowed = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &sq.codes,
@@ -45070,6 +48223,7 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
             bits: 8,
         };
         let owned = OwnedGpuSubtreeQuantizedInput {
+            rotated: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: Arc::new(global_ids.clone()),
             codes: Arc::new(sq.codes.clone()),
@@ -45977,6 +49131,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         )
         .expect("dense-i8 RabitQ+ quantization should succeed");
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::RabitqPlus,
             global_ids: &global_ids,
             codes: &rabitq_plus.codes,
@@ -46095,6 +49251,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         )
         .expect("dense-i8 RabitQ+ quantization should succeed");
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::RabitqPlus,
             global_ids: &global_ids,
             codes: &rabitq_plus.codes,
@@ -46184,6 +49342,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         .expect("TurboQuant-MSE4 quantization should succeed");
         let zero_side_terms = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::TurboQuantMse4,
             global_ids: &global_ids,
             codes: &turboquant.codes,
@@ -46300,6 +49460,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
                 .expect("TurboQuant-MSE4 quantization should succeed");
             let zero_side_terms = vec![0.0_f32; rows];
             let quantized = GpuSubtreeQuantizedInput {
+                rotated_center_ids: None,
+                rotated_centers: None,
                 distance_kind: GpuSubtreeQuantizedDistanceKind::TurboQuantMse4,
                 global_ids: &global_ids,
                 codes: &turboquant.codes,
@@ -46419,6 +49581,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         .expect("TurboQuant-MSE4 quantization should succeed");
         let zero_side_terms = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::TurboQuantMse4,
             global_ids: &global_ids,
             codes: &turboquant.codes,
@@ -46545,6 +49709,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         .expect("SQ-int8 quantization should succeed");
         let code_sums = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &sq.codes,
@@ -46590,6 +49756,7 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
             .process_quantized_subtree_l2_compact_topk(&request, quantized, &params)
             .unwrap_or_else(|err| panic!("SQ+WMMA quantized-only subtree should run: {err}"));
         let owned = OwnedGpuSubtreeQuantizedInput {
+            rotated: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: Arc::new(global_ids.clone()),
             codes: Arc::new(sq.codes.clone()),
@@ -46716,6 +49883,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         .expect("SQ-int8 quantization should succeed");
         let code_sums = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &sq.codes,
@@ -46845,6 +50014,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         .expect("SQ-int8 quantization should succeed");
         let code_sums = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &sq.codes,
@@ -46957,6 +50128,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
                 crate::algorithm::pipnn::params::PiPNNGpuSubtreeLeafTopKBackend::PersistentWmmaTf32;
             base_params.gpu_subtree_sq_wmma_mode =
                 crate::algorithm::pipnn::params::PiPNNGpuSubtreeSqWmmaMode::Build;
+            base_params.gpu_subtree_sq8_leaf_executor =
+                crate::algorithm::pipnn::params::PiPNNGpuSubtreeSq8LeafExecutor::Wmma;
             let backend = super::cuda_backend::CudaComputeBackend::new(0, &base_params)
                 .expect("CUDA backend");
 
@@ -46964,6 +50137,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
                 let mut params = base_params.clone();
                 params.gpu_subtree_sq8_leaf_mode = mode;
                 let quantized = GpuSubtreeQuantizedInput {
+                    rotated_center_ids: None,
+                    rotated_centers: None,
                     distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
                     global_ids: &global_ids,
                     codes: &sq.codes,
@@ -46985,6 +50160,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
 
             let staged = run(PiPNNGpuSubtreeSq8LeafMode::Staged);
             let row_owned = run(PiPNNGpuSubtreeSq8LeafMode::RowOwned);
+            assert!(staged.profile.persistent_leaf_sq8_wmma_tiles > 0, "rows={rows}");
+            assert!(row_owned.profile.persistent_leaf_sq8_wmma_tiles > 0, "rows={rows}");
             let tile_rows = staged.profile.persistent_leaf_tile_rows.max(1);
             let row_tiles = (rows + tile_rows - 1) / tile_rows;
             let col_tasks = if rows > 128 * 4 {
@@ -47517,6 +50694,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         let code_sums = vec![0.0_f32; rows];
         let norms = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &codes,
@@ -47601,6 +50780,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         norms[rows / 2] = (dim * 100 * 100) as f32;
         norms[715] = (dim * 100 * 100) as f32;
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &codes,
@@ -48266,6 +51447,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
             return;
         };
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::RabitqPlus,
             global_ids: &gathered.global_ids,
             codes: &gathered.codes,
@@ -48329,6 +51512,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
             return;
         };
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::RabitqPlus,
             global_ids: &gathered.global_ids,
             codes: &gathered.codes,
@@ -49061,6 +52246,8 @@ extern "C" __global__ void gpu_persistent_sq8_d96_k2_leaf_diff_test(unsigned int
         .expect("SQ-int8 quantization should succeed");
         let code_sums = vec![0.0_f32; rows];
         let quantized = GpuSubtreeQuantizedInput {
+            rotated_center_ids: None,
+            rotated_centers: None,
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &global_ids,
             codes: &sq.codes,

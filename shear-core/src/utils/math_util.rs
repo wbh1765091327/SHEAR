@@ -401,8 +401,8 @@ mod math_util_test {
 
     #[test]
     fn calc_distance_test() {
-        let vec1 = vec![1.0, 2.0, 3.0];
-        let vec2 = vec![4.0, 5.0, 6.0];
+        let vec1 = vec![1.0_f32, 2.0, 3.0];
+        let vec2 = vec![4.0_f32, 5.0, 6.0];
         let dim = vec1.len();
 
         let dist = calc_distance(&vec1, &vec2, dim);

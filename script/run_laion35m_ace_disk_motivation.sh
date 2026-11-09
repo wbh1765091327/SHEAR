@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CUVS_SOURCE_ROOT="${CUVS_SOURCE_ROOT:-$REPO_ROOT/../cuvs_tagore_ace}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data_staging/wbh/laion35m_ace_disk_motivation}"
-BASE="${BASE:-/data_staging/wbh/laion-512-35M/base.fbin}"
-CANONICAL_BASE="${CANONICAL_BASE:-/data_nvme_kioxia/tyj/data/laion-512-100M/base.fbin}"
-CUVS_PYTHON="${CUVS_PYTHON:-/data_staging/wbh/cuvs_tagore_ace_venv/bin/python}"
-CUVS_INSTALL_ROOT="${CUVS_INSTALL_ROOT:-/data_staging/wbh/shear_paper_evaluation/build/cuvs_release_shared_ace/install}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SHEAR_OUTPUT_ROOT}/laion35m_ace_disk_motivation}"
+BASE="${BASE:-${SHEAR_DATA_ROOT}/laion-512-35M/base.fbin}"
+CANONICAL_BASE="${CANONICAL_BASE:-${SHEAR_DATA_ROOT}/laion-512-100M/base.fbin}"
+CUVS_PYTHON="${CUVS_PYTHON:-${SHEAR_OUTPUT_ROOT}/cuvs_tagore_ace_venv/bin/python}"
+CUVS_INSTALL_ROOT="${CUVS_INSTALL_ROOT:-${SHEAR_OUTPUT_ROOT}/shear_paper_evaluation/build/cuvs_release_shared_ace/install}"
 CUVS_SITE_PACKAGES="$("$CUVS_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 CUVS_RUNTIME_LIBRARY_PATH="$CUVS_INSTALL_ROOT/lib:$CUVS_SITE_PACKAGES/librmm/lib64:$CUVS_SITE_PACKAGES/libraft/lib64:$CUVS_SITE_PACKAGES/rapids_logger/lib64:/usr/local/cuda-13.0/lib64"
 DRIVER="$REPO_ROOT/script/run_laion35m_ace_disk_motivation.py"

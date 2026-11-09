@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use super::dco_rabitq::rotate_rabitq_plus_fht_kac_row;
 use super::direct_io::{DirectIoConfig, DirectIoFile};
 use super::point_store::{PointStore, U8PointStore};
 use super::qcode_staging::D0AssignmentFragment;
@@ -208,6 +209,123 @@ pub(crate) struct SqInt8Matrix {
     pub(crate) norms: Vec<f32>,
 }
 
+/// Codes and coarse centers share one orthogonal transform within this matrix.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Sq8RotatedResidualMatrix {
+    pub(crate) residuals: SqInt8Matrix,
+    pub(crate) centroid_ids: Vec<u32>,
+    pub(crate) rotated_centroids: Vec<f32>,
+}
+
+impl Sq8RotatedResidualMatrix {
+    pub(crate) fn approx_l2(&self, left: usize, right: usize) -> f32 {
+        let dim = self.residuals.dim;
+        let left_centroid = self.centroid_ids[left] as usize;
+        let right_centroid = self.centroid_ids[right] as usize;
+        let left_center = &self.rotated_centroids[left_centroid * dim..(left_centroid + 1) * dim];
+        let right_center =
+            &self.rotated_centroids[right_centroid * dim..(right_centroid + 1) * dim];
+        let left_code = self.residuals.code_row(left);
+        let right_code = self.residuals.code_row(right);
+        let mut dist = 0.0_f32;
+        for axis in 0..dim {
+            let left_residual = self.residuals.scales[left] * f32::from(left_code[axis]);
+            let right_residual = self.residuals.scales[right] * f32::from(right_code[axis]);
+            let delta = (left_center[axis] + left_residual) - (right_center[axis] + right_residual);
+            dist += delta * delta;
+        }
+        dist
+    }
+}
+
+pub(crate) fn quantize_sq8_rotated_residual_matrix(
+    points_row_major: &[f32],
+    rows: usize,
+    dim: usize,
+    centroids_row_major: &[f32],
+    seed: u64,
+) -> AnnResult<Sq8RotatedResidualMatrix> {
+    if dim == 0
+        || !dim.is_power_of_two()
+        || points_row_major.len() != rows.saturating_mul(dim)
+        || centroids_row_major.is_empty()
+        || centroids_row_major.len() % dim != 0
+    {
+        return Err(AnnError::log_index_error(format!(
+            "Rotated residual SQ8 shape mismatch: rows={rows} dim={dim} points={} centroids={}",
+            points_row_major.len(),
+            centroids_row_major.len()
+        )));
+    }
+    let centroid_count = centroids_row_major.len() / dim;
+    if centroid_count > u32::MAX as usize {
+        return Err(AnnError::log_index_error(
+            "Rotated residual SQ8 has too many centroids for u32 IDs".to_string(),
+        ));
+    }
+    let mut rotated_centroids = vec![0.0_f32; centroids_row_major.len()];
+    for center in 0..centroid_count {
+        rotate_rabitq_plus_fht_kac_row(
+            &centroids_row_major[center * dim..(center + 1) * dim],
+            &mut rotated_centroids[center * dim..(center + 1) * dim],
+            seed,
+        )?;
+    }
+    let mut centroid_ids = Vec::with_capacity(rows);
+    let padded_dim = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)?;
+    let mut codes = vec![0_i8; rows.saturating_mul(padded_dim)];
+    let mut scales = vec![1.0_f32; rows];
+    let mut norms = vec![0.0_f32; rows];
+    let mut residual = vec![0.0_f32; dim];
+    let mut rotated = vec![0.0_f32; dim];
+    for row in 0..rows {
+        let point = &points_row_major[row * dim..(row + 1) * dim];
+        rotate_rabitq_plus_fht_kac_row(point, &mut rotated, seed)?;
+        let (best_center, _) = (0..centroid_count)
+            .map(|center| {
+                let centroid = &rotated_centroids[center * dim..(center + 1) * dim];
+                let dist: f32 = rotated
+                    .iter()
+                    .zip(centroid)
+                    .map(|(&value, &mean)| (value - mean) * (value - mean))
+                    .sum();
+                (center, dist)
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)))
+            .expect("at least one centroid validated");
+        centroid_ids.push(best_center as u32);
+        let centroid = &rotated_centroids[best_center * dim..(best_center + 1) * dim];
+        for axis in 0..dim {
+            residual[axis] = rotated[axis] - centroid[axis];
+        }
+        let (scale, _) = quantize_sq_int8_row(
+            &residual,
+            &mut codes[row * padded_dim..(row + 1) * padded_dim],
+        )?;
+        scales[row] = scale;
+        norms[row] = codes[row * padded_dim..row * padded_dim + dim]
+            .iter()
+            .map(|&code| {
+                let value = scale * f32::from(code);
+                value * value
+            })
+            .sum();
+    }
+    let residuals = SqInt8Matrix {
+        rows,
+        dim,
+        padded_dim,
+        codes,
+        scales,
+        norms,
+    };
+    Ok(Sq8RotatedResidualMatrix {
+        residuals,
+        centroid_ids,
+        rotated_centroids,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SqInt8LeafShadowConfig {
     pub(crate) k_align: usize,
@@ -282,6 +400,10 @@ pub(crate) struct SqWmmaGatheredInput {
     pub(crate) file_rows: usize,
     pub(crate) resident_gather_wall: Duration,
     pub(crate) file_gather_wall: Duration,
+    /// Reconstructed rotated vectors for the center-aware residual SQ8 mode.
+    pub(crate) reconstructed_vectors: Option<Vec<f32>>,
+    pub(crate) rotated_center_ids: Option<Vec<u32>>,
+    pub(crate) rotated_centers: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
@@ -409,6 +531,7 @@ pub(crate) struct SqWmmaResidentSidecarBuilder {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SqGpuD0StagingProfile {
+    pub(crate) host_rotated_quantize_wall: Duration,
     pub(crate) raw_h2d_wall: Duration,
     pub(crate) gpu_quantize_wall: Duration,
     pub(crate) qcode_d2h_wall: Duration,
@@ -441,13 +564,21 @@ pub(crate) struct SqGpuD0QuantizeAssignRequest<'a> {
     pub(crate) global_d0_leader_ids: &'a [u32],
     pub(crate) global_d0_leader_vectors_row_major: &'a [f32],
     pub(crate) leader_payload: Option<&'a SqInt8Matrix>,
+    pub(crate) rotated_residual: Option<Sq8RotatedResidualRequest<'a>>,
     pub(crate) dim: usize,
     pub(crate) fanout_top: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Sq8RotatedResidualRequest<'a> {
+    pub(crate) centroids_row_major: &'a [f32],
+    pub(crate) seed: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SqGpuD0QuantizeAssignResult {
     pub(crate) matrix: SqInt8Matrix,
+    pub(crate) centroid_ids: Option<Vec<u32>>,
     pub(crate) fragments: Vec<D0AssignmentFragment>,
     pub(crate) profile: SqGpuD0StagingProfile,
 }
@@ -942,6 +1073,9 @@ impl SqWmmaSidecar {
             file_rows,
             resident_gather_wall,
             file_gather_wall,
+            reconstructed_vectors: None,
+            rotated_center_ids: None,
+            rotated_centers: None,
         })
     }
 
@@ -1966,6 +2100,74 @@ pub(crate) fn quantize_sq8_and_assign_global_d0_reference(
         )));
     }
 
+    if let Some(rotated) = request.rotated_residual {
+        if request.leader_payload.is_some()
+            || rotated.centroids_row_major != request.global_d0_leader_vectors_row_major
+        {
+            return Err(AnnError::log_index_error(
+                "Rotated residual SQ8 D0 requires the coarse centers as leaders and no cached leader payload".to_string(),
+            ));
+        }
+        let quantize_start = Instant::now();
+        let encoded = quantize_sq8_rotated_residual_matrix(
+            request.raw_vectors_row_major,
+            rows,
+            dim,
+            rotated.centroids_row_major,
+            rotated.seed,
+        )?;
+        let quantize_wall = quantize_start.elapsed();
+        let assign_start = Instant::now();
+        let mut fragments = Vec::with_capacity(rows.saturating_mul(request.fanout_top));
+        for row in 0..rows {
+            let own_center = encoded.centroid_ids[row] as usize;
+            let own = &encoded.rotated_centroids[own_center * dim..(own_center + 1) * dim];
+            let code = encoded.residuals.code_row(row);
+            let scale = encoded.residuals.scales[row];
+            let mut candidates = Vec::with_capacity(leader_count);
+            for leader in 0..leader_count {
+                let center = &encoded.rotated_centroids[leader * dim..(leader + 1) * dim];
+                let mut dist = 0.0_f32;
+                for axis in 0..dim {
+                    let delta = own[axis] + scale * f32::from(code[axis]) - center[axis];
+                    dist += delta * delta;
+                }
+                candidates.push((leader, dist));
+            }
+            candidates.sort_unstable_by(|left, right| {
+                super::stable_distance_order(
+                    left.1,
+                    request.global_d0_leader_ids[left.0],
+                    right.1,
+                    request.global_d0_leader_ids[right.0],
+                )
+            });
+            for &(leader, _) in candidates.iter().take(request.fanout_top) {
+                fragments.push(D0AssignmentFragment {
+                    child_id: leader,
+                    point_id: request.global_ids[row],
+                });
+            }
+        }
+        let assign_wall = assign_start.elapsed();
+        return Ok(SqGpuD0QuantizeAssignResult {
+            matrix: encoded.residuals,
+            centroid_ids: Some(encoded.centroid_ids),
+            fragments,
+            profile: SqGpuD0StagingProfile {
+                host_rotated_quantize_wall: quantize_wall,
+                gpu_d0_assign_wall: assign_wall,
+                d0_assign_kernel_requested: "cpu-rotated-residual-reference",
+                d0_assign_kernel_mode: "cpu-rotated-residual-reference",
+                d0_assign_rows: rows,
+                d0_assign_leaders: leader_count,
+                d0_assign_pair_count: rows.saturating_mul(leader_count),
+                d0_assign_fanout: request.fanout_top,
+                ..SqGpuD0StagingProfile::default()
+            },
+        });
+    }
+
     let quantize_start = Instant::now();
     let matrix = quantize_sq_int8_matrix(
         request.raw_vectors_row_major,
@@ -2040,9 +2242,11 @@ pub(crate) fn quantize_sq8_and_assign_global_d0_reference(
 
     Ok(SqGpuD0QuantizeAssignResult {
         matrix,
+        centroid_ids: None,
         fragments,
         profile: SqGpuD0StagingProfile {
             raw_h2d_wall: Duration::ZERO,
+            host_rotated_quantize_wall: Duration::ZERO,
             gpu_quantize_wall,
             qcode_d2h_wall: Duration::ZERO,
             gpu_d0_assign_wall,
@@ -3103,6 +3307,57 @@ fn exact_l2(left: &[f32], right: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rotated_residual_sq8_accounts_for_different_centers() {
+        let centers = [0.0_f32, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0];
+        let points = [0.25_f32, -0.1, 0.1, 0.0, 100.2, 0.1, 0.0, -0.1];
+        let matrix =
+            super::quantize_sq8_rotated_residual_matrix(&points, 2, 4, &centers, 42).unwrap();
+        assert_ne!(matrix.centroid_ids[0], matrix.centroid_ids[1]);
+        for row in 0..2 {
+            let reconstructed_norm: f32 = matrix
+                .residuals
+                .code_row(row)
+                .iter()
+                .map(|&code| {
+                    let value = matrix.residuals.scales[row] * f32::from(code);
+                    value * value
+                })
+                .sum();
+            assert!((matrix.residuals.norms[row] - reconstructed_norm).abs() < 1e-5);
+        }
+        let exact: f32 = points[..4]
+            .iter()
+            .zip(&points[4..])
+            .map(|(&left, &right)| (left - right) * (left - right))
+            .sum();
+        assert!((matrix.approx_l2(0, 1) - exact).abs() < 1.0);
+        assert!(matrix.approx_l2(0, 1) > 9_000.0);
+    }
+
+    #[test]
+    fn rotated_residual_sq8_d0_assigns_against_coarse_centers() {
+        let centers = [0.0_f32, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0];
+        let raw = [0.25_f32, 0.0, 0.0, 0.0, 99.75, 0.0, 0.0, 0.0];
+        let result = super::quantize_sq8_and_assign_global_d0_reference(
+            super::SqGpuD0QuantizeAssignRequest {
+                raw_vectors_row_major: &raw,
+                global_ids: &[0, 1],
+                global_d0_leader_ids: &[10, 20],
+                global_d0_leader_vectors_row_major: &centers,
+                leader_payload: None,
+                rotated_residual: Some(super::Sq8RotatedResidualRequest {
+                    centroids_row_major: &centers,
+                    seed: 42,
+                }),
+                dim: 4,
+                fanout_top: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.fragments[0].child_id, 0);
+        assert_eq!(result.fragments[1].child_id, 1);
+    }
     use super::*;
     use crate::algorithm::pipnn::point_store::InmemDatasetPointStore;
     use crate::model::InmemDataset;
@@ -3429,6 +3684,7 @@ mod tests {
             global_d0_leader_ids: &[5, 3],
             global_d0_leader_vectors_row_major: &leaders,
             leader_payload: Some(&leader_payload),
+            rotated_residual: None,
             dim: 2,
             fanout_top: 1,
         };

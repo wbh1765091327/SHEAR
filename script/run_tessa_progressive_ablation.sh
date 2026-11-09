@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-run_root_base="/data_staging/wbh/tessa_ablation/wiki10m"
+run_root_base="${SHEAR_OUTPUT_ROOT}/tessa_ablation/wiki10m"
 formal_parent_run="${run_root_base}/20260721_011618"
 extension_subdir="full_build_2x2"
-data_path="/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin"
-query_path="/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin"
-gt_path="/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin"
+data_path="${SHEAR_DATA_ROOT}/wiki10m/wiki_10m_1024.fbin"
+query_path="${SHEAR_DATA_ROOT}/wiki-1024-35M/query.fbin"
+gt_path="${SHEAR_DATA_ROOT}/wiki10m/wiki_10m_gt100.bin"
 summary_script="${repo}/script/summarize_tessa_progressive_ablation.py"
 monitor_script="${repo}/script/monitor_gpu_build.sh"
 
@@ -380,7 +381,7 @@ run_preflight() {
     command -v nvidia-smi >/dev/null || die "nvidia-smi is unavailable"
     nvidia-smi -i 0 --query-gpu=name,compute_cap,memory.total --format=csv,noheader >/dev/null
     local available_kib required_kib
-    available_kib="$(df -Pk /data_staging/wbh | awk 'NR==2 {print $4}')"
+    available_kib="$(df -Pk ${SHEAR_OUTPUT_ROOT} | awk 'NR==2 {print $4}')"
     required_kib="${SHEAR_TESSA_MIN_FREE_KIB:-104857600}"
     (( available_kib >= required_kib )) || die "insufficient free space: ${available_kib} KiB < ${required_kib} KiB"
 
@@ -415,10 +416,10 @@ run_preflight() {
     {
         echo "# Prior evidence (design context only; not reusable as formal cells)"
         echo
-        echo "- /data_staging/wbh/persistent_sq_wmma_experiments/wiki10m_20260712_010422: old binary and no SQ8-DP4A leaf variant."
-        echo "- /data_staging/wbh/wiki10m_gpu_subtree_measurement/microbench/20260715_highdim_sq8_ablation_screen: mismatched fanout/config and leaf path."
-        echo "- /data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260715_highdim_sq8_ablation_formal: Wiki35M coupled comparison, not this four-mode matrix."
-        echo "- /data_staging/wbh/wiki35m_gpu_subtree_measurement/runs/20260718_162354_sq8_d0_wmma_ab: D0-only root-stop run."
+        echo "- ${SHEAR_OUTPUT_ROOT}/persistent_sq_wmma_experiments/wiki10m_20260712_010422: old binary and no SQ8-DP4A leaf variant."
+        echo "- ${SHEAR_OUTPUT_ROOT}/wiki10m_gpu_subtree_measurement/microbench/20260715_highdim_sq8_ablation_screen: mismatched fanout/config and leaf path."
+        echo "- ${SHEAR_OUTPUT_ROOT}/wiki35m_gpu_subtree_measurement/runs/20260715_highdim_sq8_ablation_formal: Wiki35M coupled comparison, not this four-mode matrix."
+        echo "- ${SHEAR_OUTPUT_ROOT}/wiki35m_gpu_subtree_measurement/runs/20260718_162354_sq8_d0_wmma_ab: D0-only root-stop run."
     } > "${run_root}/prior_evidence.md"
     env | LC_ALL=C sort > "${run_root}/environment.txt"
     nvidia-smi > "${run_root}/nvidia_smi.txt"
@@ -666,7 +667,7 @@ PY
     command -v nvidia-smi >/dev/null || die "nvidia-smi is unavailable"
     nvidia-smi -i 0 --query-gpu=name,compute_cap,memory.total --format=csv,noheader >/dev/null
     local available_kib required_kib
-    available_kib="$(df -Pk /data_staging/wbh | awk 'NR==2 {print $4}')"
+    available_kib="$(df -Pk ${SHEAR_OUTPUT_ROOT} | awk 'NR==2 {print $4}')"
     required_kib="${SHEAR_TESSA_MIN_FREE_KIB:-104857600}"
     (( available_kib >= required_kib )) \
         || die "insufficient free space: ${available_kib} KiB < ${required_kib} KiB"
@@ -709,13 +710,13 @@ PY
     {
         echo "# Prior evidence (historical context only)"
         echo
-        echo "- /data_staging/wbh/tessa_ablation/wiki10m/20260721_011618 used the pre-fix leaf executor."
+        echo "- ${SHEAR_OUTPUT_ROOT}/tessa_ablation/wiki10m/20260721_011618 used the pre-fix leaf executor."
         echo "- Its forced warp-DP4A leaf cell executed scalar int8 products and is not reused."
         echo "- ${selected_description} in this run use the same newly built release binary."
     } > "${run_root}/prior_evidence.md"
     env | LC_ALL=C sort > "${run_root}/environment.txt"
     nvidia-smi > "${run_root}/nvidia_smi.txt"
-    df -Pk /data_staging/wbh > "${run_root}/disk_free.txt"
+    df -Pk ${SHEAR_OUTPUT_ROOT} > "${run_root}/disk_free.txt"
     date --iso-8601=seconds > "${run_root}/${marker}"
 }
 
@@ -733,7 +734,7 @@ run_2x2_preflight() {
     nvidia-smi -i 0 --query-gpu=name,compute_cap,memory.total --format=csv,noheader >/dev/null
 
     local available_kib required_kib
-    available_kib="$(df -Pk /data_staging/wbh | awk 'NR==2 {print $4}')"
+    available_kib="$(df -Pk ${SHEAR_OUTPUT_ROOT} | awk 'NR==2 {print $4}')"
     required_kib="${SHEAR_TESSA_MIN_FREE_KIB:-104857600}"
     (( available_kib >= required_kib )) \
         || die "insufficient free space: ${available_kib} KiB < ${required_kib} KiB"
@@ -770,7 +771,7 @@ run_2x2_preflight() {
     } > "${extension_root}/material_passport.md"
     env | LC_ALL=C sort > "${extension_root}/environment.txt"
     nvidia-smi > "${extension_root}/nvidia_smi.txt"
-    df -Pk /data_staging/wbh > "${extension_root}/disk_free.txt"
+    df -Pk ${SHEAR_OUTPUT_ROOT} > "${extension_root}/disk_free.txt"
 }
 
 run_2x2_screen() {

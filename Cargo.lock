@@ -987,7 +987,6 @@ dependencies = [
 [[package]]
 name = "monoio"
 version = "0.2.4"
-source = "git+https://github.com/bytedance/monoio#212fde187f3d41f65ecd35b9cac80f7e246bb58e"
 dependencies = [
  "auto-const-array",
  "bytes",
@@ -1006,7 +1005,6 @@ dependencies = [
 [[package]]
 name = "monoio-macros"
 version = "0.1.0"
-source = "git+https://github.com/bytedance/monoio#212fde187f3d41f65ecd35b9cac80f7e246bb58e"
 dependencies = [
  "proc-macro2",
  "quote",

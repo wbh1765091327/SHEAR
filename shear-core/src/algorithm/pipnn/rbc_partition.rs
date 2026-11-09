@@ -33,18 +33,20 @@ use super::d0_capacity::{
 };
 use super::dco_rabitq::{
     RABITQ_DEFAULT_K_ALIGN, RabitqPlusGatheredInput, RabitqPlusSidecar, RabitqSplitSidecar,
-    rabitq_approx_l2, rabitq_padded_dim,
+    rabitq_approx_l2, rabitq_padded_dim, rotate_rabitq_plus_fht_kac_row,
 };
 use super::dco_sq_int8::{
-    SQ_INT8_DEFAULT_BITS, SqInt8CpuKernel, SqInt8Matrix, SqWmmaCodeLayout, SqWmmaGatheredInput,
-    SqWmmaResidentSidecarBuilder, SqWmmaSidecar, SqWmmaSidecarCreateReport,
+    SQ_INT8_DEFAULT_BITS, SQ_INT8_DEFAULT_K_ALIGN, SqInt8CpuKernel, SqInt8Matrix, SqWmmaCodeLayout,
+    SqWmmaGatheredInput, SqWmmaResidentSidecarBuilder, SqWmmaSidecar, SqWmmaSidecarCreateReport,
     SqWmmaSidecarShardWriter, cache_sq_wmma_created_sidecar, resolve_sq_int8_cpu_kernel,
     sq_int8_approx_l2, sq_int8_dot_with_resolved_kernel_and_right_sum_unchecked,
-    sq_int8_dot4_with_resolved_kernel_and_right_sums_unchecked, unpack_sq_s4_codes,
+    sq_int8_dot4_with_resolved_kernel_and_right_sums_unchecked, sq_int8_padded_dim,
+    unpack_sq_s4_codes,
 };
 use super::dco_turboquant::{TURBOQUANT_MSE4_SIDECAR_META_ROW_BYTES, TurboQuantMse4Sidecar};
 use super::direct_io::{DirectIoConfig, DirectIoFile};
-use super::external_store::{DiskSketchStore, ResidentSketchChunkBuilder};
+use super::external_store::{DiskSketchStore, ResidentSketchChunkBuilder, fill_sketch_row_from_slice};
+use super::hash_prune::generate_hyperplanes;
 use super::leaf_build::{CompactTopKBatch, CompactTopKSink, LeafProfile};
 use super::params::{
     PiPNNComputeBackendKind, PiPNNGpuSubtreeChildScheduleMode, PiPNNGpuSubtreeD0PartitionMode,
@@ -77,11 +79,16 @@ use super::root_risk_budget::{
     utility_record_from_top_distances,
 };
 use super::scheduler::LeafEmitter;
+use super::sq8_rotated_residual_sidecar::{
+    Sq8RotatedResidualSidecar, Sq8RotatedResidualSidecarWriter,
+};
 use super::throughput_model::{
     D0ThroughputCalibration, D0ThroughputModelDecision, D0ThroughputModelInput,
     calibration_from_json_path, decide_d0_throughput_capacity,
 };
 use crate::common::{AnnError, AnnResult, Metric};
+use super::sq4_primary::{PrimaryCodes, PrimaryChunk, PartitionCodes};
+use super::dco_rabitq::FhtKacRotationPlan;
 
 const ASYNC_RESULT_SCATTER_ENV: &str = "SHEAR_PIPNN_ASYNC_RESULT_SCATTER";
 const ASYNC_RESULT_SCATTER_MAX_INFLIGHT: usize = 2;
@@ -554,6 +561,7 @@ pub(crate) struct RbcPartitionTelemetry {
     pub(crate) gpu_subtree_sq_staging_raw_read_wall: Duration,
     pub(crate) gpu_subtree_sq_staging_raw_h2d_wall: Duration,
     pub(crate) gpu_subtree_sq_staging_gpu_quantize_wall: Duration,
+    pub(crate) gpu_subtree_sq_staging_host_rotated_quantize_wall: Duration,
     pub(crate) gpu_subtree_sq_staging_qcode_d2h_wall: Duration,
     pub(crate) gpu_subtree_sq_staging_gpu_d0_assign_wall: Duration,
     pub(crate) gpu_subtree_sq_staging_assignment_fragment_d2h_wall: Duration,
@@ -1174,6 +1182,8 @@ impl RbcPartitionTelemetry {
         self.gpu_subtree_sq_staging_raw_h2d_wall += other.gpu_subtree_sq_staging_raw_h2d_wall;
         self.gpu_subtree_sq_staging_gpu_quantize_wall +=
             other.gpu_subtree_sq_staging_gpu_quantize_wall;
+        self.gpu_subtree_sq_staging_host_rotated_quantize_wall +=
+            other.gpu_subtree_sq_staging_host_rotated_quantize_wall;
         self.gpu_subtree_sq_staging_qcode_d2h_wall += other.gpu_subtree_sq_staging_qcode_d2h_wall;
         self.gpu_subtree_sq_staging_gpu_d0_assign_wall +=
             other.gpu_subtree_sq_staging_gpu_d0_assign_wall;
@@ -1942,6 +1952,7 @@ pub(crate) enum CompactFlushMode {
 pub(crate) struct GpuSubtreeRuntimeContext<'a> {
     pub(crate) rabitq_plus_resident_sidecar: Option<&'a RabitqPlusSidecar>,
     pub(crate) sq_wmma_sidecar: Option<&'a SqWmmaSidecar>,
+    pub(crate) rotated_residual_sq8_sidecar: Option<&'a Sq8RotatedResidualSidecar>,
     pub(crate) turboquant_sidecar: Option<&'a TurboQuantMse4Sidecar>,
     pub(crate) rabitq_residual_payload: Option<&'a RabitqResidualPayloadStore>,
     pub(crate) rabitq_residual_qcode_store: Option<&'a RabitqResidualQcodeShardStore>,
@@ -3630,6 +3641,10 @@ pub(crate) struct GpuSubtreeD0Plan {
     pub(crate) child_runs: Vec<GpuSubtreeChildRun>,
     pub(crate) sq_shard_local_payloads: Vec<GpuSubtreeSqShardLocalPayload>,
     pub(crate) sq_cluster_child_indices: Vec<usize>,
+    /// Trained FP32 center for each nonempty Tagore run, in child-run order.
+    pub(crate) sq4_plus_centers: Vec<f32>,
+    pub(crate) sq4_primary: Option<Arc<PrimaryCodes>>,
+    pub(crate) sq4_partition_codes: Option<Arc<PartitionCodes>>,
     pub(crate) child_stats: GpuSubtreeChildRunStats,
     pub(crate) rbc_telemetry: RbcPartitionTelemetry,
     pub(crate) d0_capacity: D0CapacityTelemetry,
@@ -7340,6 +7355,105 @@ pub(crate) fn run_gpu_subtree_d0_preflight_with_context(
     external_child_dir: Option<&Path>,
     runtime_context: GpuSubtreeRuntimeContext<'_>,
 ) -> AnnResult<GpuSubtreeD0Plan> {
+    run_gpu_subtree_d0_preflight_inner(
+        root_assignment_backend, dataset, indices, metric, params, _num_threads,
+        rng, external_child_dir, runtime_context, None,
+    )
+}
+
+struct TagoreD0Sketch {
+    width: usize,
+    hyperplanes: Vec<f32>,
+    data: Vec<f32>,
+    worker_wall_sum: Duration,
+    join_wait_wall: Duration,
+    gpu: Option<super::gpu_sketch::GpuSketch>,
+}
+
+pub(crate) fn run_gpu_subtree_sq4_d0_preflight_with_sketch(
+    root_assignment_backend: &dyn PiPNNComputeBackend,
+    dataset: &dyn PointStore,
+    indices: &[u32],
+    metric: Metric,
+    params: &PiPNNParams,
+    num_threads: u32,
+    rng: &mut (impl Rng + Send),
+    external_child_dir: Option<&Path>,
+    sketch_path: &Path,
+    runtime_context: GpuSubtreeRuntimeContext<'_>,
+    use_gpu_sketch: bool,
+) -> AnnResult<GpuSubtreeSqStagingPreflightResult> {
+    if !params.gpu_subtree_sq4_plus || !(params.gpu_subtree_sq4_primary_center || partition_gpu_d0_requested())
+        || !(params.sq4_budget_d0() || params.gpu_subtree_d0_partition_mode == PiPNNGpuSubtreeD0PartitionMode::TagoreKMeansTopK)
+        || params.m_hash_bits == 0 || dataset.dim() == 0
+        || indices.len() > dataset.len()
+        || indices.iter().enumerate().any(|(row, &id)| id as usize != row)
+    {
+        return Err(AnnError::log_index_error(
+            "SQ4+ fused sketch requires primary or GPU partition budget/fixed k-means D0 and a contiguous input prefix".to_string(),
+        ));
+    }
+    let allocate_start = Instant::now();
+    let mut sketch = TagoreD0Sketch {
+        width: params.m_hash_bits,
+        hyperplanes: generate_hyperplanes(dataset.dim(), params.m_hash_bits, params.random_seed),
+        data: vec![0.0; indices.len().saturating_mul(params.m_hash_bits)],
+        worker_wall_sum: Duration::ZERO,
+        join_wait_wall: Duration::ZERO,
+        gpu: None,
+    };
+    if use_gpu_sketch {
+        sketch.gpu = Some(super::gpu_sketch::GpuSketch::new(
+            params.gpu_device_id, dataset.dim(), sketch.width, TAGORE_D0_ASSIGN_CHUNK_POINTS,
+            &sketch.hyperplanes, params.effective_gpu_workspace_budget_bytes(),
+        )?);
+    }
+    let allocate_wall = allocate_start.elapsed();
+    let mut d0_plan = run_gpu_subtree_d0_preflight_inner(
+        root_assignment_backend, dataset, indices, metric, params, num_threads,
+        rng, external_child_dir, runtime_context, Some(&mut sketch),
+    )?;
+    d0_plan.rbc_telemetry.gpu_subtree_d0_wall += allocate_wall;
+    let gpu_profile = sketch.gpu.as_ref().map(|gpu| gpu.profile());
+    if let Some(gpu) = &gpu_profile {
+        if gpu.rows != indices.len() {
+            return Err(AnnError::log_index_error("GPU sketch row count mismatch".to_string()));
+        }
+        tracing::info!(
+            "SQ4+ GPU sketch: gpu_rows={} cpu_rows=0 launches={} h2d_bytes={} d2h_bytes={} h2d_ms={:.3} kernel_ms={:.3} d2h_ms={:.3} service_ms={:.3} wait_ms_sum={:.3} prepare_ms={:.3} workspace_bytes={} fallbacks=0",
+            gpu.rows, gpu.launches, gpu.h2d_bytes, gpu.d2h_bytes, gpu.h2d_ms,
+            gpu.kernel_ms, gpu.d2h_ms, gpu.service_ms, gpu.wait_ms, gpu.prepare_ms, gpu.workspace_bytes,
+        );
+    }
+    tracing::info!(
+        "SQ4+ D0 fused sketch: rows={} width={} reused_raw_bytes={} worker_ms_sum={} allocation_ms={}",
+        indices.len(), sketch.width, indices.len() as u64 * dataset.dim() as u64 * 4,
+        sketch.worker_wall_sum.as_millis(), allocate_wall.as_millis(),
+    );
+    Ok(GpuSubtreeSqStagingPreflightResult {
+        d0_plan,
+        fused_sketch_compute_wall: gpu_profile.as_ref()
+            .map(|gpu| Duration::from_secs_f64(gpu.kernel_ms / 1000.0))
+            .unwrap_or(sketch.worker_wall_sum),
+        fused_sketch_join_wait_wall: sketch.join_wait_wall,
+        fused_sketches: Some(DiskSketchStore::from_resident_row_major(
+            sketch_path, indices.len(), sketch.width, sketch.data,
+        )?),
+    })
+}
+
+fn run_gpu_subtree_d0_preflight_inner(
+    root_assignment_backend: &dyn PiPNNComputeBackend,
+    dataset: &dyn PointStore,
+    indices: &[u32],
+    metric: Metric,
+    params: &PiPNNParams,
+    _num_threads: u32,
+    rng: &mut (impl Rng + Send),
+    external_child_dir: Option<&Path>,
+    runtime_context: GpuSubtreeRuntimeContext<'_>,
+    fused_sketch: Option<&mut TagoreD0Sketch>,
+) -> AnnResult<GpuSubtreeD0Plan> {
     struct RootStopLeafGuard;
 
     impl LeafEmitter for RootStopLeafGuard {
@@ -7381,7 +7495,7 @@ pub(crate) fn run_gpu_subtree_d0_preflight_with_context(
             params,
             d0_capacity_cfg,
             params.effective_gpu_workspace_budget_bytes(),
-            dim.max(1),
+            if params.gpu_subtree_sq_native_int4 { dim.max(1).div_ceil(2) } else { dim.max(1) },
         )?;
         d0_throughput_model = throughput_decision;
         let thresholds = compute_thresholds(c_gpu, d0_capacity_cfg);
@@ -7407,6 +7521,9 @@ pub(crate) fn run_gpu_subtree_d0_preflight_with_context(
             child_runs: Vec::new(),
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats: GpuSubtreeChildRunStats::default(),
             rbc_telemetry: RbcPartitionTelemetry {
                 root_fanout: root_fanout_profile,
@@ -7416,11 +7533,11 @@ pub(crate) fn run_gpu_subtree_d0_preflight_with_context(
             d0_capacity: D0CapacityTelemetry::default(),
         });
     }
-    if matches!(
+    if params.sq4_budget_d0() || matches!(
         params.gpu_subtree_d0_partition_mode,
         PiPNNGpuSubtreeD0PartitionMode::TagoreKMeansTopK
     ) {
-        return finalize_gpu_subtree_d0_hashes(run_gpu_subtree_d0_tagore_kmeans_topk(
+        return finalize_gpu_subtree_d0_hashes(run_gpu_subtree_d0_primary_kmeans_topk(
             dataset,
             indices,
             params,
@@ -7431,6 +7548,7 @@ pub(crate) fn run_gpu_subtree_d0_preflight_with_context(
             c_gpu,
             d0_capacity_telemetry,
             d0_throughput_model,
+            fused_sketch,
         )?);
     }
     let target_root_leaders = if d0_capacity_cfg.enabled {
@@ -7558,6 +7676,9 @@ pub(crate) fn run_gpu_subtree_d0_preflight_with_context(
         child_runs,
         sq_shard_local_payloads: Vec::new(),
         sq_cluster_child_indices: Vec::new(),
+        sq4_plus_centers: Vec::new(),
+        sq4_primary: None,
+            sq4_partition_codes: None,
         child_stats,
         rbc_telemetry: root_stats.telemetry,
         d0_capacity: d0_capacity_telemetry,
@@ -7886,6 +8007,9 @@ pub(crate) fn run_gpu_subtree_qcode_staging_preflight(
         child_runs,
         sq_shard_local_payloads: Vec::new(),
         sq_cluster_child_indices: Vec::new(),
+        sq4_plus_centers: Vec::new(),
+        sq4_primary: None,
+            sq4_partition_codes: None,
         child_stats,
         rbc_telemetry: telemetry,
         d0_capacity: D0CapacityTelemetry::default(),
@@ -7904,6 +8028,7 @@ struct SqGpuD0RawShard {
 struct SqGpuD0SidecarShard {
     row_start: usize,
     matrix: SqInt8Matrix,
+    centroid_ids: Option<Vec<u32>>,
 }
 
 struct SqGpuD0SidecarPipelineResult {
@@ -8038,6 +8163,21 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
         PiPNNGpuSubtreeSqStagingMode::GpuD0ClusterBatchD1
     );
     let sq_direct_d1 = sq_shard_local_direct || sq_cluster_batch_direct;
+    let rotated_sidecar = params.gpu_subtree_sq8_rotated_residual_d1;
+    let skip_sidecar =
+        sq_direct_d1 || (params.gpu_subtree_sq8_rotated_residual_d0 && !rotated_sidecar);
+    if params.gpu_subtree_sq8_rotated_residual_d0
+        && (params.gpu_subtree_sq_staging_mode != PiPNNGpuSubtreeSqStagingMode::GpuD0
+            || params.gpu_subtree_d0_partition_mode
+                != PiPNNGpuSubtreeD0PartitionMode::GpuKMeansCoarse
+            || !(params.gpu_subtree_sq_staging_raw_d1_diagnostic
+                || params.gpu_subtree_sq8_rotated_residual_d1)
+            || !dataset.dim().is_power_of_two())
+    {
+        return Err(AnnError::log_index_error(
+            "Rotated residual SQ8 D0 requires gpu-d0, gpu-kmeans-coarse, raw or rotated residual D1+, and power-of-two dimension".to_string(),
+        ));
+    }
     if !matches!(
         params.gpu_subtree_sq_staging_mode,
         PiPNNGpuSubtreeSqStagingMode::GpuD0
@@ -8063,7 +8203,23 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
                 .to_string(),
         ));
     }
-    let sidecar_prefix = if sq_direct_d1 {
+    let sidecar_prefix = if rotated_sidecar {
+        if params.gpu_subtree_sq_wmma_sidecar_mode.is_enabled() {
+            return Err(AnnError::log_index_error(
+                "Rotated residual SQ8 uses its own sidecar format".to_string(),
+            ));
+        }
+        Some(
+            params
+                .gpu_subtree_sq_wmma_sidecar_prefix
+                .as_ref()
+                .ok_or_else(|| {
+                    AnnError::log_index_error(
+                        "Rotated residual SQ8 requires a sidecar prefix".to_string(),
+                    )
+                })?,
+        )
+    } else if skip_sidecar {
         if params.gpu_subtree_sq_wmma_sidecar_mode.is_enabled()
             || params.gpu_subtree_sq_wmma_sidecar_prefix.is_some()
         {
@@ -8244,6 +8400,7 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
     let mut raw_read_wall = Duration::ZERO;
     let mut raw_h2d_wall = Duration::ZERO;
     let mut gpu_quantize_wall = Duration::ZERO;
+    let mut host_rotated_quantize_wall = Duration::ZERO;
     let mut qcode_d2h_wall = Duration::ZERO;
     let mut gpu_d0_assign_wall = Duration::ZERO;
     let mut assignment_fragment_d2h_wall = Duration::ZERO;
@@ -8269,8 +8426,29 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
     let mut fused_sketch_builder = fused_sketch_path.map(|path| {
         ResidentSketchChunkBuilder::new_with_threads(path, total_size, dim, params, num_threads)
     });
+    // A fixed OOM budget can admit the entire SQ payload just as the D1 opener
+    // does. Keep that payload instead of writing it only to read it back. An
+    // automatic budget can shrink after allocation, so retain its disk fallback.
     let resident_sidecar_pipeline =
-        !params.oom_enable && matches!(params.effective_oom_io_mode(), PiPNNOomIoMode::Buffered);
+        matches!(params.effective_oom_io_mode(), PiPNNOomIoMode::Buffered)
+            && (!params.oom_enable
+                || (params.oom_memory_budget_bytes > 0
+                    && super::estimate_sq_wmma_sidecar_resident_rows(params, total_size, dim)
+                        == total_size));
+    let mut rotated_centers_for_writer = if rotated_sidecar {
+        vec![0.0_f32; leader_vectors.len()]
+    } else {
+        Vec::new()
+    };
+    if rotated_sidecar {
+        for center in 0..global_d0_leaders.len() {
+            rotate_rabitq_plus_fht_kac_row(
+                &leader_vectors[center * dim..(center + 1) * dim],
+                &mut rotated_centers_for_writer[center * dim..(center + 1) * dim],
+                params.gpu_subtree_sq8_rotated_residual_seed,
+            )?;
+        }
+    }
 
     let stop_pipeline = Arc::new(AtomicBool::new(false));
     let sidecar_pipeline = std::thread::scope(|scope| -> AnnResult<_> {
@@ -8358,7 +8536,7 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
         });
 
         let sidecar_writer = scope.spawn(move || -> AnnResult<SqGpuD0SidecarPipelineResult> {
-            if sq_direct_d1 {
+            if skip_sidecar {
                 while let Ok(shard_result) = write_rx.recv() {
                     let _ = shard_result?;
                 }
@@ -8373,6 +8551,38 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
                 });
             }
             let sidecar_prefix = sidecar_prefix.expect("SQ GPU-D0 sidecar prefix is validated");
+            if rotated_sidecar {
+                let mut writer = Sq8RotatedResidualSidecarWriter::create(
+                    sidecar_prefix,
+                    total_size,
+                    dim,
+                    params.gpu_subtree_sq8_rotated_residual_seed,
+                    &rotated_centers_for_writer,
+                )?;
+                while let Ok(shard_result) = write_rx.recv() {
+                    let shard = shard_result?;
+                    let center_ids = shard.centroid_ids.ok_or_else(|| {
+                        AnnError::log_index_error(
+                            "Rotated residual SQ8 D0 shard has no center IDs".to_string(),
+                        )
+                    })?;
+                    writer.append(shard.row_start, &shard.matrix, &center_ids)?;
+                }
+                let written = writer.finish()?;
+                let mut report = SqWmmaSidecarCreateReport::default();
+                report.header.rows = total_size;
+                report.header.dim = dim;
+                report.header.padded_dim = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)?;
+                report.header.bits = SQ_INT8_DEFAULT_BITS;
+                report.header.codes_bytes = written.codes_bytes;
+                report.header.meta_rows_bytes = written.meta_rows_bytes;
+                report.write_wall = written.write_wall;
+                return Ok(SqGpuD0SidecarPipelineResult {
+                    report,
+                    runtime_sidecar: None,
+                    resident: false,
+                });
+            }
             if resident_sidecar_pipeline {
                 let mut writer = SqWmmaResidentSidecarBuilder::create(
                     sidecar_prefix,
@@ -8433,6 +8643,12 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
                         global_d0_leader_ids: &global_d0_leaders,
                         global_d0_leader_vectors_row_major: &leader_vectors,
                         leader_payload: None,
+                        rotated_residual: params.gpu_subtree_sq8_rotated_residual_d0.then_some(
+                            super::dco_sq_int8::Sq8RotatedResidualRequest {
+                                centroids_row_major: &leader_vectors,
+                                seed: params.gpu_subtree_sq8_rotated_residual_seed,
+                            },
+                        ),
                         dim,
                         fanout_top: fanout,
                     },
@@ -8473,6 +8689,7 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
 
             raw_h2d_wall += result.profile.raw_h2d_wall;
             gpu_quantize_wall += result.profile.gpu_quantize_wall;
+            host_rotated_quantize_wall += result.profile.host_rotated_quantize_wall;
             qcode_d2h_wall += result.profile.qcode_d2h_wall;
             gpu_d0_assign_wall += result.profile.gpu_d0_assign_wall;
             assignment_fragment_d2h_wall += result.profile.assignment_fragment_d2h_wall;
@@ -8570,10 +8787,16 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
 
             fragments.extend(result.fragments);
 
+            if skip_sidecar {
+                shard_count += 1;
+                continue;
+            }
+
             if write_tx
                 .send(Ok(SqGpuD0SidecarShard {
                     row_start: batch.row_start,
                     matrix: result.matrix,
+                    centroid_ids: result.centroid_ids,
                 }))
                 .is_err()
             {
@@ -8614,7 +8837,14 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
         runtime_sidecar,
         resident: sidecar_resident,
     } = sidecar_pipeline;
-    if !sq_direct_d1 {
+    if rotated_sidecar {
+        let _validated_sidecar = Sq8RotatedResidualSidecar::open(
+            sidecar_prefix.expect("Rotated residual SQ8 sidecar prefix is validated"),
+            total_size,
+            dim,
+            params.gpu_subtree_sq8_rotated_residual_seed,
+        )?;
+    } else if !skip_sidecar {
         if let Some(sidecar) = runtime_sidecar {
             cache_sq_wmma_created_sidecar(sidecar);
         } else {
@@ -8734,7 +8964,7 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
     } else {
         sq_global_d0_root_fanout_profile(total_size, fanout, &global_d0_leaders, &child_lens)
     };
-    let sidecar_write_wall = if sq_direct_d1 {
+    let sidecar_write_wall = if skip_sidecar {
         Duration::ZERO
     } else {
         sidecar_report.write_wall + sidecar_report.flush_wall + sidecar_report.header_write_wall
@@ -8798,6 +9028,7 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
         gpu_subtree_sq_staging_raw_read_wall: raw_read_wall,
         gpu_subtree_sq_staging_raw_h2d_wall: raw_h2d_wall,
         gpu_subtree_sq_staging_gpu_quantize_wall: gpu_quantize_wall,
+        gpu_subtree_sq_staging_host_rotated_quantize_wall: host_rotated_quantize_wall,
         gpu_subtree_sq_staging_qcode_d2h_wall: qcode_d2h_wall,
         gpu_subtree_sq_staging_gpu_d0_assign_wall: gpu_d0_assign_wall,
         gpu_subtree_sq_staging_assignment_fragment_d2h_wall: assignment_fragment_d2h_wall,
@@ -8807,8 +9038,16 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
         gpu_subtree_sq_staging_leader_code_bytes: leader_code_bytes,
         gpu_subtree_sq_staging_assignment_fragment_reduce_wall: fragment_reduce_wall,
         gpu_subtree_sq_staging_sidecar_write_wall: sidecar_write_wall,
-        gpu_subtree_sq_staging_sidecar_compatible: !sq_direct_d1,
-        gpu_subtree_sq_staging_sidecar_source: if sq_shard_local_direct {
+        gpu_subtree_sq_staging_sidecar_compatible: !skip_sidecar,
+        gpu_subtree_sq_staging_sidecar_source: if rotated_sidecar {
+            if params.gpu_subtree_sq8_rotated_residual_d1_int8 {
+                "rotated-residual-v2-int8"
+            } else {
+                "rotated-residual-v2"
+            }
+        } else if params.gpu_subtree_sq8_rotated_residual_d0 {
+            "none-rotated-residual"
+        } else if sq_shard_local_direct {
             "gpu-d0-shard-local-d1"
         } else if sq_cluster_batch_direct {
             "gpu-d0-cluster-batch-d1"
@@ -8862,6 +9101,9 @@ fn run_gpu_subtree_sq_staging_preflight_inner(
         child_runs,
         sq_shard_local_payloads,
         sq_cluster_child_indices,
+        sq4_plus_centers: Vec::new(),
+        sq4_primary: None,
+            sq4_partition_codes: None,
         child_stats,
         rbc_telemetry: telemetry,
         d0_capacity: d0_capacity_telemetry,
@@ -8960,7 +9202,7 @@ impl TagoreD0Assignments {
     }
 }
 
-fn run_gpu_subtree_d0_tagore_kmeans_topk(
+fn run_gpu_subtree_d0_primary_kmeans_topk(
     dataset: &dyn PointStore,
     indices: &[u32],
     params: &PiPNNParams,
@@ -8971,13 +9213,23 @@ fn run_gpu_subtree_d0_tagore_kmeans_topk(
     c_gpu: usize,
     mut d0_capacity_telemetry: D0CapacityTelemetry,
     d0_throughput_model: Option<D0ThroughputModelDecision>,
+    fused_sketch: Option<&mut TagoreD0Sketch>,
 ) -> AnnResult<GpuSubtreeD0Plan> {
     let total_size = indices.len();
-    let partitions = params
-        .gpu_subtree_d0_tagore_partitions
-        .max(1)
-        .min(total_size.max(1));
-    let topk = params.gpu_subtree_d0_tagore_k.max(1).min(partitions);
+    let thresholds = if params.sq4_budget_d0() {
+        super::d0_capacity::compute_admission_thresholds(c_gpu, dataset.dim(), params,
+            d0_capacity_config_from_params(params))
+    } else { compute_thresholds(c_gpu, d0_capacity_config_from_params(params)) };
+    let budget_plan = if params.sq4_budget_d0() {
+        if !params.gpu_subtree_sq4_plus || !params.gpu_subtree_d0_capacity_enable {
+            return Err(AnnError::log_index_error("SQ4 budget D0 requires SQ4+ and capacity planning".into()));
+        }
+        Some(plan_root_leaders(total_size, params.fanout_top, thresholds,
+            d0_capacity_config_from_params(params)))
+    } else { None };
+    let partitions = budget_plan.map(|p| p.k_initial)
+        .unwrap_or(params.gpu_subtree_d0_tagore_partitions).max(1).min(total_size.max(1));
+    let topk = if budget_plan.is_some() { params.fanout_top } else { params.gpu_subtree_d0_tagore_k }.max(1).min(partitions);
     let io_cfg = if params.strict_oom_io_enabled() {
         DirectIoConfig::enabled_with_alignment(4096)
     } else {
@@ -8991,35 +9243,104 @@ fn run_gpu_subtree_d0_tagore_kmeans_topk(
             .unwrap(),
     );
     pb.set_message(format!(
-        "gpu-subtree D0 Tagore-style k-means: partitions={} topk={}",
-        partitions, topk,
+        "gpu-subtree D0 {} k-means: partitions={} topk={}",
+        if budget_plan.is_some() { "budget" } else { "fixed Tagore-style" }, partitions, topk,
     ));
 
+    let random_leaders = match std::env::var("SHEAR_PIPNN_SQ4_D0_LEADER_SOURCE").as_deref() {
+        Ok("random") if budget_plan.is_some() && params.gpu_subtree_sq4_primary_center => true,
+        Ok("kmeans") | Err(std::env::VarError::NotPresent) => false,
+        other => return Err(AnnError::log_index_error(format!(
+            "SQ4 D0 leader source requires kmeans, or random with budget D0 and primary encoding: {other:?}"))),
+    };
     let d0_start = Instant::now();
     let train_start = Instant::now();
-    let (centers, sample_points) = train_tagore_d0_centers(
-        dataset,
-        indices,
-        partitions,
-        params.gpu_subtree_d0_tagore_sample_fraction,
-        params.kmeans_iterations,
-    )?;
+    let route_start = Instant::now();
+    let (centers, sample_points) = if random_leaders {
+        // Use an independent RNG so child/task seeds stay fixed between policies.
+        let mut leader_rng = StdRng::seed_from_u64(params.random_seed ^ 0x5351_3452_4f4f_5401);
+        let positions = index::sample(&mut leader_rng, total_size, partitions);
+        let leaders = positions.iter().map(|pos| indices[pos]).collect::<Vec<_>>();
+        (read_point_ids_dense(dataset, &leaders)?, 0)
+    } else {
+        let training_backend = std::env::var("SHEAR_PIPNN_SQ4_D0_TRAIN").or_else(|err| {
+            if matches!(err, std::env::VarError::NotPresent) { std::env::var("SHEAR_PIPNN_SQ4_PARTITION_TRAIN") }
+            else { Err(err) }
+        });
+        let gpu_train = match training_backend.as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("cpu") => false,
+            Ok("gpu") => true,
+            other => return Err(AnnError::log_index_error(format!("Invalid partition training backend {other:?}"))),
+        };
+        if gpu_train {
+            let exact = if params.gpu_subtree_sq4_primary_center {
+                std::env::var("SHEAR_PIPNN_SQ4_D0_BACKEND").as_deref() == Ok("gpu-exact")
+            } else { partition_d0_mode()?.as_deref() == Some("gpu-exact") };
+            if !exact || !matches!(partitions, 64 | 512) || dataset.dim() != 512 || !params.gpu_subtree_sq4_plus {
+                return Err(AnnError::log_index_error("GPU kmeans requires explicit gpu-exact, 512D/64 or 512 centers".into()));
+            }
+            #[cfg(not(feature="pipnn_cuda"))]
+            return Err(AnnError::log_index_error("GPU kmeans requires pipnn_cuda".into()));
+            #[cfg(feature="pipnn_cuda")]
+            {
+                let count=tagore_d0_sample_count(indices.len(),partitions,params.gpu_subtree_d0_tagore_sample_fraction);
+                let samples=read_point_ids_dense(dataset,&tagore_d0_sample_ids(indices,count))?;
+                (super::sq4_gpu_d0::train_partition_kmeans(&samples,partitions,params.kmeans_iterations,
+                    params.gpu_device_id,params.effective_gpu_workspace_budget_bytes(),false)?.0,count)
+            }
+        } else {
+            train_tagore_d0_centers(dataset, indices, partitions,
+                params.gpu_subtree_d0_tagore_sample_fraction, params.kmeans_iterations)?
+        }
+    };
+    let route_prepare_wall = route_start.elapsed();
+    let primary_start = Instant::now();
+    let primary_centers = if budget_plan.is_some() && params.gpu_subtree_sq4_primary_center
+        && (random_leaders || partitions != total_size.min(64)) {
+        Some(train_tagore_d0_centers(dataset, indices, total_size.min(64),
+            params.gpu_subtree_d0_tagore_sample_fraction, params.kmeans_iterations)?.0)
+    } else { None };
+    let primary_train_wall = if primary_centers.is_some() { primary_start.elapsed() } else { route_prepare_wall };
+    let primary_count = primary_centers.as_ref().map_or(partitions, |c|c.len()/dataset.dim());
     let train_wall = train_start.elapsed();
+    let code_centers = primary_centers.as_deref().unwrap_or(&centers);
+    let mut primary_hash = StableFnv1a64::new(b"SQ4-PRIMARY-CENTERS\0");
+    for value in code_centers { primary_hash.write(&value.to_bits().to_le_bytes()); }
+    tracing::info!("SQ4+ D0 leader preparation: source={} route_centers={} primary_centers={} primary_hash={} route_prepare_ms={:.6} primary_train_ms={:.6} shared_training={} total_ms={:.6}",
+        if random_leaders { "random" } else { "kmeans" }, partitions, primary_count,
+        primary_hash.finish(), route_prepare_wall.as_secs_f64()*1000.0,
+        primary_train_wall.as_secs_f64()*1000.0, primary_centers.is_none(), train_wall.as_secs_f64()*1000.0);
 
     let assign_start = Instant::now();
     let seed: u64 = rng.random();
     let mut run_store = ExternalRunStore::new(external_child_dir, io_cfg);
-    let child_runs =
-        write_tagore_d0_topk_child_runs(dataset, indices, &centers, topk, seed, &mut run_store)?;
+    let (child_runs, sq4_plus_centers, sq4_primary, sq4_partition_codes) =
+        write_tagore_d0_topk_child_runs(
+            dataset, indices, &centers, primary_centers.as_deref(), topk, seed, &mut run_store, params, fused_sketch,
+        )?;
     run_store.finalize()?;
     let assign_wall = assign_start.elapsed();
+    if std::env::var("SHEAR_PIPNN_SQ4_D0_CODE_HASH").as_deref() == Ok("1") {
+        if let Some(codes) = sq4_primary.as_ref() {
+            tracing::info!("SQ4+ primary payload SHA256: {}", codes.fingerprint());
+        }
+    }
 
     if d0_capacity_telemetry.enabled {
-        let thresholds = compute_thresholds(c_gpu, d0_capacity_config_from_params(params));
-        d0_capacity_telemetry.root_leader_source = "tagore-kmeans-topk";
+        if let Some(plan) = budget_plan {
+            d0_capacity_telemetry.record_thresholds(thresholds, dataset.dim(), params);
+            d0_capacity_telemetry.k_capacity = plan.k_capacity;
+            d0_capacity_telemetry.root_leader_source = plan.root_leader_source;
+            d0_capacity_telemetry.root_leader_cap = plan.root_leader_cap;
+            tracing::info!("SQ4+ budget D0: rows={} capacity_leaders={} quality_floor={} leader_cap={} route_centers={} primary_centers={} topk={} c_gpu={} c_high={} c_target={}",
+                total_size,plan.k_capacity,params.gpu_subtree_d0_capacity_quality_min_root_leaders,
+                plan.root_leader_cap,partitions,primary_count,topk,thresholds.c_gpu,thresholds.c_high,thresholds.c_target);
+        } else {
+            d0_capacity_telemetry.root_leader_source = "tagore-kmeans-topk";
+            d0_capacity_telemetry.root_leader_cap = partitions;
+        }
         d0_capacity_telemetry.root_leaders_initial = partitions;
         d0_capacity_telemetry.root_leaders_final = partitions;
-        d0_capacity_telemetry.root_leader_cap = partitions;
         let mut unique_sizes =
             scan_gpu_subtree_child_unique_sizes(external_child_dir, io_cfg, &child_runs)?;
         super::d0_capacity::observe_child_unique_sizes(
@@ -9033,7 +9354,7 @@ fn run_gpu_subtree_d0_tagore_kmeans_topk(
     let root_fanout_profile = tagore_d0_root_fanout_profile(total_size, partitions, topk);
     let mut telemetry = RbcPartitionTelemetry {
         root_fanout: root_fanout_profile.clone(),
-        gpu_subtree_d0_partition_mode: params.gpu_subtree_d0_partition_mode.as_str(),
+        gpu_subtree_d0_partition_mode: if budget_plan.is_some() { "budget-kmeans-topk" } else { params.gpu_subtree_d0_partition_mode.as_str() },
         gpu_subtree_d0_tagore_partitions: partitions,
         gpu_subtree_d0_tagore_k: topk,
         gpu_subtree_d0_tagore_sample_points: sample_points,
@@ -9065,6 +9386,9 @@ fn run_gpu_subtree_d0_tagore_kmeans_topk(
         child_runs,
         sq_shard_local_payloads: Vec::new(),
         sq_cluster_child_indices: Vec::new(),
+        sq4_plus_centers,
+        sq4_primary,
+        sq4_partition_codes,
         child_stats,
         rbc_telemetry: telemetry,
         d0_capacity: d0_capacity_telemetry,
@@ -9199,19 +9523,118 @@ fn write_tagore_d0_topk_child_runs(
     dataset: &dyn PointStore,
     indices: &[u32],
     centers: &[f32],
+    primary_centers: Option<&[f32]>,
     topk: usize,
     seed: u64,
     store: &mut ExternalRunStore,
-) -> AnnResult<Vec<GpuSubtreeChildRun>> {
+    params: &PiPNNParams,
+    fused_sketch: Option<&mut TagoreD0Sketch>,
+) -> AnnResult<(Vec<GpuSubtreeChildRun>, Vec<f32>, Option<Arc<PrimaryCodes>>, Option<Arc<PartitionCodes>>)> {
     let dim = dataset.dim();
     let partitions = centers.len() / dim.max(1);
     let topk = topk.max(1).min(partitions.max(1));
-    let clusters = build_tagore_d0_topk_clusters_parallel(dataset, indices, centers, topk)?;
+    let partition_mode = partition_d0_mode()?;
+    if let Some(mode) = partition_mode.as_deref() {
+        if !params.gpu_subtree_sq4_plus || params.gpu_subtree_sq4_primary_center
+            || params.compute_backend != PiPNNComputeBackendKind::Cuda || dim != 512
+            || !matches!(partitions, 64 | 512) {
+            return Err(AnnError::log_index_error("Partition GPU D0 requires CUDA SQ4+, partition codes, 512D/64 or 512 centers".into()));
+        }
+        #[cfg(not(feature="pipnn_cuda"))]
+        return Err(AnnError::log_index_error("Partition GPU D0 requires pipnn_cuda".into()));
+        #[cfg(feature="pipnn_cuda")]
+        {
+            let (clusters, table) = partition_d0_pipeline(dataset, indices, centers, topk, params, mode, fused_sketch)?;
+            let mut runs = Vec::new(); let mut run_centers = Vec::new();
+            for (center, cluster) in clusters.into_iter().enumerate() {
+                if cluster.is_empty() { continue; }
+                run_centers.extend_from_slice(&centers[center*dim..(center+1)*dim]);
+                let extent = write_child_run(store, 0, &cluster)?;
+                runs.push(GpuSubtreeChildRun {extents:vec![extent],len:cluster.len(),
+                    seed:seed ^ (center as u64).wrapping_mul(0x9e3779b97f4a7c15)});
+            }
+            return Ok((runs, run_centers, None, Some(Arc::new(table))));
+        }
+    }
+    let code_centers = primary_centers.unwrap_or(centers);
+    let code_count = code_centers.len()/dim.max(1);
+    let rotation = if params.gpu_subtree_sq4_primary_center {
+        let packed = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)? / 2;
+        let host_bytes = indices.len().saturating_mul(packed + 9)
+            .saturating_add(dataset.len().saturating_mul(size_of::<usize>()));
+        if code_count > 256 || host_bytes > params.effective_oom_memory_budget_bytes() / 2 {
+            return Err(AnnError::log_index_error(format!(
+                "Primary SQ4+ requires up to 256 centers and a resident code table within half the host budget (centers={code_count}, bytes={host_bytes})")));
+        }
+        Some(FhtKacRotationPlan::new(dim, params.random_seed)?)
+    } else { None };
+    let gpu_d0 = match std::env::var("SHEAR_PIPNN_SQ4_D0_BACKEND").as_deref() {
+        Ok("cpu") => None,
+        // Default only the validated CUDA/LAION primary-code configuration.
+        // Explicit CPU/sketch experiments and other shapes keep their paths.
+        Err(std::env::VarError::NotPresent) => {
+            let supported = cfg!(feature = "pipnn_cuda")
+                && params.compute_backend == PiPNNComputeBackendKind::Cuda
+                && params.gpu_subtree_sq4_plus && rotation.is_some()
+                && dim == 512 && (params.sq4_budget_d0() || partitions == 64)
+                && (primary_centers.is_none() || code_count == 64) && topk <= 32
+                && fused_sketch.as_ref().is_some_and(|sketch| sketch.gpu.is_none());
+            supported.then_some((true, true))
+        }
+        Ok("gpu-encode") => Some((false, false)),
+        Ok("gpu") => Some((true, false)),
+        Ok("gpu-exact") => Some((true, true)),
+        other => return Err(AnnError::log_index_error(format!(
+            "Invalid SQ4+ D0 backend {other:?}; expected cpu, gpu-encode, gpu, or gpu-exact"))),
+    };
+    let (clusters, primary) = if let Some((assign_on_gpu, exact)) = gpu_d0 {
+        #[cfg(not(feature = "pipnn_cuda"))]
+        { let _ = (assign_on_gpu, exact); return Err(AnnError::log_index_error("GPU D0 requires pipnn_cuda".into())); }
+        #[cfg(feature = "pipnn_cuda")]
+        {
+            if !params.gpu_subtree_sq4_plus || rotation.is_none() {
+                return Err(AnnError::log_index_error("GPU D0 requires SQ4+ primary-center mode".into()));
+            }
+            let sketch = fused_sketch.ok_or_else(|| AnnError::log_index_error(
+                "GPU D0 requires fused CPU sketch; leave SQ4_D0_FUSED_SKETCH enabled".into()))?;
+            if sketch.gpu.is_some() {
+                return Err(AnnError::log_index_error("GPU D0 uses CPU sketch; set SQ4_D0_SKETCH_BACKEND=cpu".into()));
+            }
+            let (clusters, primary, sketch_wall, join_wait, profile) = tagore_primary_gpu_pipeline(
+                dataset, indices, centers, primary_centers, topk, rotation.as_ref().unwrap(),
+                &sketch.hyperplanes, sketch.width, &mut sketch.data, params.gpu_device_id,
+                params.effective_gpu_workspace_budget_bytes(), assign_on_gpu, exact,
+            )?;
+            sketch.worker_wall_sum += sketch_wall;
+            sketch.join_wait_wall += join_wait;
+            tracing::info!(
+                "SQ4+ GPU D0: mode={} encoded_gpu_rows={} encoded_cpu_rows=0 sketch_cpu_rows={} sketch_gpu_rows=0 sketch_ms={} sketch_join_wait_ms={} workspace_bytes={} prepare_ms={:.3} profile={:?}",
+                if exact { "gpu-exact" } else if assign_on_gpu { "gpu" } else { "gpu-encode" }, indices.len(), indices.len(),
+                sketch_wall.as_millis(), join_wait.as_millis(), profile.workspace_bytes, profile.prepare_ms, profile,
+            );
+            (clusters, Some(primary))
+        }
+    } else if let Some(sketch) = fused_sketch {
+        let (clusters, primary, worker_wall_sum) = tagore_clusters_primary_and_sketches(
+            dataset, indices, centers, topk, rotation.as_ref(), primary_centers,
+            Some((&sketch.hyperplanes, sketch.width, &mut sketch.data, sketch.gpu.as_ref())),
+        )?;
+        sketch.worker_wall_sum += worker_wall_sum;
+        (clusters, primary)
+    } else {
+        let (clusters, primary, _) = tagore_clusters_primary_and_sketches(dataset, indices, centers, topk,
+            rotation.as_ref(), primary_centers, None)?;
+        (clusters, primary)
+    };
 
     let mut runs = Vec::new();
+    let mut run_centers = Vec::new();
     for (cluster_idx, cluster) in clusters.into_iter().enumerate() {
         if cluster.is_empty() {
             continue;
+        }
+        if params.gpu_subtree_sq4_plus && primary.is_none() {
+            run_centers.extend_from_slice(&centers[cluster_idx * dim..(cluster_idx + 1) * dim]);
         }
         let extent = write_child_run(store, 0, &cluster)?;
         runs.push(GpuSubtreeChildRun {
@@ -9220,7 +9643,7 @@ fn write_tagore_d0_topk_child_runs(
             seed: seed ^ (cluster_idx as u64).wrapping_mul(0x9e3779b97f4a7c15),
         });
     }
-    Ok(runs)
+    Ok((runs, run_centers, primary.map(Arc::new), None))
 }
 
 fn build_tagore_d0_topk_clusters_parallel(
@@ -9229,12 +9652,32 @@ fn build_tagore_d0_topk_clusters_parallel(
     centers: &[f32],
     topk: usize,
 ) -> AnnResult<Vec<Vec<u32>>> {
+    Ok(tagore_clusters_and_primary_codes(dataset, indices, centers, topk, None)?.0)
+}
+
+fn tagore_clusters_and_primary_codes(
+    dataset: &dyn PointStore, indices: &[u32], centers: &[f32], topk: usize,
+    rotation: Option<&FhtKacRotationPlan>,
+) -> AnnResult<(Vec<Vec<u32>>, Option<PrimaryCodes>)> {
+    let (clusters, primary, _) = tagore_clusters_primary_and_sketches(
+        dataset, indices, centers, topk, rotation, None, None,
+    )?;
+    Ok((clusters, primary))
+}
+
+fn tagore_clusters_primary_and_sketches(
+    dataset: &dyn PointStore, indices: &[u32], centers: &[f32], topk: usize,
+    rotation: Option<&FhtKacRotationPlan>,
+    primary_centers: Option<&[f32]>,
+    sketch: Option<(&[f32], usize, &mut [f32], Option<&super::gpu_sketch::GpuSketch>)>,
+) -> AnnResult<(Vec<Vec<u32>>, Option<PrimaryCodes>, Duration)> {
     let dim = dataset.dim();
     let partitions = centers.len() / dim.max(1);
     if indices.is_empty() || partitions == 0 {
-        return Ok(vec![Vec::new(); partitions]);
+        return Ok((vec![Vec::new(); partitions], None, Duration::ZERO));
     }
     let topk = topk.max(1).min(partitions);
+    let code_centers = primary_centers.unwrap_or(centers);
     let center_norms = tagore_d0_center_norms(centers, dim);
     let options = default_rbc_windowed_options(dataset, TAGORE_D0_ASSIGN_CHUNK_POINTS);
     let chunk_count = indices.len().div_ceil(TAGORE_D0_ASSIGN_CHUNK_POINTS);
@@ -9247,35 +9690,60 @@ fn build_tagore_d0_topk_clusters_parallel(
         rayon::current_num_threads().max(1)
     );
 
-    let partials = indices
-        .par_chunks(TAGORE_D0_ASSIGN_CHUNK_POINTS)
-        .map(|ids| -> AnnResult<Vec<Vec<u32>>> {
-            let rows = ids.len();
-            let mut buffer = vec![0.0f32; rows.saturating_mul(dim)];
-            let mut stats = PointBatchStats::default();
-            dataset.read_points_windowed_into_batch_stats(
-                ids,
-                &mut buffer,
-                &options,
-                &mut stats,
-            )?;
-            let assignments = assign_dense_rows_to_precomputed_centers(
-                &buffer,
-                rows,
-                dim,
-                centers,
-                &center_norms,
-                topk,
-            );
-            let mut clusters = (0..partitions).map(|_| Vec::new()).collect::<Vec<_>>();
-            for (row, &point_id) in ids.iter().enumerate() {
-                for &cluster_idx in assignments.row(row) {
-                    clusters[cluster_idx].push(point_id);
+    let padded = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)?;
+    let process_chunk = |ids: &[u32], sketch_output: Option<(&[f32], usize, &mut [f32], Option<&super::gpu_sketch::GpuSketch>)>| -> AnnResult<_> {
+        let rows = ids.len();
+        let mut buffer = vec![0.0f32; rows.saturating_mul(dim)];
+        let mut stats = PointBatchStats::default();
+        dataset.read_points_windowed_into_batch_stats(
+            ids,
+            &mut buffer,
+            &options,
+            &mut stats,
+        )?;
+        let sketch_wall = if let Some((hyperplanes, width, output, gpu)) = sketch_output {
+            let start = Instant::now();
+            if let Some(gpu) = gpu {
+                gpu.compute(&buffer, output)?;
+            } else {
+                for (point, row) in buffer.chunks_exact(dim).zip(output.chunks_exact_mut(width)) {
+                    fill_sketch_row_from_slice(point, hyperplanes, row)?;
                 }
             }
-            Ok(clusters)
-        })
-        .collect::<AnnResult<Vec<_>>>()?;
+            start.elapsed()
+        } else { Duration::ZERO };
+        let assignments = assign_dense_rows_to_precomputed_centers(
+            &buffer,
+            rows,
+            dim,
+            centers,
+            &center_norms,
+            topk,
+        );
+        let mut clusters = (0..partitions).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (row, &point_id) in ids.iter().enumerate() {
+            for &cluster_idx in assignments.row(row) {
+                clusters[cluster_idx].push(point_id);
+            }
+        }
+        let primary_assignments = primary_centers.map(|c|assign_dense_rows_to_centers(&buffer,rows,dim,c,1));
+        let codes = rotation.map(|rot| PrimaryChunk::encode(&buffer, dim, padded, code_centers,
+            (0..rows).map(|r| primary_assignments.as_ref().unwrap_or(&assignments).row(r)[0]), rot)).transpose()?;
+        Ok((clusters, codes, sketch_wall))
+    };
+    let partials = if let Some((hyperplanes, width, data, gpu)) = sketch {
+        if width == 0 || data.len() != indices.len().saturating_mul(width) {
+            return Err(AnnError::log_index_error("Invalid fused D0 sketch shape".to_string()));
+        }
+        indices.par_chunks(TAGORE_D0_ASSIGN_CHUNK_POINTS)
+            .zip(data.par_chunks_mut(TAGORE_D0_ASSIGN_CHUNK_POINTS * width))
+            .map(|(ids, output)| process_chunk(ids, Some((hyperplanes, width, output, gpu))))
+            .collect::<AnnResult<Vec<_>>>()?
+    } else {
+        indices.par_chunks(TAGORE_D0_ASSIGN_CHUNK_POINTS)
+            .map(|ids| process_chunk(ids, None))
+            .collect::<AnnResult<Vec<_>>>()?
+    };
 
     let mut clusters = (0..partitions)
         .map(|_| {
@@ -9289,12 +9757,250 @@ fn build_tagore_d0_topk_clusters_parallel(
             )
         })
         .collect::<Vec<_>>();
-    for partial in partials {
+    let mut encoded = Vec::new();
+    let mut sketch_worker_wall_sum = Duration::ZERO;
+    for (partial, codes, sketch_wall) in partials {
+        sketch_worker_wall_sum += sketch_wall;
+        if let Some(codes) = codes { encoded.push(codes); }
         for (dst, mut src) in clusters.iter_mut().zip(partial) {
             dst.append(&mut src);
         }
     }
-    Ok(clusters)
+    let primary = rotation.map(|rot| PrimaryCodes::new(encoded, indices, dataset.len(),
+        TAGORE_D0_ASSIGN_CHUNK_POINTS, dim, padded, code_centers, rot)).transpose()?;
+    if primary.is_some() {
+        tracing::info!("SQ4+ primary table: rows={} centers={} packed_bytes={} memberships={}",
+            indices.len(), code_centers.len()/dim, indices.len() * (padded / 2), indices.len() * topk);
+    }
+    Ok((clusters, primary, sketch_worker_wall_sum))
+}
+
+#[cfg(feature = "pipnn_cuda")]
+fn tagore_primary_gpu_pipeline(
+    dataset: &dyn PointStore, indices: &[u32], centers: &[f32], primary_centers: Option<&[f32]>, topk: usize,
+    rotation: &FhtKacRotationPlan, planes: &[f32], width: usize, sketch: &mut [f32],
+    device: usize, budget: usize, assign_on_gpu: bool, exact: bool,
+) -> AnnResult<(Vec<Vec<u32>>, PrimaryCodes, Duration, Duration, super::sq4_gpu_d0::Profile)> {
+    let (clusters, chunks, sketch_wall, join_wait, profile) = sq4_gpu_chunks_and_sketch(
+        dataset, indices, centers, primary_centers, topk, rotation, planes, width, sketch,
+        device, budget, assign_on_gpu, exact, false,
+    )?;
+    let dim = dataset.dim();
+    let padded = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)?;
+    let primary = PrimaryCodes::new(chunks, indices, dataset.len(), TAGORE_D0_ASSIGN_CHUNK_POINTS,
+        dim, padded, primary_centers.unwrap_or(centers), rotation)?;
+    tracing::info!("SQ4+ primary table: rows={} centers={} packed_bytes={} memberships={}",
+        indices.len(), primary_centers.unwrap_or(centers).len()/dim, indices.len() * (padded / 2), indices.len() * topk);
+    Ok((clusters, primary, sketch_wall, join_wait, profile))
+}
+
+#[cfg(feature = "pipnn_cuda")]
+fn sq4_gpu_chunks_and_sketch(
+    dataset: &dyn PointStore, indices: &[u32], centers: &[f32], primary_centers: Option<&[f32]>, topk: usize,
+    rotation: &FhtKacRotationPlan, planes: &[f32], width: usize, sketch: &mut [f32],
+    device: usize, budget: usize, assign_on_gpu: bool, exact: bool, partition_encoding: bool,
+) -> AnnResult<(Vec<Vec<u32>>, Vec<PrimaryChunk>, Duration, Duration, super::sq4_gpu_d0::Profile)> {
+    let dim = dataset.dim();
+    if dim == 0 || width == 0 || planes.len() != width.saturating_mul(dim)
+        || sketch.len() != indices.len().saturating_mul(width) {
+        return Err(AnnError::log_index_error("Invalid GPU D0 sketch shape".into()));
+    }
+    let partitions = centers.len() / dim;
+    let topk = topk.max(1).min(partitions);
+    let padded = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)?;
+    let norms = tagore_d0_center_norms(centers, dim);
+    let mut gpu = super::sq4_gpu_d0::GpuPrimaryD0::new(device, dim, padded,
+        TAGORE_D0_ASSIGN_CHUNK_POINTS, centers, &norms, topk, rotation, budget)?;
+    if exact { gpu.enable_exact_assignment(centers, budget)?; }
+    if let Some(c) = primary_centers { gpu.set_primary_centers(c, budget)?; }
+    if partition_encoding { gpu.enable_partition_encoding(budget)?; }
+    let sketch_pool = rayon::ThreadPoolBuilder::new().num_threads(rayon::current_num_threads().max(1))
+        .build().map_err(|e| AnnError::log_index_error(format!("GPU D0 sketch pool: {e}")))?;
+    let options = default_rbc_windowed_options(dataset, TAGORE_D0_ASSIGN_CHUNK_POINTS);
+    let mut clusters = (0..partitions).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut chunks = Vec::with_capacity(indices.len().div_ceil(TAGORE_D0_ASSIGN_CHUNK_POINTS));
+    let mut sketch_wall = Duration::ZERO;
+    let mut join_wait = Duration::ZERO;
+    // Reuse SQ8 staging's bounded reader -> GPU/CPU-sketch fork -> ordered
+    // commit organization. Keep original 4096-row CPU GEMM shapes in the legacy mode.
+    std::thread::scope(|scope| -> AnnResult<()> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let reader = scope.spawn(move || {
+            for (chunk, ids) in indices.chunks(TAGORE_D0_ASSIGN_CHUNK_POINTS).enumerate() {
+                let read_start = Instant::now();
+                let mut raw = vec![0.0; ids.len() * dim];
+                let read = dataset.read_points_windowed_into_batch_stats(ids, &mut raw,
+                    &options, &mut PointBatchStats::default()).map(|_| (chunk, raw, read_start.elapsed()));
+                let failed = read.is_err();
+                if tx.send(read).is_err() || failed { break; }
+            }
+        });
+        let result = (|| -> AnnResult<()> {
+            loop {
+                let wait_start = Instant::now();
+                let next = rx.recv();
+                gpu.profile.reader_wait_ms += wait_start.elapsed().as_secs_f64() * 1000.0;
+                let Ok(raw) = next else { break; };
+                let (chunk, raw, read_wall) = raw?;
+                gpu.profile.host_read_ms += read_wall.as_secs_f64() * 1000.0;
+                let rows = raw.len() / dim;
+                let start = chunk * TAGORE_D0_ASSIGN_CHUNK_POINTS;
+                if chunk != chunks.len() { return Err(AnnError::log_index_error("Unordered GPU D0 batch".into())); }
+                let sketch_out = &mut sketch[start * width..(start + rows) * width];
+                let (staged, sketched, waited) = std::thread::scope(|fork| {
+                    let sketch_job = fork.spawn(|| -> AnnResult<Duration> {
+                        let begin = Instant::now();
+                        sketch_pool.install(|| raw.par_chunks_exact(dim)
+                            .zip(sketch_out.par_chunks_exact_mut(width))
+                            .try_for_each(|(point, out)| fill_sketch_row_from_slice(point, planes, out)))?;
+                        Ok(begin.elapsed())
+                    });
+                    let staged = gpu.stage(&raw, assign_on_gpu, || {
+                        // Never compact the uncertain rows: matrix shape/order
+                        // preserve the legacy CPU GEMM call; gpu-exact never invokes it.
+                        assign_dense_rows_to_precomputed_centers(&raw, rows, dim, centers, &norms, topk)
+                            .clusters.into_iter().map(|id| u32::try_from(id)
+                                .map_err(|_| AnnError::log_index_error("Invalid reference center ID".into())))
+                            .collect::<AnnResult<Vec<_>>>()
+                    });
+                    let begin = Instant::now();
+                    let sketched = sketch_job.join().map_err(|_| AnnError::log_index_error("CPU sketch worker panicked".into()))
+                        .and_then(|r| r);
+                    (staged, sketched, begin.elapsed())
+                });
+                sketch_wall += sketched?;
+                join_wait += waited;
+                let (selected, codes) = staged?;
+                for (row, assignments) in selected.chunks_exact(topk).enumerate() {
+                    for &center in assignments { clusters[center as usize].push(indices[start + row]); }
+                }
+                chunks.push(codes);
+            }
+            Ok(())
+        })();
+        // On any GPU/CPU failure, unblock a reader stalled in its bounded send
+        // before joining it; failed batches are never published as a D0 plan.
+        drop(rx);
+        let joined = reader.join().map_err(|_| AnnError::log_index_error("GPU D0 reader panicked".into()));
+        result?;
+        joined?;
+        Ok(())
+    })?;
+    if gpu.profile.rows != indices.len() {
+        return Err(AnnError::log_index_error("GPU D0 did not encode every source row".into()));
+    }
+    Ok((clusters, chunks, sketch_wall, join_wait, gpu.profile))
+}
+
+pub(super) fn partition_gpu_d0_requested() -> bool {
+    matches!(std::env::var("SHEAR_PIPNN_SQ4_PARTITION_D0").as_deref(), Ok("gpu-encode") | Ok("gpu-exact"))
+}
+
+fn partition_d0_mode() -> AnnResult<Option<String>> {
+    match std::env::var("SHEAR_PIPNN_SQ4_PARTITION_D0") {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(mode) if matches!(mode.as_str(), "cpu" | "gpu-encode" | "gpu-exact") => Ok(Some(mode)),
+        other => Err(AnnError::log_index_error(format!("Invalid SQ4 partition D0 mode: {other:?}"))),
+    }
+}
+
+#[cfg(feature="pipnn_cuda")]
+fn partition_d0_pipeline(dataset: &dyn PointStore, indices: &[u32], centers: &[f32],
+    topk: usize, params: &PiPNNParams, mode: &str,
+    fused_sketch: Option<&mut TagoreD0Sketch>) -> AnnResult<(Vec<Vec<u32>>, PartitionCodes)> {
+    let dim = dataset.dim(); let partitions = centers.len()/dim;
+    let padded = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)?;
+    let required = indices.len().checked_mul(topk * (padded/2 + 10))
+        .and_then(|v| v.checked_add(dataset.len() * size_of::<usize>()))
+        .ok_or_else(|| AnnError::log_index_error("Partition code host size overflow".into()))?;
+    let total_budget = params.effective_oom_memory_budget_bytes();
+    let host_cap = match std::env::var("SHEAR_PIPNN_SQ4_PARTITION_HOST_BUDGET_BYTES") {
+        Err(std::env::VarError::NotPresent) => total_budget / 2,
+        Ok(value) => {
+            let cap = value.parse::<usize>().map_err(|_| AnnError::log_index_error("Invalid partition host budget".into()))?;
+            let layout = if super::uses_hashprune_candidate_backend(params) {
+                super::ResidentReservoirLayout::from_env()?
+            } else { super::ResidentReservoirLayout::Legacy };
+            let plan = super::OomMemoryPlan::from_params_for_dataset_with_reservoir_layout(
+                params, dataset.len(), dim, layout);
+            let remaining = total_budget.saturating_sub(plan.d1plus_working_set_budget_bytes)
+                .saturating_sub(params.effective_gpu_workspace_budget_bytes());
+            if cap > remaining {
+                return Err(AnnError::log_index_error(format!("Partition host cap {cap} leaves insufficient room for resident graph/sketch and staging; maximum {remaining}")));
+            }
+            cap
+        }
+        Err(err) => return Err(AnnError::log_index_error(format!("Invalid partition host budget: {err}"))),
+    };
+    if required > host_cap {
+        return Err(AnnError::log_index_error(format!("Partition codes need {required} host bytes, exceeding cap {host_cap}")));
+    }
+    tracing::info!("SQ4 partition host admission: required_bytes={} cap_bytes={} total_budget_bytes={}", required, host_cap, total_budget);
+    let rotation = FhtKacRotationPlan::new(dim, params.random_seed)?;
+    if let Some(sketch) = fused_sketch {
+        if sketch.gpu.is_some() || !matches!(mode, "gpu-encode" | "gpu-exact") {
+            return Err(AnnError::log_index_error("Partition fused sketch requires GPU encoding and CPU sketch".into()));
+        }
+        let start = Instant::now();
+        let (clusters, chunks, compute, waited, profile) = sq4_gpu_chunks_and_sketch(
+            dataset, indices, centers, None, topk, &rotation,
+            &sketch.hyperplanes, sketch.width, &mut sketch.data, params.gpu_device_id,
+            params.effective_gpu_workspace_budget_bytes(), mode == "gpu-exact", mode == "gpu-exact", true,
+        )?;
+        sketch.worker_wall_sum += compute;
+        sketch.join_wait_wall += waited;
+        let child_centers = clusters.iter().enumerate().filter(|(_,v)| !v.is_empty()).map(|(i,_)|i).collect();
+        let table = PartitionCodes::new(chunks, indices, dataset.len(), TAGORE_D0_ASSIGN_CHUNK_POINTS,
+            topk, dim, padded, child_centers)?;
+        tracing::info!("SQ4 partition D0: mode={} rows={} memberships={} host_table_bytes={} raw_read_bytes={} fused_cpu_sketch=true sketch_cpu_rows={} sketch_ms={:.3} sketch_join_wait_ms={:.3} cpu_assign_ms=0 cpu_encode_ms=0 wall_ms={:.3} profile={:?}",
+            mode, indices.len(), indices.len()*topk, required, indices.len()*dim*4, indices.len(),
+            compute.as_secs_f64()*1000.0, waited.as_secs_f64()*1000.0, start.elapsed().as_secs_f64()*1000.0, profile);
+        return Ok((clusters, table));
+    }
+    let norms = tagore_d0_center_norms(centers,dim);
+    let budget = params.effective_gpu_workspace_budget_bytes();
+    let mut gpu = if mode != "cpu" {
+        let mut g = super::sq4_gpu_d0::GpuPrimaryD0::new(params.gpu_device_id,dim,padded,
+            TAGORE_D0_ASSIGN_CHUNK_POINTS,centers,&norms,topk,&rotation,budget)?;
+        if mode == "gpu-exact" { g.enable_exact_assignment(centers,budget)?; }
+        g.enable_partition_encoding(budget)?; Some(g)
+    } else { None };
+    let options = default_rbc_windowed_options(dataset,TAGORE_D0_ASSIGN_CHUNK_POINTS);
+    let mut clusters = (0..partitions).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut read_wall = Duration::ZERO; let mut cpu_assign = Duration::ZERO; let mut cpu_encode = Duration::ZERO;
+    let start = Instant::now();
+    // Same ordered batches for the CPU control and both GPU variants.
+    for ids in indices.chunks(TAGORE_D0_ASSIGN_CHUNK_POINTS) {
+        let timer=Instant::now();
+        let mut raw=vec![0.0;ids.len()*dim];
+        dataset.read_points_windowed_into_batch_stats(ids,&mut raw,&options,&mut PointBatchStats::default())?;
+        read_wall += timer.elapsed();
+        let mut reference = || {
+            let timer=Instant::now();
+            let assigned=assign_dense_rows_to_precomputed_centers(&raw,ids.len(),dim,centers,&norms,topk)
+                .clusters.into_iter().map(|id|id as u32).collect::<Vec<_>>();
+            cpu_assign += timer.elapsed(); Ok(assigned)
+        };
+        let (selected, chunk) = if let Some(g) = gpu.as_mut() {
+            g.stage(&raw,mode == "gpu-exact",reference)?
+        } else {
+            let selected=reference()?; let timer=Instant::now();
+            let chunk=PrimaryChunk::encode_memberships(&raw,dim,padded,centers,&selected,topk,&rotation)?;
+            cpu_encode += timer.elapsed(); (selected,chunk)
+        };
+        for (row, assigned) in selected.chunks_exact(topk).enumerate() {
+            for &c in assigned { clusters[c as usize].push(ids[row]); }
+        }
+        chunks.push(chunk);
+    }
+    let child_centers=clusters.iter().enumerate().filter(|(_,v)|!v.is_empty()).map(|(i,_)|i).collect();
+    let table=PartitionCodes::new(chunks,indices,dataset.len(),TAGORE_D0_ASSIGN_CHUNK_POINTS,topk,dim,padded,child_centers)?;
+    tracing::info!("SQ4 partition D0: mode={} rows={} memberships={} host_table_bytes={} raw_read_bytes={} read_ms={:.3} cpu_assign_ms={:.3} cpu_encode_ms={:.3} wall_ms={:.3} profile={:?}",
+        mode,indices.len(),indices.len()*topk,required,indices.len()*dim*4,read_wall.as_secs_f64()*1000.0,
+        cpu_assign.as_secs_f64()*1000.0,cpu_encode.as_secs_f64()*1000.0,start.elapsed().as_secs_f64()*1000.0,
+        gpu.as_ref().map(|g|&g.profile));
+    Ok((clusters,table))
 }
 
 fn tagore_d0_center_norms(centers: &[f32], dim: usize) -> Vec<f32> {
@@ -9467,8 +10173,39 @@ fn dense_sq_gathered_codes(gathered: &SqWmmaGatheredInput) -> AnnResult<Vec<i8>>
     }
 }
 
+enum SqAdmissionCodes<'a> {
+    Global(&'a SqWmmaSidecar),
+    Primary(&'a PrimaryCodes),
+    PartitionTable(&'a PartitionCodes, usize),
+    PartitionResidual { dataset: &'a dyn PointStore, center: &'a [f32], seed: u64 },
+}
+
+impl SqAdmissionCodes<'_> {
+    fn gather(&self, ids: &[u32]) -> AnnResult<SqWmmaGatheredInput> {
+        match self {
+            Self::Global(sidecar) => sidecar.gather(ids),
+            Self::Primary(table) => table.gather(ids),
+            Self::PartitionTable(table, child) => table.gather(*child, ids),
+            Self::PartitionResidual { dataset, center, seed } =>
+                gather_sq4_plus_residuals(*dataset, ids, center, *seed),
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        match self {
+            Self::PartitionResidual { .. } => "sq4-partition-residual",
+            Self::Primary(_) => "sq4-primary-residual",
+            Self::PartitionTable(..) => "sq4-partition-resident",
+            Self::Global(s) if s.is_fully_resident() => "sq-resident",
+            Self::Global(s) if s.is_resident() && s.uses_direct_io() => "sq-partial-direct",
+            Self::Global(s) if s.uses_direct_io() => "sq-direct",
+            Self::Global(_) => "sq-file",
+        }
+    }
+}
+
 fn split_unique_points_once_by_sq_sidecar_with_points(
-    sidecar: &SqWmmaSidecar,
+    sidecar: &SqAdmissionCodes<'_>,
     params: &PiPNNParams,
     points: &[u32],
     split_count: usize,
@@ -9517,13 +10254,27 @@ fn split_unique_points_once_by_sq_sidecar_with_points(
                         kernel,
                         Some(leader_code_sums[leader_idx]),
                     ) as f32;
-                    let dist = sq_int8_approx_l2_from_dot(
-                        gathered.scales[row],
-                        gathered.norms[row],
-                        leader_gathered.scales[leader_idx],
-                        leader_gathered.norms[leader_idx],
-                        dot,
-                    );
+                    let dist = if let (Some(centers), Some(ids), Some(leader_centers)) = (
+                        gathered.rotated_centers.as_deref(), gathered.rotated_center_ids.as_deref(),
+                        leader_gathered.rotated_center_ids.as_deref(),
+                    ) {
+                        let dim = gathered.dim;
+                        let a = ids[row] as usize * dim;
+                        let b = leader_centers[leader_idx] as usize * dim;
+                        let sa = gathered.scales[row];
+                        let sb = leader_gathered.scales[leader_idx];
+                        let mut d = gathered.norms[row] + leader_gathered.norms[leader_idx] - 2.0 * sa * sb * dot;
+                        if a != b {
+                            for i in 0..dim {
+                                let dc = centers[a + i] - centers[b + i];
+                                d += dc * (dc + 2.0 * (sa * f32::from(point_code[i]) - sb * f32::from(leader_code[i])));
+                            }
+                        }
+                        d.max(0.0)
+                    } else {
+                        sq_int8_approx_l2_from_dot(gathered.scales[row], gathered.norms[row],
+                            leader_gathered.scales[leader_idx], leader_gathered.norms[leader_idx], dot)
+                    };
                     if dist + super::STABLE_DISTANCE_TIE_EPS < best_dist {
                         best_dist = dist;
                         tied_leaders.clear();
@@ -10209,9 +10960,12 @@ fn gpu_subtree_rabitq_plus_sidecar_build_enabled(params: &PiPNNParams) -> bool {
 
 fn gpu_subtree_sq_wmma_sidecar_build_enabled(params: &PiPNNParams) -> bool {
     params.gpu_subtree_sq_wmma_mode == PiPNNGpuSubtreeSqWmmaMode::Build
-        && params.gpu_subtree_sq_wmma_sidecar_mode.is_enabled()
-        && params.gpu_subtree_sq_wmma_sidecar_mode != PiPNNGpuSubtreeSqWmmaSidecarMode::CreateOnly
-        && params.gpu_subtree_sq_wmma_sidecar_prefix.is_some()
+        && (params.gpu_subtree_sq4_plus
+            || params.gpu_subtree_sq8_rotated_residual_d1
+            || (params.gpu_subtree_sq_wmma_sidecar_mode.is_enabled()
+                && params.gpu_subtree_sq_wmma_sidecar_mode
+                    != PiPNNGpuSubtreeSqWmmaSidecarMode::CreateOnly
+                && params.gpu_subtree_sq_wmma_sidecar_prefix.is_some()))
 }
 
 fn gpu_subtree_turboquant_sidecar_build_enabled(params: &PiPNNParams) -> bool {
@@ -11774,12 +12528,22 @@ fn run_gpu_subtree_d1plus_pipeline_with_context(
         .gpu_subtree_vector_staging_mode
         .records_repeat_profile();
     let mut repeat_estimator = D1PlusRepeatEstimator::new(d0_plan.total_points);
-    let async_result_scatter_config = async_result_scatter_config_from_env();
+    let mut async_result_scatter_config = async_result_scatter_config_from_env();
+    if params.gpu_subtree_sq8_rotated_residual_d1_int8 {
+        async_result_scatter_config.enabled = false;
+    }
     let use_sq_wmma_sidecar_preload =
         gpu_subtree_sq_wmma_sidecar_preload_enabled(params, d0_plan, dataset.dim());
     let preload_config = use_sq_wmma_sidecar_preload
         .then(|| sq_wmma_sidecar_preload_config(params, d0_plan, dataset.dim(), runtime_context))
         .filter(|config| config.worker_count > 0);
+    let stream_primary_gather = if params.gpu_subtree_sq4_primary_center && d0_plan.sq4_primary.is_some() {
+        match std::env::var("SHEAR_PIPNN_SQ4_STREAM_GATHER").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("1") => true,
+            Ok("0") => false,
+            other => return Err(AnnError::log_index_error(format!("Invalid SQ4 stream gather setting: {other:?}"))),
+        }
+    } else { false };
     let mut async_result_scatter = start_async_result_scatter_if_enabled::<PendingSqWmmaChild>(
         &async_result_scatter_config,
         preload_config.is_some(),
@@ -11890,11 +12654,12 @@ fn run_gpu_subtree_d1plus_pipeline_with_context(
                 .gpu_subtree_sidecar_preload_workers
                 .max(preload_config.worker_count);
             tracing::info!(
-                "gpu-subtree D1+ SQ sidecar preload start: workers={} queue_capacity={} budget_bytes={} estimated_child_bytes={}",
+                "gpu-subtree D1+ SQ sidecar preload start: workers={} queue_capacity={} budget_bytes={} estimated_child_bytes={} per_subtree_gather={}",
                 preload_config.worker_count,
                 preload_config.queue_capacity,
                 preload_config.budget_bytes,
                 preload_config.estimated_child_bytes,
+                stream_primary_gather,
             );
 
             let (preload_tx, preload_rx) =
@@ -11906,6 +12671,11 @@ fn run_gpu_subtree_d1plus_pipeline_with_context(
                 let rx = Arc::clone(&rx);
                 let stop_for_preload = Arc::clone(&stop_replay);
                 preload_workers.push(scope.spawn(move || {
+                    // The single producer preserves the existing split/task order.
+                    // Streamed deliveries get consecutive sequence numbers even when
+                    // one input D0 child produces several admitted GPU subtrees.
+                    debug_assert!(!stream_primary_gather || preload_config.worker_count == 1);
+                    let mut delivery_seq = 0usize;
                     loop {
                         if stop_for_preload.load(Ordering::Relaxed) {
                             break;
@@ -11917,6 +12687,29 @@ fn run_gpu_subtree_d1plus_pipeline_with_context(
                         let Ok(sequenced) = sequenced else {
                             break;
                         };
+                        if stream_primary_gather {
+                            let result = sequenced.result.and_then(|task| {
+                                stream_gpu_subtree_d1plus_sq_wmma_sidecar_children(
+                                    dataset, params, d0_plan, runtime_context, task,
+                                    |batch| {
+                                        preload_tx.send(SequencedSqWmmaPreloadResult {
+                                            seq: delivery_seq, result: Ok(batch),
+                                        }).map_err(|_| AnnError::log_index_error(
+                                            "SQ4 gather consumer disconnected".into()))?;
+                                        delivery_seq += 1;
+                                        Ok(())
+                                    },
+                                )
+                            });
+                            if let Err(err) = result {
+                                let _ = preload_tx.send(SequencedSqWmmaPreloadResult {
+                                    seq: delivery_seq, result: Err(err),
+                                });
+                                stop_for_preload.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            continue;
+                        }
                         let seq = sequenced.seq;
                         let preload_result = match sequenced.result {
                             Ok(task) => preload_gpu_subtree_d1plus_sq_wmma_sidecar_child_batch(
@@ -12841,6 +13634,9 @@ fn gpu_subtree_sq_wmma_sidecar_preload_enabled(
     d0_plan: &GpuSubtreeD0Plan,
     dim: usize,
 ) -> bool {
+    if params.gpu_subtree_sq8_rotated_residual_d1 {
+        return false;
+    }
     if !gpu_subtree_sq_wmma_sidecar_build_enabled(params) {
         return false;
     }
@@ -13141,7 +13937,8 @@ fn split_gpu_subtree_d1plus_task_by_sampled_leaders_for_admission(
 }
 
 fn split_gpu_subtree_d1plus_sq_task_by_sampled_leaders_for_admission(
-    sidecar: &SqWmmaSidecar,
+    sidecar: &SqAdmissionCodes<'_>,
+    dim: usize,
     params: &PiPNNParams,
     child_idx: usize,
     seed: u64,
@@ -13152,15 +13949,7 @@ fn split_gpu_subtree_d1plus_sq_task_by_sampled_leaders_for_admission(
     split_depth: usize,
 ) -> AnnResult<Vec<GpuSubtreeD1ChildTask>> {
     let split_wall_start = Instant::now();
-    telemetry.gpu_subtree_d1plus_lazy_split_source = if sidecar.is_fully_resident() {
-        "sq-resident"
-    } else if sidecar.is_resident() && sidecar.uses_direct_io() {
-        "sq-partial-direct"
-    } else if sidecar.uses_direct_io() {
-        "sq-direct"
-    } else {
-        "sq-file"
-    };
+    telemetry.gpu_subtree_d1plus_lazy_split_source = sidecar.source();
     points.sort_unstable();
     points.dedup();
     let initial_run = GpuSubtreeChildRun {
@@ -13173,7 +13962,8 @@ fn split_gpu_subtree_d1plus_sq_task_by_sampled_leaders_for_admission(
     let split_limit = d0_capacity_config_from_params(params).split_recursion_limit;
 
     while let Some((points, child_run, depth)) = queue.pop_front() {
-        if points.len() <= thresholds.c_high {
+        if points.len() <= thresholds.c_high
+            && d1_admission_preflight(points.len(), dim, params, d1plus_admission_ratio(params)).supported {
             tasks.push(GpuSubtreeD1ChildTask {
                 child_idx,
                 child_run,
@@ -13193,7 +13983,7 @@ fn split_gpu_subtree_d1plus_sq_task_by_sampled_leaders_for_admission(
                 thresholds.c_high
             )));
         }
-        let split_count = split_leader_count(points.len(), thresholds);
+        let split_count = split_leader_count(points.len(), thresholds).max(2);
         let split_runs = split_unique_points_once_by_sq_sidecar_with_points(
             sidecar,
             params,
@@ -13673,6 +14463,8 @@ fn process_gpu_subtree_d1plus_quantized_sidecar_child(
         memory_budget_bytes: d1plus_transient_memory_budget_bytes(params, runtime_context),
     };
     let quantized = GpuSubtreeQuantizedInput {
+        rotated_center_ids: None,
+        rotated_centers: None,
         distance_kind: GpuSubtreeQuantizedDistanceKind::RabitqPlus,
         global_ids: &gathered.global_ids,
         codes: &gathered.codes,
@@ -14166,6 +14958,12 @@ fn estimate_sq_wmma_gathered_bytes(gathered: &SqWmmaGatheredInput) -> usize {
         .saturating_add(gathered.scales.len().saturating_mul(size_of::<f32>()))
         .saturating_add(gathered.norms.len().saturating_mul(size_of::<f32>()))
         .saturating_add(gathered.code_sums.len().saturating_mul(size_of::<f32>()))
+        .saturating_add(
+            gathered
+                .reconstructed_vectors
+                .as_ref()
+                .map_or(0, |vectors| vectors.len().saturating_mul(size_of::<f32>())),
+        )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14249,6 +15047,9 @@ fn gather_gpu_subtree_d1plus_sq_shard_local_child(
         file_rows: 0,
         resident_gather_wall: Duration::ZERO,
         file_gather_wall: Duration::ZERO,
+        reconstructed_vectors: None,
+        rotated_center_ids: None,
+        rotated_centers: None,
     };
     Ok(GpuSubtreeD1SqWmmaGatheredTask {
         task: GpuSubtreeD1ChildTask {
@@ -14369,6 +15170,9 @@ fn gather_gpu_subtree_d1plus_sq_cluster_batch_child(
         file_rows: 0,
         resident_gather_wall: Duration::ZERO,
         file_gather_wall: Duration::ZERO,
+        reconstructed_vectors: None,
+        rotated_center_ids: None,
+        rotated_centers: None,
     };
     Ok(GpuSubtreeD1SqWmmaGatheredTask {
         task: GpuSubtreeD1ChildTask {
@@ -14474,6 +15278,89 @@ fn run_gpu_subtree_sq_cluster_batch_d1plus_producer(
     Ok(())
 }
 
+fn sq4_plus_partition_center(plan: &GpuSubtreeD0Plan, dim: usize, child: usize) -> AnnResult<&[f32]> {
+    plan.sq4_plus_centers.chunks_exact(dim).nth(child)
+        .ok_or_else(|| AnnError::log_index_error("Missing SQ4+ D0 cluster center".to_string()))
+}
+
+/// The same center cancels in every pairwise L2 inside this subtree. A point
+/// assigned to multiple D0 clusters receives a separate code in each one.
+fn gather_sq4_plus_residuals(
+    dataset: &dyn PointStore,
+    ids: &[u32],
+    center: &[f32],
+    seed: u64,
+) -> AnnResult<SqWmmaGatheredInput> {
+    use super::dco_rabitq::FhtKacRotationPlan;
+    use super::dco_sq_int8::{pack_sq_s4_codes, quantize_sq_int8_row_with_bits};
+    let start = Instant::now();
+    let dim = dataset.dim();
+    let plan = FhtKacRotationPlan::new(dim, seed)?;
+    let padded_dim = sq_int8_padded_dim(dim, SQ_INT8_DEFAULT_K_ALIGN)?;
+    let row_bytes = padded_dim / 2;
+    let mut codes = Vec::with_capacity(ids.len() * row_bytes);
+    let mut norms = vec![0.0; ids.len()];
+    let mut scales = vec![0.0; ids.len()];
+    let mut read_wall = Duration::ZERO;
+    let mut transform_wall = Duration::ZERO;
+    let mut pack_wall = Duration::ZERO;
+    for (chunk_index, chunk) in ids.chunks(TAGORE_D0_ASSIGN_CHUNK_POINTS).enumerate() {
+        let offset = chunk_index * TAGORE_D0_ASSIGN_CHUNK_POINTS;
+        let end = offset + chunk.len();
+        let timer = Instant::now();
+        let mut raw = read_point_ids_dense(dataset, chunk)?;
+        read_wall += timer.elapsed();
+        let timer = Instant::now();
+        let mut dense_codes = vec![0; chunk.len() * padded_dim];
+        raw.par_chunks_exact_mut(dim)
+            .zip(dense_codes.par_chunks_exact_mut(padded_dim))
+            .zip(scales[offset..end].par_iter_mut())
+            .zip(norms[offset..end].par_iter_mut())
+            .try_for_each_init(
+                || vec![0.0; dim],
+                |rotated, (((point, dense), scale), norm)| -> AnnResult<()> {
+                    for (x, mean) in point.iter_mut().zip(center) {
+                        *x -= mean;
+                    }
+                    plan.rotate_row(point, rotated)?;
+                    (*scale, *norm) = quantize_sq_int8_row_with_bits(rotated, dense, 4)?;
+                    if !norm.is_finite() || *scale <= 0.0 {
+                        return Err(AnnError::log_index_error("SQ4+ residual exceeds FP32 range".to_string()));
+                    }
+                    Ok(())
+                },
+            )?;
+        transform_wall += timer.elapsed();
+        let timer = Instant::now();
+        codes.extend_from_slice(&pack_sq_s4_codes(&dense_codes, chunk.len(), padded_dim)?);
+        pack_wall += timer.elapsed();
+    }
+    tracing::info!("SQ4+ encode detail: rows={} read_us={} transform_quantize_us={} pack_us={}",
+        ids.len(), read_wall.as_micros(), transform_wall.as_micros(), pack_wall.as_micros());
+
+    Ok(SqWmmaGatheredInput {
+        global_ids: ids.to_vec(),
+        codes,
+        scales,
+        norms,
+        code_sums: vec![0.0; ids.len()],
+        dim,
+        padded_dim,
+        bits: 4,
+        code_layout: SqWmmaCodeLayout::PackedS4,
+        code_row_bytes: row_bytes,
+        gather_wall: start.elapsed(),
+        resident_source: false,
+        resident_rows: 0,
+        file_rows: 0,
+        resident_gather_wall: Duration::ZERO,
+        file_gather_wall: Duration::ZERO,
+        reconstructed_vectors: None,
+        rotated_center_ids: None,
+        rotated_centers: None,
+    })
+}
+
 fn gather_gpu_subtree_d1plus_sq_wmma_sidecar_child(
     dataset: &dyn PointStore,
     params: &PiPNNParams,
@@ -14505,6 +15392,49 @@ fn gather_gpu_subtree_d1plus_sq_wmma_sidecar_child(
     let normalize_start = Instant::now();
     let global_ids = sort_dedup_points(&task.points);
     let host_normalize_wall = normalize_start.elapsed();
+    if let Some(table) = &d0_plan.sq4_partition_codes {
+        let gathered = table.gather(task.child_idx, &global_ids)?;
+        return Ok(GpuSubtreeD1SqWmmaGatheredTask {task, global_ids, host_normalize_wall, gathered});
+    }
+    if let Some(primary) = &d0_plan.sq4_primary {
+        let gathered = primary.gather(&global_ids)?;
+        return Ok(GpuSubtreeD1SqWmmaGatheredTask { task, global_ids, host_normalize_wall, gathered });
+    }
+    if params.gpu_subtree_sq4_plus {
+        let center = sq4_plus_partition_center(d0_plan, dataset.dim(), task.child_idx)?;
+        let gathered = gather_sq4_plus_residuals(dataset, &global_ids, center, params.random_seed)?;
+        tracing::info!(
+            "SQ4+ rotated residuals: child={} rows={} seed={} packed_bytes={} encode_ms={}",
+            task.child_idx, global_ids.len(), params.random_seed, gathered.codes.len(),
+            gathered.gather_wall.as_millis(),
+        );
+        return Ok(GpuSubtreeD1SqWmmaGatheredTask {
+            task,
+            global_ids,
+            host_normalize_wall,
+            gathered,
+        });
+    }
+    if params.gpu_subtree_sq8_rotated_residual_d1 {
+        let sidecar = runtime_context
+            .rotated_residual_sq8_sidecar
+            .ok_or_else(|| {
+                AnnError::log_index_error(
+                    "Rotated residual SQ8 sidecar is missing from D1+ runtime".to_string(),
+                )
+            })?;
+        let gathered = if params.gpu_subtree_sq8_rotated_residual_d1_int8 {
+            sidecar.gather_quantized(&global_ids)?
+        } else {
+            sidecar.gather_reconstructed(&global_ids)?
+        };
+        return Ok(GpuSubtreeD1SqWmmaGatheredTask {
+            task,
+            global_ids,
+            host_normalize_wall,
+            gathered,
+        });
+    }
     let file_sidecar;
     let sidecar = if let Some(sidecar) = runtime_context.sq_wmma_sidecar {
         sidecar
@@ -14575,13 +15505,90 @@ fn preload_gpu_subtree_d1plus_sq_wmma_sidecar_child(
     })
 }
 
+// Capacity-only admission: no encoded vectors or distances are accessed here.
+fn split_sq4_task_by_balanced_ids_for_admission(
+    task: GpuSubtreeD1ChildTask,
+    dim: usize,
+    params: &PiPNNParams,
+    cap: usize,
+    telemetry: &mut RbcPartitionTelemetry,
+) -> AnnResult<Vec<GpuSubtreeD1ChildTask>> {
+    let start = Instant::now();
+    let replay_wall = task.replay_wall;
+    let mut queue = VecDeque::from([task]);
+    let mut ready = Vec::new();
+    let ratio = d1plus_admission_ratio(params);
+    while let Some(task) = queue.pop_front() {
+        let n = task.points.len();
+        if n <= cap && d1_admission_preflight(n, dim, params, ratio).supported {
+            ready.push(task);
+            continue;
+        }
+        if n <= 1 || task.split_depth >= D1PLUS_ADMISSION_SPLIT_DEPTH_LIMIT {
+            return Err(AnnError::log_index_error(format!(
+                "SQ4 balanced admission cannot fit batch: rows={n} cap={cap} depth={}", task.split_depth)));
+        }
+        let (left, right) = split_gpu_subtree_d1plus_task(task)?;
+        record_d1plus_preflight_split(telemetry, n, left.points.len().max(right.points.len()));
+        queue.push_back(left);
+        queue.push_back(right);
+    }
+    // The existing half-split helper clears replay time on both children.
+    // Charge the original replay exactly once, including the no-split case.
+    for task in &mut ready { task.replay_wall = Duration::ZERO; }
+    if let Some(first) = ready.first_mut() { first.replay_wall = replay_wall; }
+    telemetry.gpu_subtree_d1plus_lazy_split_source = "balanced-ids";
+    telemetry.gpu_subtree_d1plus_lazy_split_wall += start.elapsed();
+    Ok(ready)
+}
+
 fn preload_gpu_subtree_d1plus_sq_wmma_sidecar_child_batch(
     dataset: &dyn PointStore,
     params: &PiPNNParams,
     d0_plan: &GpuSubtreeD0Plan,
     runtime_context: GpuSubtreeRuntimeContext<'_>,
-    mut task: GpuSubtreeD1ChildTask,
+    task: GpuSubtreeD1ChildTask,
 ) -> AnnResult<GpuSubtreeD1SqWmmaPreloadBatch> {
+    let (tasks, split_telemetry) = prepare_gpu_subtree_d1plus_sq_wmma_sidecar_children(
+        dataset, params, d0_plan, runtime_context, task,
+    )?;
+    let tasks = tasks.into_iter().map(|task| {
+        preload_gpu_subtree_d1plus_sq_wmma_sidecar_child(dataset, params, d0_plan, runtime_context, task)
+    }).collect::<AnnResult<Vec<_>>>()?;
+    Ok(GpuSubtreeD1SqWmmaPreloadBatch { tasks, split_telemetry })
+}
+
+fn stream_gpu_subtree_d1plus_sq_wmma_sidecar_children(
+    dataset: &dyn PointStore,
+    params: &PiPNNParams,
+    d0_plan: &GpuSubtreeD0Plan,
+    runtime_context: GpuSubtreeRuntimeContext<'_>,
+    task: GpuSubtreeD1ChildTask,
+    mut publish: impl FnMut(GpuSubtreeD1SqWmmaPreloadBatch) -> AnnResult<()>,
+) -> AnnResult<()> {
+    // Finish exactly the same split before gathering; this only changes delivery.
+    let (tasks, mut split_telemetry) = prepare_gpu_subtree_d1plus_sq_wmma_sidecar_children(
+        dataset, params, d0_plan, runtime_context, task,
+    )?;
+    for task in tasks {
+        let preloaded = preload_gpu_subtree_d1plus_sq_wmma_sidecar_child(
+            dataset, params, d0_plan, runtime_context, task,
+        )?;
+        publish(GpuSubtreeD1SqWmmaPreloadBatch {
+            tasks: vec![preloaded],
+            split_telemetry: std::mem::take(&mut split_telemetry),
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_gpu_subtree_d1plus_sq_wmma_sidecar_children(
+    dataset: &dyn PointStore,
+    params: &PiPNNParams,
+    d0_plan: &GpuSubtreeD0Plan,
+    runtime_context: GpuSubtreeRuntimeContext<'_>,
+    mut task: GpuSubtreeD1ChildTask,
+) -> AnnResult<(Vec<GpuSubtreeD1ChildTask>, RbcPartitionTelemetry)> {
     let mut split_telemetry = RbcPartitionTelemetry::default();
     let before = task.points.len();
     let dedup_start = Instant::now();
@@ -14598,13 +15605,28 @@ fn preload_gpu_subtree_d1plus_sq_wmma_sidecar_child_batch(
         );
     }
 
-    let mut tasks = Vec::new();
     if let Some(thresholds) = d1plus_lazy_admission_thresholds(params, d0_plan) {
         let admission_ratio = d1plus_admission_ratio(params);
         let preflight =
             d1_admission_preflight(task.points.len(), dataset.dim(), params, admission_ratio);
         let should_split = task.points.len() > thresholds.c_high || !preflight.supported;
         if should_split && task.points.len() > 1 {
+            if params.gpu_subtree_sq4_plus && d0_plan.sq4_primary.is_some()
+                && std::env::var("SHEAR_PIPNN_SQ4_D1_BALANCED").as_deref() == Ok("1")
+            {
+                let rows = task.points.len();
+                let child_idx = task.child_idx;
+                let split_tasks = split_sq4_task_by_balanced_ids_for_admission(
+                    task, dataset.dim(), params, thresholds.c_high, &mut split_telemetry,
+                )?;
+                tracing::info!("SQ4 balanced ID admission: child={} rows={} batches={} output_rows={} max_rows={} cpu_distance_rows=0 prepartition_h2d_bytes=0 split_ms={}",
+                    child_idx, rows, split_tasks.len(),
+                    split_tasks.iter().map(|t| t.points.len()).sum::<usize>(),
+                    split_tasks.iter().map(|t| t.points.len()).max().unwrap_or(0),
+                    split_telemetry.gpu_subtree_d1plus_lazy_split_wall.as_secs_f64()*1000.0);
+                return Ok((split_tasks, split_telemetry));
+            }
+
             if task.split_depth >= D1PLUS_ADMISSION_SPLIT_DEPTH_LIMIT {
                 return Err(AnnError::log_index_error(format!(
                     "gpu-subtree D1+ sidecar preload child {} exceeded lazy admission split depth: rows={} depth={} c_high={} admission_supported={} required_bytes={} budget_bytes={}",
@@ -14621,8 +15643,18 @@ fn preload_gpu_subtree_d1plus_sq_wmma_sidecar_child_batch(
             let mut split_store =
                 ExternalRunStore::new(&d0_plan.external_child_dir, d0_plan.io_cfg);
             let file_sidecar;
-            let sidecar = if let Some(sidecar) = runtime_context.sq_wmma_sidecar {
-                sidecar
+            let sidecar = if let Some(table) = &d0_plan.sq4_partition_codes {
+                SqAdmissionCodes::PartitionTable(table, task.child_idx)
+            } else if let Some(primary) = &d0_plan.sq4_primary {
+                SqAdmissionCodes::Primary(primary)
+            } else if params.gpu_subtree_sq4_plus {
+                SqAdmissionCodes::PartitionResidual {
+                    dataset,
+                    center: sq4_plus_partition_center(d0_plan, dataset.dim(), task.child_idx)?,
+                    seed: params.random_seed,
+                }
+            } else if let Some(sidecar) = runtime_context.sq_wmma_sidecar {
+                SqAdmissionCodes::Global(sidecar)
             } else {
                 let prefix = params
                     .gpu_subtree_sq_wmma_sidecar_prefix
@@ -14643,11 +15675,12 @@ fn preload_gpu_subtree_d1plus_sq_wmma_sidecar_child_batch(
                         DirectIoConfig::disabled()
                     },
                 )?;
-                &file_sidecar
+                SqAdmissionCodes::Global(&file_sidecar)
             };
             let mut split_tasks =
                 split_gpu_subtree_d1plus_sq_task_by_sampled_leaders_for_admission(
-                    sidecar,
+                    &sidecar,
+                    dataset.dim(),
                     params,
                     task.child_idx,
                     task.child_run.seed,
@@ -14661,33 +15694,11 @@ fn preload_gpu_subtree_d1plus_sq_wmma_sidecar_child_batch(
             if let Some(first_task) = split_tasks.first_mut() {
                 first_task.replay_wall += replay_wall;
             }
-            for split_task in split_tasks {
-                tasks.push(preload_gpu_subtree_d1plus_sq_wmma_sidecar_child(
-                    dataset,
-                    params,
-                    d0_plan,
-                    runtime_context,
-                    split_task,
-                )?);
-            }
-            return Ok(GpuSubtreeD1SqWmmaPreloadBatch {
-                tasks,
-                split_telemetry,
-            });
+            return Ok((split_tasks, split_telemetry));
         }
     }
 
-    tasks.push(preload_gpu_subtree_d1plus_sq_wmma_sidecar_child(
-        dataset,
-        params,
-        d0_plan,
-        runtime_context,
-        task,
-    )?);
-    Ok(GpuSubtreeD1SqWmmaPreloadBatch {
-        tasks,
-        split_telemetry,
-    })
+    Ok((vec![task], split_telemetry))
 }
 
 fn preload_result_bytes(result: &SequencedSqWmmaPreloadResult) -> usize {
@@ -15022,7 +16033,11 @@ fn submit_gpu_subtree_d1plus_sq_wmma_gathered_sidecar_child(
         rows: unique_len,
         codes_bytes: gathered.codes.len(),
         meta_bytes: unique_len
-            .saturating_mul(2)
+            .saturating_mul(if gathered.rotated_center_ids.is_some() || params.gpu_subtree_sq8_rotated_residual_d1 {
+                3
+            } else {
+                2
+            })
             .saturating_mul(size_of::<f32>()),
         gather_wall: gathered.gather_wall,
         resident: gathered.resident_rows > 0,
@@ -15034,9 +16049,18 @@ fn submit_gpu_subtree_d1plus_sq_wmma_gathered_sidecar_child(
     enum SqWmmaBackendInput<'a> {
         Borrowed(GpuSubtreeQuantizedInput<'a>),
         Owned(OwnedGpuSubtreeQuantizedInput),
+        Reconstructed(GpuSubtreeMaterializedInput<'a>),
     }
-    let input = if deferred_enabled {
+    let input = if let Some(vectors) = gathered.reconstructed_vectors.as_ref() {
+        SqWmmaBackendInput::Reconstructed(GpuSubtreeMaterializedInput {
+            global_ids: &gathered.global_ids,
+            vectors_row_major: vectors,
+            norms: &gathered.norms,
+            dim: gathered.dim,
+        })
+    } else if deferred_enabled {
         SqWmmaBackendInput::Owned(OwnedGpuSubtreeQuantizedInput {
+            rotated: gathered.rotated_center_ids.zip(gathered.rotated_centers).map(|(ids, centers)| (Arc::new(ids), Arc::new(centers))),
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: Arc::new(gathered.global_ids),
             codes: Arc::new(gathered.codes),
@@ -15051,6 +16075,8 @@ fn submit_gpu_subtree_d1plus_sq_wmma_gathered_sidecar_child(
         })
     } else {
         SqWmmaBackendInput::Borrowed(GpuSubtreeQuantizedInput {
+            rotated_center_ids: gathered.rotated_center_ids.as_deref(),
+            rotated_centers: gathered.rotated_centers.as_deref(),
             distance_kind: GpuSubtreeQuantizedDistanceKind::SqInt8,
             global_ids: &gathered.global_ids,
             codes: &gathered.codes,
@@ -15066,6 +16092,15 @@ fn submit_gpu_subtree_d1plus_sq_wmma_gathered_sidecar_child(
     };
     let backend_start = Instant::now();
     let mut retry_params = params.clone();
+    if params.gpu_subtree_sq8_rotated_residual_d1_int8 {
+        retry_params.gpu_subtree_sq8_assignment_kernel =
+            super::params::PiPNNGpuSubtreeSq8AssignmentKernel::WarpDp4a;
+        retry_params.gpu_subtree_sq8_leaf_executor =
+            super::params::PiPNNGpuSubtreeSq8LeafExecutor::WarpDp4a;
+        retry_params.gpu_subtree_sq8_leaf_mode = super::params::PiPNNGpuSubtreeSq8LeafMode::Staged;
+        retry_params.gpu_subtree_execution_mode =
+            super::params::PiPNNGpuSubtreeExecutionMode::FusedPersistent;
+    }
     if deferred_enabled {
         // Deferred overflow is observed only after submission, when replay is unsafe.
         retry_params.max_depth = retry_params
@@ -15075,6 +16110,17 @@ fn submit_gpu_subtree_d1plus_sq_wmma_gathered_sidecar_child(
     let mut terminal_depth_retries = 0usize;
     let submission = loop {
         let attempt = match &input {
+            SqWmmaBackendInput::Reconstructed(materialized) => {
+                let mut fp32_params = retry_params.clone();
+                fp32_params.gpu_subtree_sq_wmma_mode = PiPNNGpuSubtreeSqWmmaMode::Off;
+                subtree_backend
+                    .process_materialized_subtree_l2_compact_topk(
+                        &request,
+                        *materialized,
+                        &fp32_params,
+                    )
+                    .map(GpuSubtreeTopKSubmission::Ready)
+            }
             SqWmmaBackendInput::Owned(owned) => subtree_backend
                 .submit_owned_quantized_subtree_l2_compact_topk(
                     &request,
@@ -15433,6 +16479,8 @@ fn process_gpu_subtree_d1plus_turboquant_sidecar_child(
     };
     let zeros = vec![0.0_f32; gathered.global_ids.len()];
     let quantized = GpuSubtreeQuantizedInput {
+        rotated_center_ids: None,
+        rotated_centers: None,
         distance_kind: GpuSubtreeQuantizedDistanceKind::TurboQuantMse4,
         global_ids: &gathered.global_ids,
         codes: &gathered.codes,
@@ -21330,6 +22378,7 @@ mod tests {
         dim: usize,
         point_reads: AtomicUsize,
         batch_reads: AtomicUsize,
+        range_rows_read: AtomicUsize,
     }
 
     impl CountingPointStore {
@@ -21343,6 +22392,7 @@ mod tests {
                 dim,
                 point_reads: AtomicUsize::new(0),
                 batch_reads: AtomicUsize::new(0),
+                range_rows_read: AtomicUsize::new(0),
             }
         }
 
@@ -21372,6 +22422,7 @@ mod tests {
         }
 
         fn read_range_into(&self, start_pid: u32, count: usize, out: &mut [f32]) -> AnnResult<()> {
+            self.range_rows_read.fetch_add(count, Ordering::Relaxed);
             for row in 0..count {
                 let pid = start_pid as usize + row;
                 let src_start = pid * self.dim;
@@ -22792,6 +23843,630 @@ mod tests {
     }
 
     #[test]
+    fn sq4_budget_planner_uses_budget_instead_of_fixed_partitions() {
+        let rows = 1024; let dim = 4;
+        let dataset = build_test_dataset(rows,dim);
+        let store = InmemDatasetPointStore::new(&dataset,rows);
+        let ids:Vec<u32> = (0..rows as u32).collect();
+        let mut counts=Vec::new();
+        for budget in [1usize<<20,2usize<<20] {
+            let mut p=PiPNNParams::default();
+            p.partitioner=PiPNNPartitionerKind::GpuSubtree;p.oom_enable=true;p.oom_memory_budget_bytes=256<<20;
+            p.gpu_subtree_sq4_plus=true;p.gpu_subtree_sq4_primary_center=true;p.gpu_subtree_sq_native_int4=true;p.gpu_subtree_sq_bits=4;
+            p.gpu_subtree_sq_wmma_mode=PiPNNGpuSubtreeSqWmmaMode::Build;
+            p.gpu_subtree_d0_partition_mode=PiPNNGpuSubtreeD0PartitionMode::BudgetKMeansTopK;
+            p.gpu_subtree_d0_capacity_enable=true;p.gpu_subtree_d0_capacity_quality_min_root_leaders=2;
+            p.gpu_subtree_d0_capacity_root_leader_cap=1024;p.gpu_workspace_budget_bytes=budget;
+            p.gpu_subtree_d0_capacity_target_ratio=0.25;p.gpu_subtree_d0_tagore_partitions=3;
+            p.gpu_subtree_d0_tagore_k=1;p.fanout_top=3;p.fanout_second=3;
+            p.c_min=4;p.c_max=16;p.max_leaders=8;p.leaf_knn=2;p.kmeans_iterations=1;
+            p.gpu_subtree_d0_tagore_sample_fraction=1.0;
+            let dir=tempdir().unwrap();let mut rng=StdRng::seed_from_u64(42);
+            let plan=super::run_gpu_subtree_d0_preflight(cpu_backend(),&store,&ids,Metric::L2,&p,1,&mut rng,Some(dir.path())).unwrap();
+            let c=&plan.d0_capacity;
+            let expected=(rows*3).div_ceil(c.c_target).max(2).min(1024);
+            assert_eq!(c.k_capacity,(rows*3).div_ceil(c.c_target));
+            assert_eq!(c.root_leaders_initial,expected);assert_eq!(plan.child_stats.total_points,rows*3);
+            assert_eq!(plan.rbc_telemetry.gpu_subtree_d0_partition_mode,"budget-kmeans-topk");
+            assert_eq!(plan.sq4_primary.as_ref().unwrap().gather(&ids).unwrap().rotated_centers.unwrap().len(),64*dim);
+            counts.push(expected);
+        }
+        assert!(counts[0]>counts[1],"smaller budget must create more routing leaders: {counts:?}");
+        eprintln!("budget routing counts at 1/2 MiB: {counts:?}; independent primary centers=64");
+    }
+
+    #[test]
+    #[cfg(feature="pipnn_cuda")]
+    #[ignore="requires CUDA GPU"]
+    fn sq4_budget_gpu_routing_and_primary_codebook_match_cpu_reference() {
+        use super::super::sq4_gpu_d0::GpuPrimaryD0;
+        let dim=512;let rot=super::FhtKacRotationPlan::new(dim,42).unwrap();
+        let primary:Vec<f32>=(0..64*dim).map(|i|((i*83%2039) as f32-1019.0)/1024.0).collect();
+        for count in [7usize,63,64,65,127,128,257,513] {
+            for rows in [1usize,7,67,257] {
+                let raw:Vec<f32>=(0..rows*dim).map(|i| match i/dim%11 {0=>-0.0,1=>f32::from_bits(64+(i%1023) as u32),_=>((i*137%2017) as f32-1008.0)/1024.0}).collect();
+                let mut centers:Vec<f32>=(0..count*dim).map(|i|((i*73%2027) as f32-1013.0)/1024.0).collect();
+                let first=centers[..dim].to_vec();centers[dim..2*dim].copy_from_slice(&first);
+                centers[2*dim..3*dim].copy_from_slice(&first);centers[2*dim]=centers[2*dim].next_up();
+                let norms=super::tagore_d0_center_norms(&centers,dim);
+                let expected=super::assign_dense_rows_to_precomputed_centers(&raw,rows,dim,&centers,&norms,6);
+                let nearest=super::assign_dense_rows_to_centers(&raw,rows,dim,&primary,1);
+                let mut gpu=GpuPrimaryD0::new(0,dim,dim,rows,&centers,&norms,6,&rot,64<<20).unwrap();
+                gpu.enable_exact_assignment(&centers,64<<20).unwrap();gpu.set_primary_centers(&primary,64<<20).unwrap();
+                gpu.capture_intermediates().unwrap();
+                let (actual,codes)=gpu.stage(&raw,true,||panic!("budget routing called CPU reference")).unwrap();
+                assert_eq!(actual,expected.clusters.iter().map(|&id|id as u32).collect::<Vec<_>>(),"count={count} rows={rows}");
+                let mut gram=ndarray::Array2::<f32>::zeros((rows,count));
+                ndarray::linalg::general_mat_mul(1.0,&ndarray::ArrayView2::from_shape((rows,dim),&raw).unwrap(),
+                    &ndarray::ArrayView2::from_shape((count,dim),&centers).unwrap().t(),0.0,&mut gram);
+                let captured=gpu.captured_dots_scores(rows).unwrap();
+                for r in 0..rows {let norm=raw[r*dim..(r+1)*dim].iter().map(|x|x*x).sum::<f32>();
+                    for c in 0..count {assert_eq!(captured[r*count+c].to_bits(),gram[[r,c]].to_bits(),"dot C={count} N={rows}");
+                        assert_eq!(captured[(rows+r)*count+c].to_bits(),(norm+norms[c]-2.0*gram[[r,c]]).to_bits(),"score C={count} N={rows}");}}
+                let ids:Vec<u32>=(0..rows as u32).collect();
+                let expected_chunk=super::PrimaryChunk::encode(&raw,dim,dim,&primary,(0..rows).map(|r|nearest.row(r)[0]),&rot).unwrap();
+                let expected_codes=super::PrimaryCodes::new(vec![expected_chunk],&ids,rows,rows,dim,dim,&primary,&rot).unwrap().gather(&ids).unwrap();
+                let actual_codes=super::PrimaryCodes::new(vec![codes],&ids,rows,rows,dim,dim,&primary,&rot).unwrap().gather(&ids).unwrap();
+                check_primary_payload_equal(&expected_codes,&actual_codes);
+                assert_eq!(gpu.profile.checked_cpu_rows,0);assert_eq!(gpu.profile.primary_assignment_gpu_rows,rows);
+                assert_eq!(gpu.profile.raw_h2d_bytes,rows*dim*4);
+            }
+        }
+        eprintln!("budget GPU exact: 7/63/64/65/127/128/257/513 routing centers; dots/scores/top6 IDs/codebook64 payload bit-exact; CPU callback forbidden");
+    }
+
+    #[test]
+    fn sq4_d0_fused_sketch_preserves_bits_codes_and_memberships_without_extra_reads() {
+        check_sq4_d0_fused_sketch(false);
+    }
+
+    #[cfg(feature = "pipnn_cuda")]
+    fn check_primary_payload_equal(a: &super::SqWmmaGatheredInput, b: &super::SqWmmaGatheredInput) {
+        assert_eq!(a.global_ids, b.global_ids);
+        assert_eq!(a.codes, b.codes);
+        assert_eq!(a.rotated_center_ids, b.rotated_center_ids);
+        assert_eq!(a.scales.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                   b.scales.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(a.norms.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                   b.norms.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[cfg(feature="pipnn_cuda")]
+    #[ignore="requires CUDA GPU"]
+    fn sq4_partition_gpu_pipeline_matches_original_and_membership_subsets() {
+        let dim=512; let rows=8193;
+        let mut dataset=InmemDataset::new(rows,1.0,dim).unwrap();
+        for (i,x) in dataset.data.iter_mut().enumerate() {
+            *x=if i/dim%23==0 {-0.0} else {((i*137%2017) as f32-1008.0)/1024.0};
+        }
+        let store=InmemDatasetPointStore::new(&dataset,rows);
+        let ids=(0..rows as u32).collect::<Vec<_>>();
+        for center_count in [64,512] {
+        let mut centers=dataset.data[..center_count*dim].to_vec();
+        // Equal centers and close neighbors exercise deterministic ordered ties.
+        let c=centers[..dim].to_vec(); centers[dim..2*dim].copy_from_slice(&c);
+        centers[2*dim..3*dim].copy_from_slice(&c); centers[2*dim]=centers[2*dim].next_up();
+        let mut params=PiPNNParams::default(); params.random_seed=42;
+        params.oom_enable=true; params.oom_memory_budget_bytes=256<<30;
+        params.gpu_workspace_budget_bytes=16<<30;
+        let expected=super::build_tagore_d0_topk_clusters_parallel(&store,&ids,&centers,6).unwrap();
+        if center_count == 512 { assert!(expected[256..].iter().any(|v| !v.is_empty())); }
+        for mode in ["cpu","gpu-encode","gpu-exact"] {
+            let (clusters,table)=super::partition_d0_pipeline(&store,&ids,&centers,6,&params,mode,None).unwrap();
+            assert_eq!(clusters,expected,"mode={mode}");
+            let mut child=0;
+            for (c,ids) in clusters.iter().enumerate() {
+                if ids.is_empty() {continue;}
+                for subset in [ids.clone(),ids.iter().rev().step_by(7).copied().collect()] {
+                    let old=super::gather_sq4_plus_residuals(&store,&subset,&centers[c*dim..(c+1)*dim],42).unwrap();
+                    let new=table.gather(child,&subset).unwrap();
+                    check_primary_payload_equal(&old,&new);
+                    assert!(new.rotated_centers.is_none() && new.rotated_center_ids.is_none());
+                }
+                child+=1;
+            }
+            assert!(table.gather(child,&[0]).is_err());
+            assert!(table.gather(0,&[rows as u32]).is_err());
+            eprintln!("partition centers={center_count} mode={mode}: all 8193*6 memberships and admission subsets bitwise equal");
+        }
+        }
+    }
+
+    #[test]
+    #[cfg(feature="pipnn_cuda")]
+    #[ignore="requires CUDA GPU"]
+    fn sq4_partition_gpu_fused_sketch_preserves_payload_and_reads_each_batch_once() {
+        let rows=8193; let dim=512; let width=12;
+        let mut store=CountingPointStore::new(rows,dim);
+        for (i,x) in store.data.iter_mut().enumerate() {
+            *x=if i/dim%11==0 {-0.0} else {((i*37%1013) as f32-506.0)/512.0};
+        }
+        let ids=(0..rows as u32).collect::<Vec<_>>();
+        for center_count in [64,512] {
+        let centers=store.data[..center_count*dim].to_vec();
+        let mut params=PiPNNParams::default();params.random_seed=42;
+        params.oom_enable=true;params.oom_memory_budget_bytes=256<<30;params.gpu_workspace_budget_bytes=16<<30;
+        let planes=super::generate_hyperplanes(dim,width,42);
+        let mut expected_sketch=vec![0.0;rows*width];
+        for (x,y) in store.data[..rows*dim].chunks_exact(dim).zip(expected_sketch.chunks_exact_mut(width)) {
+            super::fill_sketch_row_from_slice(x,&planes,y).unwrap();
+        }
+        let (expected, table)=super::partition_d0_pipeline(&store,&ids,&centers,6,&params,"gpu-exact",None).unwrap();
+        store.batch_reads.store(0,Ordering::Relaxed);
+        let mut sketch=super::TagoreD0Sketch {width,hyperplanes:planes,data:vec![f32::NAN;rows*width],
+            worker_wall_sum:Duration::ZERO,join_wait_wall:Duration::ZERO,gpu:None};
+        let pool=rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let (actual, fused)=pool.install(|| super::partition_d0_pipeline(&store,&ids,&centers,6,&params,
+            "gpu-exact",Some(&mut sketch))).unwrap();
+        assert_eq!(actual,expected);
+        assert_eq!(store.batch_read_count(),3);
+        assert_eq!(store.point_read_count(),0);
+        assert_eq!(sketch.data.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),
+            expected_sketch.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
+        for (child, ids) in actual.iter().filter(|v|!v.is_empty()).enumerate() {
+            check_primary_payload_equal(&table.gather(child,ids).unwrap(),&fused.gather(child,ids).unwrap());
+        }
+        eprintln!("fused partition centers={center_count}: 8193*6 codes/IDs/scales/norms and 8193*12 sketch FP32 bits equal; exactly 3 raw reads");
+        }
+    }
+
+    #[test]
+    #[cfg(feature="pipnn_cuda")]
+    #[ignore="requires CUDA GPU and SHEAR_SQ4_TEST_BASE 10M input"]
+    fn sq4_partition_gpu_kmeans_matches_every_cpu_iteration() {
+        use std::io::{Read,Seek,SeekFrom};
+        let base=std::env::var("SHEAR_SQ4_TEST_BASE").expect("set verified LAION10M fbin");
+        let mut f=std::fs::File::open(base).unwrap();
+        let mut header=[0u8;8];f.read_exact(&mut header).unwrap();
+        assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()),10_000_000);
+        assert_eq!(u32::from_le_bytes(header[4..].try_into().unwrap()),512);
+        for actual in [false,true] {
+            let rows=if actual {20_000} else {4097}; let dim=512;
+            let mut dataset=InmemDataset::new(rows,1.0,dim).unwrap();
+            if actual {
+                for row in 0..rows {
+                    f.seek(SeekFrom::Start(8+(row*500*dim*4) as u64)).unwrap();
+                    let mut bytes=vec![0u8;dim*4]; f.read_exact(&mut bytes).unwrap();
+                    for (axis,b) in bytes.chunks_exact(4).enumerate() {
+                        dataset.data[row*dim+axis]=f32::from_le_bytes(b.try_into().unwrap());
+                    }
+                }
+            } else {
+                for (i,x) in dataset.data.iter_mut().enumerate() {
+                    *x=if i/dim%5==0 {0.0} else {((i*83%2039) as f32-1019.0)/1024.0};
+                }
+            }
+            for center_count in [64,512] {
+            let iterations=if center_count == 64 {10} else {4};
+            let (_,history)=super::super::sq4_gpu_d0::train_partition_kmeans(&dataset.data[..rows*dim],
+                center_count,iterations,0,16<<30,true).unwrap();
+            let store=InmemDatasetPointStore::new(&dataset,rows);
+            let ids=(0..rows as u32).collect::<Vec<_>>();
+            for iteration in 1..=iterations {
+                let (expected,_)=super::train_tagore_d0_centers(&store,&ids,center_count,1.0,iteration).unwrap();
+                assert_eq!(expected.iter().map(|x|x.to_bits()).collect::<Vec<_>>(),
+                    history[iteration-1].iter().map(|x|x.to_bits()).collect::<Vec<_>>(),
+                    "actual={actual} centers={center_count} iteration={iteration}");
+            }
+            eprintln!("kmeans actual_laion={actual} rows={rows} centers={center_count}: all {iterations} center iterations bitwise equal");
+            }
+        }
+        // Identical points force 63 empty clusters on every iteration.
+        let (_,history)=super::super::sq4_gpu_d0::train_partition_kmeans(&vec![0.5;67*512],64,3,0,16<<30,true).unwrap();
+        for centers in history { assert_eq!(centers,vec![0.5;64*512]); }
+        let (_,history)=super::super::sq4_gpu_d0::train_partition_kmeans(&vec![0.5;517*512],512,3,0,16<<30,true).unwrap();
+        for centers in history { assert_eq!(centers,vec![0.5;512*512]); }
+    }
+
+    #[test]
+    #[cfg(feature = "pipnn_cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn sq4_gpu_d0_exact_matches_reference_dots_scores_ids_without_cpu_assignment() {
+        use super::super::sq4_gpu_d0::GpuPrimaryD0;
+        let dim = 512;
+        let rot = super::FhtKacRotationPlan::new(dim, 42).unwrap();
+        // Production 10M/100M tails, full batches, and masked 8x8 tail kernels.
+        for rows in [1, 7, 67, 256, 1664, 4096] {
+            for scale in [1e-20f32, 1.0, 1e12] {
+                let raw = (0..rows * dim).map(|i| match i / dim % 11 {
+                    0 => -0.0,
+                    1 => f32::from_bits(64 + (i % 1023) as u32),
+                    _ => ((i * 137 % 2017) as f32 - 1008.0) / 1024.0 * scale,
+                }).collect::<Vec<_>>();
+                let mut centers = (0..64 * dim).map(|i|
+                    ((i * 83 % 2039) as f32 - 1019.0) / 1024.0 * scale).collect::<Vec<_>>();
+                let first = centers[..dim].to_vec();
+                centers[dim..2*dim].copy_from_slice(&first);
+                centers[2*dim..3*dim].copy_from_slice(&first);
+                centers[2*dim] = centers[2*dim].next_up();
+                let norms = super::tagore_d0_center_norms(&centers, dim);
+                let reference = super::assign_dense_rows_to_precomputed_centers(&raw, rows,
+                    dim, &centers, &norms, 6);
+                let mut gram = ndarray::Array2::<f32>::zeros((rows, 64));
+                ndarray::linalg::general_mat_mul(1.0,
+                    &ndarray::ArrayView2::from_shape((rows, dim), &raw).unwrap(),
+                    &ndarray::ArrayView2::from_shape((64, dim), &centers).unwrap().t(),
+                    0.0, &mut gram);
+                let mut gpu = GpuPrimaryD0::new(0, dim, dim, rows, &centers, &norms, 6, &rot, 32<<20).unwrap();
+                gpu.enable_exact_assignment(&centers, 32<<20).unwrap();
+                gpu.capture_intermediates().unwrap();
+                let (actual, chunk) = gpu.stage(&raw, true, || panic!("exact GPU path invoked CPU assignment")).unwrap();
+                assert_eq!(actual, reference.clusters.iter().map(|&id| id as u32).collect::<Vec<_>>());
+                let captures = gpu.captured_dots_scores(rows).unwrap();
+                for row in 0..rows {
+                    let norm = raw[row*dim..(row+1)*dim].iter().map(|x| x*x).sum::<f32>();
+                    for c in 0..64 {
+                        let dot = gram[[row,c]];
+                        assert_eq!(dot.to_bits(), captures[row*64+c].to_bits(), "dot rows={rows} row={row} c={c} scale={scale}");
+                        let score = norm + norms[c] - 2.0*dot;
+                        assert_eq!(score.to_bits(), captures[(rows+row)*64+c].to_bits(), "score rows={rows} row={row} c={c}");
+                    }
+                }
+                let ids = (0..rows as u32).collect::<Vec<_>>();
+                let expected_chunk = super::PrimaryChunk::encode(&raw, dim, dim, &centers,
+                    (0..rows).map(|r| reference.row(r)[0]), &rot).unwrap();
+                let expected = super::PrimaryCodes::new(vec![expected_chunk], &ids, rows, rows, dim, dim, &centers, &rot).unwrap().gather(&ids).unwrap();
+                let actual_codes = super::PrimaryCodes::new(vec![chunk], &ids, rows, rows, dim, dim, &centers, &rot).unwrap().gather(&ids).unwrap();
+                check_primary_payload_equal(&expected, &actual_codes);
+                assert_eq!(gpu.profile.checked_cpu_rows, 0);
+                assert_eq!(gpu.profile.corrected_ids_h2d_bytes, 0);
+                assert_eq!(gpu.profile.exact_gpu_rows, rows);
+                eprintln!("exact rows={rows} scale={scale} {:?}", gpu.profile);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pipnn_cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn sq4_gpu_d0_encoding_preserves_intermediate_bits_and_packed_payload() {
+        for dim in [1, 4, 32, 512, 4096] {
+            let rows = 67;
+            let padded = super::sq_int8_padded_dim(dim, 16).unwrap();
+            let ids = (0..rows as u32).collect::<Vec<_>>();
+            let centers = [0.0, 0.0, 0.5, 2.0, -4.0].into_iter()
+                .flat_map(|v| vec![v; dim]).collect::<Vec<_>>();
+            let norms = super::tagore_d0_center_norms(&centers, dim);
+            let raw = (0..rows*dim).map(|i| match i/dim % 7 {
+                0 => -0.0, 1 => 0.5, 2 => f32::from_bits(64 + (i % 1023) as u32),
+                3 => 0.25f32.next_up(), 4 => ((i % 13) as f32 - 6.0) * 1e10,
+                _ => ((i * 37 % 1013) as f32 - 506.0) / 511.0,
+            }).collect::<Vec<_>>();
+            for seed in [0, 42, u64::MAX] {
+                let rot = super::FhtKacRotationPlan::new(dim, seed).unwrap();
+                let mut gpu = super::super::sq4_gpu_d0::GpuPrimaryD0::new(0, dim, padded, rows,
+                    &centers, &norms, 3, &rot, 128 << 20).unwrap();
+                gpu.capture_intermediates().unwrap();
+                let assignment = super::assign_dense_rows_to_precomputed_centers(&raw, rows,
+                    dim, &centers, &norms, 3);
+                let expected_ids = assignment.clusters.iter().map(|&v| v as u32).collect::<Vec<_>>();
+                for assign_on_gpu in [false, true] {
+                    let (actual_ids, chunk) = gpu.stage(&raw, assign_on_gpu, || Ok(expected_ids.clone())).unwrap();
+                    assert_eq!(actual_ids, expected_ids, "dim={dim} seed={seed}");
+                    let expected_chunk = super::PrimaryChunk::encode(&raw, dim, padded, &centers,
+                        (0..rows).map(|r| assignment.row(r)[0]), &rot).unwrap();
+                    let actual = super::PrimaryCodes::new(vec![chunk], &ids, rows, rows,
+                        dim, padded, &centers, &rot).unwrap().gather(&ids).unwrap();
+                    let expected = super::PrimaryCodes::new(vec![expected_chunk], &ids, rows, rows,
+                        dim, padded, &centers, &rot).unwrap().gather(&ids).unwrap();
+                    check_primary_payload_equal(&expected, &actual);
+                    let captured = gpu.intermediates(rows).unwrap();
+                    for r in 0..rows {
+                        let c = assignment.row(r)[0];
+                        let residual = raw[r*dim..(r+1)*dim].iter().zip(&centers[c*dim..(c+1)*dim])
+                            .map(|(x,c)| x-c).collect::<Vec<_>>();
+                        let mut rotated = vec![0.0; dim];
+                        rot.rotate_row(&residual, &mut rotated).unwrap();
+                        for (offset, reference) in [(r*dim, &residual), ((rows+r)*dim, &rotated)] {
+                            assert_eq!(captured[offset..offset+dim].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                       reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                       "intermediate dim={dim} row={r} offset={offset}");
+                        }
+                    }
+                }
+                assert_eq!(gpu.profile.rows, rows*2);
+                assert_eq!(gpu.profile.raw_h2d_bytes, rows*dim*4*2);
+                assert_eq!(gpu.profile.code_d2h_bytes, rows*(padded/2+8)*2);
+                assert!(gpu.stage(&vec![f32::NAN; dim], false, || unreachable!()).is_err());
+                assert!(gpu.stage(&vec![0.0; (rows+1)*dim], false, || unreachable!()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pipnn_cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn sq4_gpu_d0_rank_certificate_and_compatibility_match_cpu_blas() {
+        use super::super::sq4_gpu_d0::GpuPrimaryD0;
+        let scalar_rotation = super::FhtKacRotationPlan::new(1, 42).unwrap();
+        let tiny = [f32::from_bits(1)];
+        assert!(super::PrimaryChunk::encode(&tiny, 1, 16, &[0.0], [0].into_iter(), &scalar_rotation).is_err());
+        let mut scalar = GpuPrimaryD0::new(0, 1, 16, 1, &[0.0], &[0.0], 1, &scalar_rotation, 4096).unwrap();
+        assert!(scalar.stage(&tiny, false, || Ok(vec![0])).is_err());
+        let dim = 512;
+        let rows = 257;
+        let rot = super::FhtKacRotationPlan::new(dim, 42).unwrap();
+        let centers = [0.0, 10.0, 30.0, 60.0].into_iter().flat_map(|v| vec![v; dim]).collect::<Vec<_>>();
+        let norms = super::tagore_d0_center_norms(&centers, dim);
+        let mut gpu = GpuPrimaryD0::new(0, dim, dim, rows, &centers, &norms, 3, &rot, 32 << 20).unwrap();
+        let (ids, _) = gpu.stage(&vec![0.125; rows*dim], true,
+            || panic!("well-separated rows must not invoke CPU assignment")).unwrap();
+        assert_eq!(ids, [0u32,1,2].repeat(rows));
+        assert_eq!(gpu.profile.checked_cpu_rows, 0);
+        assert!(GpuPrimaryD0::new(0, dim, dim, rows, &centers, &norms, 3, &rot, 1).is_err());
+        for scale in [1e-20f32, 1e-4, 1.0, 1e12] {
+            let raw = (0..rows*dim).map(|i| ((i*137 % 2017) as f32 - 1008.0) / 1024.0 * scale).collect::<Vec<_>>();
+            let mut centers = (0..64*dim).map(|i| ((i*83 % 2039) as f32 - 1019.0) / 1024.0 * scale).collect::<Vec<_>>();
+            // Force exact and near ties in addition to random cancellation.
+            let first = centers[..dim].to_vec();
+            centers[dim..2*dim].copy_from_slice(&first);
+            centers[2*dim..3*dim].copy_from_slice(&first);
+            centers[2*dim] = centers[2*dim].next_up();
+            let norms = super::tagore_d0_center_norms(&centers, dim);
+            let expected = super::assign_dense_rows_to_precomputed_centers(&raw, rows, dim,
+                &centers, &norms, 6).clusters.into_iter().map(|id| id as u32).collect::<Vec<_>>();
+            let mut gpu = GpuPrimaryD0::new(0, dim, dim, rows, &centers, &norms, 6, &rot, 32 << 20).unwrap();
+            let (actual, _) = gpu.stage(&raw, true, || Ok(expected.clone())).unwrap();
+            assert_eq!(actual, expected, "scale={scale}");
+            eprintln!("SQ4 GPU D0 certificate scale={scale} {:?}", gpu.profile);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pipnn_cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn sq4_gpu_d0_pipeline_preserves_codes_sketch_members_and_cancels_reader() {
+        let rows = 4103;
+        let dim = 32;
+        let width = 12;
+        let ids = (0..rows as u32).collect::<Vec<_>>();
+        let centers = [0.0, 0.0, 0.5, -0.75].into_iter().flat_map(|v| vec![v; dim]).collect::<Vec<_>>();
+        let rot = super::FhtKacRotationPlan::new(dim, 42).unwrap();
+        let planes = super::generate_hyperplanes(dim, width, 42);
+        let mut store = CountingPointStore::new(rows, dim);
+        for (i, x) in store.data.iter_mut().enumerate() { *x = ((i*37%1013) as f32-506.0)/512.0; }
+        let mut expected_sketch = vec![0.0; rows*width];
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (expected_members, expected_codes, _) = pool.install(|| super::tagore_clusters_primary_and_sketches(
+            &store, &ids, &centers, 3, Some(&rot), None, Some((&planes, width, &mut expected_sketch, None)))).unwrap();
+        let expected_codes = expected_codes.unwrap().gather(&ids).unwrap();
+        for assign_on_gpu in [false, true] {
+            store.batch_reads.store(0, Ordering::Relaxed);
+            let mut actual_sketch = vec![f32::NAN; rows*width];
+            let (members, codes, _, _, profile) = pool.install(|| super::tagore_primary_gpu_pipeline(
+                &store, &ids, &centers, None, 3, &rot, &planes, width, &mut actual_sketch, 0, 32<<20, assign_on_gpu, false)).unwrap();
+            assert_eq!(members, expected_members);
+            check_primary_payload_equal(&expected_codes, &codes.gather(&ids).unwrap());
+            assert_eq!(actual_sketch.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                       expected_sketch.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+            assert_eq!(store.batch_read_count(), 2);
+            assert_eq!(store.point_read_count(), 0);
+            assert_eq!(store.range_rows_read.load(Ordering::Relaxed), 0);
+            assert_eq!(profile.rows, rows);
+            assert_eq!(profile.batches, 2);
+            assert_eq!(profile.assigned_gpu_rows, if assign_on_gpu {rows} else {0});
+            assert_eq!(profile.raw_h2d_bytes, rows*dim*4);
+            assert_eq!(profile.code_d2h_bytes, rows*(dim/2+8));
+            eprintln!("SQ4 GPU D0 pipeline assign={assign_on_gpu} {profile:?}");
+        }
+        // More batches than the queue can hold: a GPU input rejection must
+        // unblock the prefetch reader instead of deadlocking its scoped join.
+        let mut bad = CountingPointStore::new(5*4096+7, dim);
+        bad.data[0] = f32::NAN;
+        let bad_ids = (0..bad.rows as u32).collect::<Vec<_>>();
+        let begin = std::time::Instant::now();
+        assert!(pool.install(|| super::tagore_primary_gpu_pipeline(&bad, &bad_ids, &centers, None, 3,
+            &rot, &planes, width, &mut vec![0.0; bad.rows*width], 0, 32<<20, true, false)).is_err());
+        assert!(begin.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    #[cfg(feature = "pipnn_cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn sq4_d0_gpu_sketch_preserves_bits_codes_and_memberships_without_extra_reads() {
+        check_sq4_d0_fused_sketch(true);
+    }
+
+    fn check_sq4_d0_fused_sketch(use_gpu: bool) {
+        use super::super::hash_prune::SketchAccessor;
+        let dir = tempdir().unwrap();
+        for (rows, dim, threads) in [(1, 32, 1), (4095, 32, 4), (4096, 32, 4),
+                                     (4097, 512, 8), (8205, 32, 4)] {
+            let mut baseline = CountingPointStore::new(rows, dim);
+            for (i, x) in baseline.data.iter_mut().enumerate() {
+                *x = if i / dim % 11 == 0 { -0.0 } else { ((i * 37 % 1013) as f32 - 506.0) / 512.0 };
+            }
+            let mut fused = CountingPointStore::new(rows, dim);
+            fused.data.clone_from(&baseline.data);
+            let ids = (0..rows as u32).collect::<Vec<_>>();
+            let centers = [0.0, 0.0, 0.25, -0.75].into_iter()
+                .flat_map(|value| vec![value; dim]).collect::<Vec<_>>();
+            let mut params = PiPNNParams::default();
+            params.m_hash_bits = 12;
+            let rotation = super::FhtKacRotationPlan::new(dim, params.random_seed).unwrap();
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let expected_sketch = super::DiskSketchStore::build_resident_from_point_store(
+                &dir.path().join("expected"), &baseline, rows, &params, threads as u32,
+            ).unwrap();
+            let (expected_clusters, expected_primary) = pool.install(|| {
+                super::tagore_clusters_and_primary_codes(&baseline, &ids, &centers, 3, Some(&rotation))
+            }).unwrap();
+            let hyperplanes = super::generate_hyperplanes(dim, params.m_hash_bits, params.random_seed);
+            let gpu = use_gpu.then(|| super::super::gpu_sketch::GpuSketch::new(
+                0, dim, params.m_hash_bits, super::TAGORE_D0_ASSIGN_CHUNK_POINTS,
+                &hyperplanes, 16 << 20).unwrap());
+            let mut actual_sketch = vec![f32::NAN; rows * params.m_hash_bits];
+            let (actual_clusters, actual_primary, _) = pool.install(|| {
+                super::tagore_clusters_primary_and_sketches(&fused, &ids, &centers, 3,
+                    Some(&rotation), None, Some((&hyperplanes, params.m_hash_bits, &mut actual_sketch, gpu.as_ref())))
+            }).unwrap();
+            assert_eq!(actual_clusters, expected_clusters, "rows={rows}");
+            let a = expected_primary.unwrap().gather(&ids).unwrap();
+            let b = actual_primary.unwrap().gather(&ids).unwrap();
+            assert_eq!(a.codes, b.codes);
+            assert_eq!(a.rotated_center_ids, b.rotated_center_ids);
+            assert_eq!(a.scales.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                       b.scales.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            assert_eq!(a.norms.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                       b.norms.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            for row in 0..rows {
+                let mut expected = vec![0.0; params.m_hash_bits];
+                expected_sketch.row_copy_into(row, &mut expected).unwrap();
+                assert_eq!(expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    actual_sketch[row * params.m_hash_bits..(row + 1) * params.m_hash_bits]
+                        .iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "row={row} rows={rows}");
+            }
+            assert_eq!(baseline.range_rows_read.load(Ordering::Relaxed), rows);
+            assert_eq!(fused.range_rows_read.load(Ordering::Relaxed), 0);
+            assert_eq!(baseline.batch_read_count(), rows.div_ceil(super::TAGORE_D0_ASSIGN_CHUNK_POINTS));
+            assert_eq!(fused.batch_read_count(), baseline.batch_read_count());
+            assert_eq!(fused.point_read_count(), 0);
+            if let Some(gpu) = gpu {
+                assert_eq!(gpu.profile().rows, rows);
+                assert_eq!(gpu.profile().launches, rows.div_ceil(super::TAGORE_D0_ASSIGN_CHUNK_POINTS));
+            }
+        }
+    }
+
+    #[test]
+    fn sq4_d0_fused_sketch_preflight_preserves_d0_hashes_and_rejects_nonprefix_ids() {
+        check_sq4_d0_fused_sketch_preflight(false);
+    }
+
+    #[test]
+    #[cfg(feature = "pipnn_cuda")]
+    #[ignore = "requires CUDA GPU"]
+    fn sq4_d0_gpu_sketch_preflight_preserves_d0_hashes_and_rejects_nonprefix_ids() {
+        check_sq4_d0_fused_sketch_preflight(true);
+    }
+
+    fn check_sq4_d0_fused_sketch_preflight(use_gpu: bool) {
+        use super::super::hash_prune::SketchAccessor;
+        let rows = 129;
+        let dim = 32;
+        let dataset = build_test_dataset(rows, dim);
+        let store = InmemDatasetPointStore::new(&dataset, rows);
+        let ids = (0..rows as u32).collect::<Vec<_>>();
+        let mut params = PiPNNParams::default();
+        params.partitioner = PiPNNPartitionerKind::GpuSubtree;
+        params.oom_enable = true;
+        params.oom_memory_budget_bytes = 512 << 20;
+        params.gpu_subtree_d0_partition_mode = PiPNNGpuSubtreeD0PartitionMode::TagoreKMeansTopK;
+        params.gpu_subtree_d0_tagore_partitions = 4;
+        params.gpu_subtree_d0_tagore_k = 2;
+        params.gpu_subtree_d0_tagore_sample_fraction = 1.0;
+        params.gpu_subtree_sq4_plus = true;
+        params.gpu_subtree_sq4_primary_center = true;
+        params.kmeans_iterations = 2;
+        let a_dir = tempdir().unwrap();
+        let b_dir = tempdir().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        pool.install(|| {
+            let a = super::run_gpu_subtree_d0_preflight(cpu_backend(), &store, &ids, Metric::L2,
+                &params, 4, &mut StdRng::seed_from_u64(42), Some(a_dir.path())).unwrap();
+            let b = super::run_gpu_subtree_sq4_d0_preflight_with_sketch(cpu_backend(), &store, &ids,
+                Metric::L2, &params, 4, &mut StdRng::seed_from_u64(42), Some(b_dir.path()),
+                &b_dir.path().join("sketch"), super::GpuSubtreeRuntimeContext::default(), use_gpu).unwrap();
+            assert_eq!(a.rbc_telemetry.gpu_subtree_d0_partition_hash, b.d0_plan.rbc_telemetry.gpu_subtree_d0_partition_hash);
+            assert_eq!(a.rbc_telemetry.gpu_subtree_d0_task_list_hash, b.d0_plan.rbc_telemetry.gpu_subtree_d0_task_list_hash);
+            assert_eq!(d0_child_point_sets(&a), d0_child_point_sets(&b.d0_plan));
+            let expected = super::DiskSketchStore::build_resident_from_point_store(
+                &a_dir.path().join("sketch"), &store, rows, &params, 4).unwrap();
+            let actual = b.fused_sketches.unwrap();
+            for row in 0..rows {
+                let mut x = vec![0.0; params.m_hash_bits];
+                let mut y = x.clone();
+                expected.row_copy_into(row, &mut x).unwrap();
+                actual.row_copy_into(row, &mut y).unwrap();
+                assert_eq!(x.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                           y.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            }
+            assert!(super::run_gpu_subtree_sq4_d0_preflight_with_sketch(cpu_backend(), &store,
+                &[1, 0], Metric::L2, &params, 4, &mut StdRng::seed_from_u64(42), Some(b_dir.path()),
+                &b_dir.path().join("bad"), super::GpuSubtreeRuntimeContext::default(), use_gpu).is_err());
+        });
+    }
+
+    #[test]
+    fn sq4_plus_rotation_matches_scalar_bits() {
+        use super::super::dco_rabitq::FhtKacRotationPlan;
+        for dim in [1, 4, 8, 16, 32, 128, 512, 1024] {
+            for seed in [0, 42, u64::MAX] {
+                let plan = FhtKacRotationPlan::new(dim, seed).unwrap();
+                for row in 0..8 {
+                    let input: Vec<_> = (0..dim).map(|axis| match row {
+                        0 => -0.0,
+                        1 => if axis == dim / 2 { 1.0 } else { 0.0 },
+                        _ => ((axis * 277 + row * 31) % 1013) as f32 / 507.0 - 1.0,
+                    }).collect();
+                    let mut actual = vec![0.0; dim];
+                    let mut expected = vec![0.0; dim];
+                    plan.rotate_row(&input, &mut actual).unwrap();
+                    super::rotate_rabitq_plus_fht_kac_row(&input, &mut expected, seed).unwrap();
+                    for (a, b) in actual.iter().zip(expected) {
+                        assert_eq!(a.to_bits(), b.to_bits(), "dim={dim} seed={seed} row={row}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sq4_plus_primary_code_follows_nearest_center_across_overlapping_partitions() {
+        let ids = [3, 0, 2];
+        let centers = [0.0; 4].into_iter().chain([9.0; 4]).collect::<Vec<_>>();
+        let data = vec![1.0, 2.0, 0.0, 1.0, 8.0, 0.0, 1.0, 0.0,
+                        7.0, 9.0, 9.0, 8.0, 9.0, 8.0, 9.0, 9.0];
+        let store = super::ResidentSubsetPointStore::new(vec![0, 1, 2, 3], 4, data).unwrap();
+        let rotation = super::FhtKacRotationPlan::new(4, 42).unwrap();
+        let (clusters, primary) = super::tagore_clusters_and_primary_codes(
+            &store, &ids, &centers, 2, Some(&rotation),
+        ).unwrap();
+        assert_eq!(clusters, [ids, ids]);
+        let primary = primary.unwrap();
+        assert!(primary.gather(&[1]).is_err());
+        for order in [vec![3, 0, 2], vec![2, 0, 3]] {
+            let gathered = primary.gather(&order).unwrap();
+            for (i, id) in order.into_iter().enumerate() {
+                let center = usize::from(id != 0);
+                assert_eq!(gathered.rotated_center_ids.as_ref().unwrap()[i], center as u32);
+                let expected = super::gather_sq4_plus_residuals(
+                    &store, &[id], &centers[center * 4..(center + 1) * 4], 42,
+                ).unwrap();
+                let stride = gathered.code_row_bytes;
+                assert_eq!(&gathered.codes[i * stride..(i + 1) * stride], &expected.codes);
+                assert_eq!(gathered.scales[i], expected.scales[0]);
+                assert_eq!(gathered.norms[i], expected.norms[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn sq4_plus_packed_payload_matches_rotated_cluster_residual_reference() {
+        use super::super::dco_sq_int8::{quantize_sq_int8_row_with_bits, unpack_sq_s4_codes};
+        let center = [2.0, -1.0, 3.0, 5.0];
+        let point = [-1.0, 3.0, 4.0, -2.0];
+        let data: Vec<_> = center.iter().chain(&point).copied().collect();
+        let store = super::ResidentSubsetPointStore::new(vec![0, 1], 4, data).unwrap();
+        for mean in [center, point] {
+            let payload = super::gather_sq4_plus_residuals(&store, &[1, 0], &mean, 42).unwrap();
+            assert_eq!(payload.global_ids, [1, 0]);
+            assert_eq!(payload.code_row_bytes, 8);
+            let dense = unpack_sq_s4_codes(&payload.codes, 2, 16).unwrap();
+            for (row, x) in [point, center].iter().enumerate() {
+                let residual: Vec<f32> = x.iter().zip(mean).map(|(a, b)| a - b).collect();
+                let mut rotated = vec![0.0; 4];
+                super::rotate_rabitq_plus_fht_kac_row(&residual, &mut rotated, 42).unwrap();
+                let mut expected = [0; 16];
+                let (scale, norm) = quantize_sq_int8_row_with_bits(&rotated, &mut expected, 4).unwrap();
+                assert_eq!(&dense[row * 16..(row + 1) * 16], &expected);
+                assert_eq!((payload.scales[row], payload.norms[row]), (scale, norm));
+            }
+        }
+    }
+
+    #[test]
     fn gpu_subtree_d0_tagore_top2_emits_two_assignments_per_point() {
         let num_points = 64;
         let dim = 8;
@@ -23078,6 +24753,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -23222,6 +24900,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry {
@@ -23250,17 +24931,22 @@ mod tests {
     }
 
     #[test]
-    fn d1plus_lazy_split_on_preserves_conservative_ratio_and_thresholds() {
+    fn d1plus_lazy_split_on_uses_high_ratio_not_planning_target() {
         let dir = tempdir().unwrap();
         let point_ids = (0..32_u32).collect::<Vec<_>>();
         let d0_plan = d0_plan_with_single_child_and_capacity(&dir, &point_ids, 20, 18);
         let mut params = PiPNNParams::default();
         params.gpu_subtree_d0_capacity_enable = true;
-        params.gpu_subtree_d0_capacity_high_ratio = 0.08;
+        params.gpu_subtree_d0_capacity_target_ratio = 0.08;
         params.gpu_subtree_d1plus_lazy_split_mode = PiPNNGpuSubtreeD1PlusLazySplitMode::On;
 
-        assert!(super::d1plus_lazy_admission_thresholds(&params, &d0_plan).is_some());
-        assert_eq!(super::d1plus_admission_ratio(&params), 0.08);
+        for high_ratio in [0.08, 0.50] {
+            params.gpu_subtree_d0_capacity_high_ratio = high_ratio;
+            let thresholds = super::d1plus_lazy_admission_thresholds(&params, &d0_plan).unwrap();
+            assert_eq!(thresholds.c_high, 20);
+            assert_eq!(thresholds.c_target, 18);
+            assert_eq!(super::d1plus_admission_ratio(&params), high_ratio);
+        }
     }
 
     #[test]
@@ -23458,6 +25144,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry {
@@ -23603,6 +25292,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -23694,6 +25386,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry {
@@ -23834,6 +25529,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -23932,6 +25630,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
         };
@@ -23997,6 +25698,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
         };
@@ -24035,6 +25739,9 @@ mod tests {
                 file_rows: 0,
                 resident_gather_wall: Duration::from_millis(1),
                 file_gather_wall: Duration::ZERO,
+                reconstructed_vectors: None,
+                rotated_center_ids: None,
+                rotated_centers: None,
             },
         };
         let mut telemetry = super::RbcPartitionTelemetry::default();
@@ -24089,6 +25796,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
         };
@@ -24119,6 +25829,9 @@ mod tests {
                 file_rows: 0,
                 resident_gather_wall: Duration::ZERO,
                 file_gather_wall: Duration::ZERO,
+                reconstructed_vectors: None,
+                rotated_center_ids: None,
+                rotated_centers: None,
             },
         };
         let mut params = PiPNNParams::default();
@@ -24244,6 +25957,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
         };
@@ -24286,6 +26002,9 @@ mod tests {
                 file_rows: 0,
                 resident_gather_wall: Duration::ZERO,
                 file_gather_wall: Duration::ZERO,
+                reconstructed_vectors: None,
+                rotated_center_ids: None,
+                rotated_centers: None,
             },
         };
         let backend =
@@ -24380,6 +26099,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -24470,6 +26192,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry {
@@ -24827,6 +26552,70 @@ mod tests {
         let sidecar =
             SqWmmaSidecar::open_validated_with_bits(&sidecar_prefix, rows, dim, 8).unwrap();
         assert_eq!(sidecar.gather(&[0, 3, 9]).unwrap().file_rows, 3);
+    }
+
+    #[test]
+    fn gpu_subtree_sq_staging_admitted_resident_payload_matches_disk_and_partial_budget() {
+        let dir = tempdir().unwrap();
+        let rows = 39;
+        let dim = 5;
+        let dataset = build_test_dataset(rows, dim);
+        let store = InmemDatasetPointStore::new(&dataset, rows);
+        let indices = (0..rows as u32).collect::<Vec<_>>();
+        let mut gather_ids = indices.iter().rev().copied().collect::<Vec<_>>();
+        gather_ids.extend_from_slice(&[0, 17, 17]);
+        let mut reference = None;
+
+        for (name, cap, resident) in [
+            ("disk", Some(0), false),
+            ("partial", Some(120), false),
+            ("resident", None, true),
+        ] {
+            let child_dir = dir.path().join(name);
+            std::fs::create_dir_all(&child_dir).unwrap();
+            let prefix = child_dir.join("sq8");
+            let mut params = PiPNNParams::default();
+            params.oom_enable = true;
+            params.oom_io_mode = PiPNNOomIoMode::Buffered;
+            params.oom_memory_budget_bytes = 1024 * 1024 * 1024;
+            params.oom_sidecar_resident_budget_cap_bytes = cap;
+            params.fanout_top = 2;
+            params.max_leaders = 4;
+            params.gpu_subtree_sq_staging_mode = PiPNNGpuSubtreeSqStagingMode::GpuD0;
+            params.gpu_subtree_sq_staging_upload_shard_rows = 7;
+            params.gpu_subtree_sq_wmma_mode = PiPNNGpuSubtreeSqWmmaMode::Build;
+            params.gpu_subtree_sq_wmma_sidecar_mode = PiPNNGpuSubtreeSqWmmaSidecarMode::Rebuild;
+            params.gpu_subtree_sq_wmma_sidecar_prefix = Some(prefix.clone());
+            let plan = super::run_gpu_subtree_sq_staging_preflight(
+                cpu_backend(), &store, &indices, Metric::L2, &params, 1,
+                &mut StdRng::seed_from_u64(23), Some(&child_dir),
+            ).unwrap();
+
+            assert_eq!(plan.rbc_telemetry.gpu_subtree_sq_wmma_sidecar_resident, resident);
+            assert_eq!(sq_wmma_sidecar_codes_path(&prefix).exists(), !resident);
+            assert_eq!(sq_wmma_sidecar_meta_path(&prefix).exists(), !resident);
+            let cached = take_cached_sq_wmma_created_sidecar_with_bits(&prefix, rows, dim, 8)
+                .unwrap();
+            assert_eq!(cached.is_some(), resident);
+            let sidecar = cached.unwrap_or_else(|| {
+                SqWmmaSidecar::open_validated_with_bits(&prefix, rows, dim, 8).unwrap()
+            });
+            let gathered = sidecar.gather(&gather_ids).unwrap();
+            assert_eq!(gathered.global_ids, gather_ids);
+            assert_eq!(gathered.file_rows, if resident { 0 } else { gather_ids.len() });
+            let observed = (
+                gathered.codes,
+                gathered.norms.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                gathered.scales.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                plan.rbc_telemetry.gpu_subtree_d0_partition_hash,
+                plan.rbc_telemetry.gpu_subtree_d0_task_list_hash,
+            );
+            if let Some(expected) = &reference {
+                assert_eq!(&observed, expected, "{name}");
+            } else {
+                reference = Some(observed);
+            }
+        }
     }
 
     #[test]
@@ -25388,6 +27177,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry {
@@ -25521,6 +27313,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry {
@@ -25583,6 +27378,60 @@ mod tests {
                 <= profile.rbc.gpu_subtree_sidecar_gather_active_wall
         );
         assert!(profile.rbc.gpu_subtree_sidecar_queue_max_bytes > 0);
+    }
+
+    #[test]
+    fn sq4_balanced_admission_preserves_all_ids_without_replication() {
+        let mut params = PiPNNParams::default();
+        params.gpu_workspace_budget_bytes = 16 << 30;
+        params.leaf_knn = 2;
+        for rows in [1usize, 3, 31, 4097, 32771] {
+            for cap in [1usize, 31, 4096] {
+                let ids: Vec<u32> = (0..rows as u32).map(|id| 7 + id * 19).collect();
+                let make = || super::GpuSubtreeD1ChildTask {
+                    child_idx: 7,
+                    child_run: super::GpuSubtreeChildRun { extents: Vec::new(), len: rows, seed: 42 },
+                    points: ids.clone(), replay_wall: Duration::from_millis(23), split_depth: 0,
+                };
+                let mut telemetry = super::RbcPartitionTelemetry::default();
+                let tasks = super::split_sq4_task_by_balanced_ids_for_admission(make(), 512, &params, cap, &mut telemetry).unwrap();
+                let mut actual: Vec<u32> = tasks.iter().flat_map(|t| t.points.iter().copied()).collect();
+                actual.sort_unstable();
+                assert_eq!(actual, ids, "rows={rows} cap={cap}: lost or repeated IDs");
+                assert_eq!(tasks.iter().map(|t|t.replay_wall).sum::<Duration>(), Duration::from_millis(23));
+                assert!(tasks.iter().all(|t| t.child_idx == 7 && t.child_run.len == t.points.len()
+                    && t.points.len() <= cap && d1_admission_preflight(t.points.len(),512,&params,super::d1plus_admission_ratio(&params)).supported));
+                let again = super::split_sq4_task_by_balanced_ids_for_admission(make(), 512, &params, cap, &mut super::RbcPartitionTelemetry::default()).unwrap();
+                for (a,b) in tasks.iter().zip(&again) { assert_eq!(a.points,b.points); assert_eq!(a.child_run.seed,b.child_run.seed); }
+            }
+        }
+    }
+
+    #[test]
+    fn sq4_balanced_admission_obeys_preflight_below_row_cap() {
+        let dim = 1024;
+        let mut params = PiPNNParams::default();
+        params.gpu_workspace_budget_bytes = 96 * 1024;
+        params.c_min = 4; params.c_max = 16; params.max_leaders = 8;
+        params.fanout_second = 2; params.leaf_knn = 2;
+        let ratio = super::d1plus_admission_ratio(&params);
+        let budget = params.effective_gpu_workspace_budget_bytes();
+        let max_rows = find_max_admissible_rows(dim, params.leaf_knn,
+            gpu_persistent_subtree_max_leaders_for_params(&params), params.fanout_second,
+            Some(budget),Some((budget as f64 * ratio) as usize),&params);
+        assert!(max_rows > 1);
+        let rows = max_rows + 9;
+        assert!(!d1_admission_preflight(rows,dim,&params,ratio).supported);
+        let task = super::GpuSubtreeD1ChildTask {
+            child_idx: 3, child_run: super::GpuSubtreeChildRun { extents:Vec::new(),len:rows,seed:99 },
+            points:(0..rows as u32).collect(),replay_wall:Duration::ZERO,split_depth:0,
+        };
+        let mut telemetry = super::RbcPartitionTelemetry::default();
+        let tasks = super::split_sq4_task_by_balanced_ids_for_admission(task, dim, &params, rows, &mut telemetry).unwrap();
+        assert!(tasks.len()>1);
+        assert_eq!(tasks.iter().map(|t|t.points.len()).sum::<usize>(),rows);
+        assert!(tasks.iter().all(|t|d1_admission_preflight(t.points.len(),dim,&params,ratio).supported));
+        assert_eq!(telemetry.gpu_subtree_d1plus_lazy_split_source,"balanced-ids");
     }
 
     #[test]
@@ -25659,6 +27508,95 @@ mod tests {
         assert!(super::gpu_subtree_sq_wmma_sidecar_preload_enabled(
             &params, &d0_plan, dim
         ));
+    }
+
+    #[test]
+    fn sq4_stream_gather_preserves_split_payloads_and_disconnects() {
+        let rows = 96; let dim = 4; let padded = 64;
+        let ids: Vec<u32> = (0..rows as u32).collect();
+        let raw: Vec<f32> = (0..rows * dim).map(|i| ((i * 71 % 193) as f32 - 96.0) / 97.0).collect();
+        let centers = vec![0.0, 0.0, 0.0, 0.0, 0.2, 0.1, -0.1, -0.2];
+        let rotation = super::FhtKacRotationPlan::new(dim, 42).unwrap();
+        let chunk = super::PrimaryChunk::encode(&raw, dim, padded, &centers,
+            (0..rows).map(|i| i % 2), &rotation).unwrap();
+        let primary = std::sync::Arc::new(super::PrimaryCodes::new(
+            vec![chunk], &ids, rows, rows, dim, padded, &centers, &rotation).unwrap());
+        let store = CountingPointStore::new(rows, dim);
+        let mut params = PiPNNParams::default();
+        params.oom_enable = true;
+        params.oom_memory_budget_bytes = 512 << 20;
+        params.gpu_workspace_budget_bytes = 512 << 20;
+        params.gpu_subtree_d0_capacity_enable = true;
+        params.gpu_subtree_d0_capacity_split_recursion_limit = 8;
+        params.gpu_subtree_sq_wmma_mode = PiPNNGpuSubtreeSqWmmaMode::Build;
+        params.gpu_subtree_sq4_plus = true;
+        params.gpu_subtree_sq4_primary_center = true;
+        params.gpu_subtree_sq_native_int4 = true;
+        params.gpu_subtree_sq_bits = 4;
+        params.max_leaders = 8;
+        params.leaf_knn = 2;
+        params.fanout_second = 2;
+        let context = super::GpuSubtreeRuntimeContext::default();
+        for cap in [20, rows] {
+            let dir = tempdir().unwrap();
+            let mut plan = d0_plan_with_single_child_and_capacity(&dir, &ids, cap, cap - 2);
+            plan.sq4_primary = Some(std::sync::Arc::clone(&primary));
+            let task = || super::GpuSubtreeD1ChildTask {
+                child_idx: 0, child_run: plan.child_runs[0].clone(), points: ids.clone(),
+                replay_wall: Duration::from_millis(7), split_depth: 0,
+            };
+            let whole = super::preload_gpu_subtree_d1plus_sq_wmma_sidecar_child_batch(
+                &store, &params, &plan, context, task()).unwrap();
+            assert_eq!(whole.tasks.len() > 1, cap < rows);
+            let mut streamed = Vec::new();
+            let mut telemetry = super::RbcPartitionTelemetry::default();
+            super::stream_gpu_subtree_d1plus_sq_wmma_sidecar_children(
+                &store, &params, &plan, context, task(), |batch| {
+                    assert_eq!(batch.tasks.len(), 1);
+                    telemetry.merge(batch.split_telemetry);
+                    streamed.extend(batch.tasks);
+                    Ok(())
+                }).unwrap();
+            assert_eq!(whole.tasks.len(), streamed.len());
+            assert_eq!(whole.split_telemetry.gpu_subtree_d1plus_admission_split_count,
+                telemetry.gpu_subtree_d1plus_admission_split_count);
+            assert_eq!(whole.split_telemetry.gpu_subtree_d1plus_admission_split_rows,
+                telemetry.gpu_subtree_d1plus_admission_split_rows);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            for (a, b) in whole.tasks.iter().zip(&streamed) {
+                let a = &a.gathered_task; let b = &b.gathered_task;
+                assert_eq!(a.task.points, b.task.points);
+                assert_eq!(a.task.child_run.seed, b.task.child_run.seed);
+                assert_eq!(a.task.child_run.len, b.task.child_run.len);
+                assert_eq!(a.task.split_depth, b.task.split_depth);
+                assert_eq!(a.task.replay_wall, b.task.replay_wall);
+                assert_eq!(a.global_ids, b.global_ids);
+                assert_eq!(a.gathered.codes, b.gathered.codes);
+                assert_eq!(bits(&a.gathered.scales), bits(&b.gathered.scales));
+                assert_eq!(bits(&a.gathered.norms), bits(&b.gathered.norms));
+                assert_eq!(a.gathered.rotated_center_ids, b.gathered.rotated_center_ids);
+                assert_eq!(bits(a.gathered.rotated_centers.as_ref().unwrap()),
+                    bits(b.gathered.rotated_centers.as_ref().unwrap()));
+            }
+            if cap < rows {
+                // A rendezvous channel must deliver a child and unblock on receiver
+                // cancellation, without retaining or publishing the remaining payloads.
+                let (tx, rx) = std::sync::mpsc::sync_channel(0);
+                std::thread::scope(|scope| {
+                    let producer = scope.spawn(|| {
+                        super::stream_gpu_subtree_d1plus_sq_wmma_sidecar_children(
+                            &store, &params, &plan, context, task(), |batch| {
+                                tx.send(batch).map_err(|_| AnnError::log_index_error("test receiver closed".into()))
+                            })
+                    });
+                    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap().tasks.len(), 1);
+                    drop(rx);
+                    assert!(producer.join().unwrap().is_err());
+                });
+            }
+        }
+        assert_eq!(store.point_read_count(), 0);
+        assert_eq!(store.batch_read_count(), 0);
     }
 
     #[test]
@@ -25771,6 +27709,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -25872,6 +27813,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -25973,6 +27917,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -26113,6 +28060,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -26204,6 +28154,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),
@@ -26299,6 +28252,9 @@ mod tests {
             child_runs,
             sq_shard_local_payloads: Vec::new(),
             sq_cluster_child_indices: Vec::new(),
+            sq4_plus_centers: Vec::new(),
+            sq4_primary: None,
+            sq4_partition_codes: None,
             child_stats,
             rbc_telemetry: super::RbcPartitionTelemetry::default(),
             d0_capacity: super::D0CapacityTelemetry::default(),

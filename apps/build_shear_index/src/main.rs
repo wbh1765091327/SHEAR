@@ -302,8 +302,23 @@ fn effective_gpu_subtree_d0_capacity_enabled(args: &Args) -> bool {
     args.partitioner == PiPNNPartitionerKind::GpuSubtree && args.oom_enable
 }
 
+fn effective_gpu_subtree_d0_capacity_ratios(args: &Args) -> (f64, f64, f64) {
+    // D0 planning targets 8%; upload admission has a separate 50% high-water limit.
+    let defaults = if args.gpu_subtree_sq4_plus { (0.50, 0.08, 0.08) } else { (0.60, 0.50, 0.15) };
+    (args.gpu_subtree_d0_capacity_high_ratio.unwrap_or(defaults.0),
+     args.gpu_subtree_d0_capacity_target_ratio.unwrap_or(defaults.1),
+     args.gpu_subtree_d0_capacity_low_ratio.unwrap_or(defaults.2))
+}
+
 fn validate_args(args: &Args) -> AnnResult<()> {
     let gpu_subtree_d0_capacity_enabled = effective_gpu_subtree_d0_capacity_enabled(args);
+    if (args.gpu_subtree_d0_partition_mode == PiPNNGpuSubtreeD0PartitionMode::BudgetKMeansTopK
+        || (args.gpu_subtree_sq4_plus && args.gpu_subtree_d0_partition_mode == PiPNNGpuSubtreeD0PartitionMode::RbcFanout))
+        && (!args.gpu_subtree_sq4_plus || !gpu_subtree_d0_capacity_enabled) {
+        return Err(AnnError::log_index_config_error("gpu_subtree_d0_partition_mode".into(),
+            "budget-kmeans-topk requires SQ4+ and D0 capacity planning".into()));
+    }
+
 
     if args.gpu_subtree_persistent_launch_policy == PiPNNGpuSubtreePolicy::Enforce {
         return Err(AnnError::log_index_config_error(
@@ -397,12 +412,40 @@ fn validate_args(args: &Args) -> AnnResult<()> {
             "raw-D1 diagnostic requires --gpu-subtree-sq-staging-mode gpu-d0".to_string(),
         ));
     }
+    if args.gpu_subtree_sq8_rotated_residual_d0 {
+        if args.gpu_subtree_sq_staging_mode != PiPNNGpuSubtreeSqStagingMode::GpuD0
+            || !(args.gpu_subtree_sq_staging_raw_d1_diagnostic
+                || args.gpu_subtree_sq8_rotated_residual_d1)
+            || args.gpu_subtree_d0_partition_mode != PiPNNGpuSubtreeD0PartitionMode::GpuKMeansCoarse
+        {
+            return Err(AnnError::log_index_config_error(
+                "gpu_subtree_sq8_rotated_residual_d0".to_string(),
+                "rotated residual SQ8 D0 requires gpu-d0 SQ staging, gpu-kmeans-coarse, and either raw D1+ or rotated residual SQ8 D1+".to_string(),
+            ));
+        }
+    }
+    if args.gpu_subtree_sq8_rotated_residual_d1
+        && (!args.gpu_subtree_sq8_rotated_residual_d0
+            || args.gpu_subtree_sq_wmma_mode != PiPNNGpuSubtreeSqWmmaMode::Build
+            || args.gpu_subtree_sq_staging_raw_d1_diagnostic)
+    {
+        return Err(AnnError::log_index_config_error(
+            "gpu_subtree_sq8_rotated_residual_d1".to_string(),
+            "rotated residual SQ8 D1+ requires rotated residual D0 and SQ-WMMA build, without raw-D1 diagnostic".to_string(),
+        ));
+    }
+    if args.gpu_subtree_sq8_rotated_residual_d1_int8 && !args.gpu_subtree_sq8_rotated_residual_d1 {
+        return Err(AnnError::log_index_config_error(
+            "gpu_subtree_sq8_rotated_residual_d1_int8".to_string(),
+            "direct INT8 D1+ requires --gpu-subtree-sq8-rotated-residual-d1".to_string(),
+        ));
+    }
     if args.gpu_subtree_sq_staging_mode.is_enabled() {
         let sq_direct_d1 = matches!(
             args.gpu_subtree_sq_staging_mode,
             PiPNNGpuSubtreeSqStagingMode::GpuD0ShardLocalD1
                 | PiPNNGpuSubtreeSqStagingMode::GpuD0ClusterBatchD1
-        );
+        ) || args.gpu_subtree_sq8_rotated_residual_d0;
         let turboquant_requested = args.gpu_subtree_turboquant_mode.is_enabled()
             || args.gpu_subtree_turboquant_sidecar_mode.is_enabled()
             || args.gpu_subtree_turboquant_sidecar_prefix.is_some();
@@ -496,6 +539,22 @@ fn validate_args(args: &Args) -> AnnResult<()> {
                 "SQ GPU-D0 staging requires upload shard rows > 0".to_string(),
             ));
         }
+    }
+    if args.gpu_subtree_sq4_plus
+        && (!args.gpu_subtree_sq_native_int4
+            || args.gpu_subtree_sq_wmma_mode != PiPNNGpuSubtreeSqWmmaMode::Build
+            || !matches!(args.gpu_subtree_d0_partition_mode,
+                PiPNNGpuSubtreeD0PartitionMode::TagoreKMeansTopK | PiPNNGpuSubtreeD0PartitionMode::BudgetKMeansTopK | PiPNNGpuSubtreeD0PartitionMode::RbcFanout)
+            || !args.data_type.eq_ignore_ascii_case("float")
+            || !args.dist_fn.eq_ignore_ascii_case("l2")
+            || !args.oom_enable
+            || args.root_stop_after_d00
+            || args.gpu_subtree_sq_wmma_sidecar_mode == PiPNNGpuSubtreeSqWmmaSidecarMode::CreateOnly)
+    {
+        return Err(AnnError::log_index_config_error(
+            "gpu_subtree_sq4_plus".to_string(),
+            "SQ4+ requires a float L2 OOM graph build with budget-kmeans-topk (default) or explicit fixed tagore-kmeans-topk D0 and native packed SQ4 WMMA build".to_string(),
+        ));
     }
     if args.gpu_subtree_sq_native_int4 && args.gpu_subtree_sq_bits != 4 {
         return Err(AnnError::log_index_config_error(
@@ -1338,7 +1397,7 @@ fn validate_args(args: &Args) -> AnnResult<()> {
                 args.gpu_subtree_sq_staging_mode,
                 PiPNNGpuSubtreeSqStagingMode::GpuD0ShardLocalD1
                     | PiPNNGpuSubtreeSqStagingMode::GpuD0ClusterBatchD1
-            );
+            ) || args.gpu_subtree_sq8_rotated_residual_d1 || args.gpu_subtree_sq4_plus;
             if !sq_direct_d1
                 && (!matches!(
                     args.gpu_subtree_sq_wmma_sidecar_mode,
@@ -1651,18 +1710,19 @@ fn validate_args(args: &Args) -> AnnResult<()> {
             ));
         }
     }
+    let (capacity_high, capacity_target, capacity_low) = effective_gpu_subtree_d0_capacity_ratios(args);
     for (name, ratio) in [
         (
             "gpu_subtree_d0_capacity_high_ratio",
-            args.gpu_subtree_d0_capacity_high_ratio,
+            capacity_high,
         ),
         (
             "gpu_subtree_d0_capacity_target_ratio",
-            args.gpu_subtree_d0_capacity_target_ratio,
+            capacity_target,
         ),
         (
             "gpu_subtree_d0_capacity_low_ratio",
-            args.gpu_subtree_d0_capacity_low_ratio,
+            capacity_low,
         ),
     ] {
         if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
@@ -1672,7 +1732,7 @@ fn validate_args(args: &Args) -> AnnResult<()> {
             ));
         }
     }
-    if args.gpu_subtree_d0_capacity_target_ratio > args.gpu_subtree_d0_capacity_high_ratio {
+    if capacity_target > capacity_high {
         return Err(AnnError::log_index_config_error(
             "gpu_subtree_d0_capacity_target_ratio".to_string(),
             "D0 capacity target ratio must be <= high ratio".to_string(),
@@ -2274,6 +2334,10 @@ fn apply_gpu_subtree_args(params: &mut PiPNNParams, args: &Args) {
     params.gpu_subtree_rabitq_d0_assign_mode = args.gpu_subtree_rabitq_d0_assign_mode;
     params.gpu_subtree_rabitq_d1_topk_mode = args.gpu_subtree_rabitq_d1_topk_mode;
     params.gpu_subtree_sq_staging_mode = args.gpu_subtree_sq_staging_mode;
+    params.gpu_subtree_sq8_rotated_residual_d0 = args.gpu_subtree_sq8_rotated_residual_d0;
+    params.gpu_subtree_sq8_rotated_residual_d1 = args.gpu_subtree_sq8_rotated_residual_d1;
+    params.gpu_subtree_sq8_rotated_residual_d1_int8 = args.gpu_subtree_sq8_rotated_residual_d1_int8;
+    params.gpu_subtree_sq8_rotated_residual_seed = args.gpu_subtree_sq8_rotated_residual_seed;
     params.gpu_subtree_sq_staging_upload_shard_rows =
         args.gpu_subtree_sq_staging_upload_shard_rows.max(1);
     params.gpu_subtree_sq_staging_raw_d1_diagnostic = args.gpu_subtree_sq_staging_raw_d1_diagnostic;
@@ -2282,10 +2346,24 @@ fn apply_gpu_subtree_args(params: &mut PiPNNParams, args: &Args) {
     params.gpu_subtree_rabitq_d0_leader_tile = args.gpu_subtree_rabitq_d0_leader_tile.max(1);
     params.gpu_subtree_rabitq_d0_partial_r = args.gpu_subtree_rabitq_d0_partial_r.max(1);
     params.gpu_subtree_sq_bits = args.gpu_subtree_sq_bits;
+    params.gpu_subtree_sq4_plus = args.gpu_subtree_sq4_plus;
+    params.gpu_subtree_sq4_primary_center = args
+        .gpu_subtree_sq4_primary_center
+        .unwrap_or(args.gpu_subtree_sq4_plus);
     params.gpu_subtree_sq_native_int4 = args.gpu_subtree_sq_native_int4;
     params.gpu_subtree_sq_wmma_mode = args.gpu_subtree_sq_wmma_mode;
-    params.gpu_subtree_sq_wmma_sidecar_prefix = args.gpu_subtree_sq_wmma_sidecar_prefix.clone();
-    params.gpu_subtree_sq_wmma_sidecar_mode = args.gpu_subtree_sq_wmma_sidecar_mode;
+    params.gpu_subtree_sq_wmma_sidecar_prefix = if args.gpu_subtree_sq4_plus {
+        None
+    } else if args.gpu_subtree_sq8_rotated_residual_d1 {
+        Some(PathBuf::from(&args.index_path_prefix).join("rotated_residual_sq8"))
+    } else {
+        args.gpu_subtree_sq_wmma_sidecar_prefix.clone()
+    };
+    params.gpu_subtree_sq_wmma_sidecar_mode = if args.gpu_subtree_sq4_plus {
+        PiPNNGpuSubtreeSqWmmaSidecarMode::Off
+    } else {
+        args.gpu_subtree_sq_wmma_sidecar_mode
+    };
     params.gpu_subtree_turboquant_mode = args.gpu_subtree_turboquant_mode;
     params.gpu_subtree_turboquant_bits = args.gpu_subtree_turboquant_bits;
     params.gpu_subtree_turboquant_seed = args.gpu_subtree_turboquant_seed;
@@ -2311,16 +2389,20 @@ fn apply_gpu_subtree_args(params: &mut PiPNNParams, args: &Args) {
     params.gpu_subtree_sq8_leaf_executor = args.gpu_subtree_sq8_leaf_executor;
     params.gpu_subtree_tessa_capture_dir = args.gpu_subtree_tessa_capture_dir.clone();
     params.gpu_subtree_sq8_leaf_mode = args.gpu_subtree_sq8_leaf_mode;
-    params.gpu_subtree_d0_partition_mode = args.gpu_subtree_d0_partition_mode;
+    params.gpu_subtree_d0_partition_mode = if args.gpu_subtree_sq4_plus
+        && args.gpu_subtree_d0_partition_mode == PiPNNGpuSubtreeD0PartitionMode::RbcFanout {
+        PiPNNGpuSubtreeD0PartitionMode::BudgetKMeansTopK
+    } else { args.gpu_subtree_d0_partition_mode };
     params.gpu_subtree_d1_root_partition_mode = args.gpu_subtree_d1_root_partition_mode;
     params.gpu_subtree_d0_tagore_partitions = args.gpu_subtree_d0_tagore_partitions;
     params.gpu_subtree_d0_tagore_k = args.gpu_subtree_d0_tagore_k;
     params.gpu_subtree_d0_tagore_sample_fraction = args.gpu_subtree_d0_tagore_sample_fraction;
     params.gpu_subtree_d0_capacity_enable = effective_gpu_subtree_d0_capacity_enabled(args);
     params.gpu_subtree_d1plus_lazy_split_mode = args.gpu_subtree_d1plus_lazy_split_mode;
-    params.gpu_subtree_d0_capacity_high_ratio = args.gpu_subtree_d0_capacity_high_ratio;
-    params.gpu_subtree_d0_capacity_target_ratio = args.gpu_subtree_d0_capacity_target_ratio;
-    params.gpu_subtree_d0_capacity_low_ratio = args.gpu_subtree_d0_capacity_low_ratio;
+    let (capacity_high, capacity_target, capacity_low) = effective_gpu_subtree_d0_capacity_ratios(args);
+    params.gpu_subtree_d0_capacity_high_ratio = capacity_high;
+    params.gpu_subtree_d0_capacity_target_ratio = capacity_target;
+    params.gpu_subtree_d0_capacity_low_ratio = capacity_low;
     params.gpu_subtree_d0_capacity_min_efficient_rows =
         args.gpu_subtree_d0_capacity_min_efficient_rows;
     params.gpu_subtree_d0_capacity_quality_min_root_leaders =
@@ -2694,6 +2776,14 @@ fn maybe_create_sq_wmma_sidecar(
     data_num: usize,
     data_dim: usize,
 ) -> AnnResult<bool> {
+    if args.gpu_subtree_sq4_plus {
+        if params.gpu_subtree_sq4_primary_center {
+            println!("PiPNN: SQ4+ encodes each point once against its nearest D0 center");
+        } else {
+            println!("PiPNN: SQ4+ uses per-partition rotated residual codes");
+        }
+        return Ok(false);
+    }
     if args.gpu_subtree_sq_staging_mode.is_enabled() {
         println!(
             "PiPNN: deferring SQ+WMMA sidecar creation to SQ GPU-D0 staging prefix={} bits={} upload_shard_rows={}",
@@ -2901,7 +2991,8 @@ struct SqWmmaSidecarCleanupGuard {
 
 impl SqWmmaSidecarCleanupGuard {
     fn for_rebuild(args: &Args) -> Option<Self> {
-        if args.gpu_subtree_sq_wmma_sidecar_mode == PiPNNGpuSubtreeSqWmmaSidecarMode::Rebuild {
+        if !args.gpu_subtree_sq4_plus
+            && args.gpu_subtree_sq_wmma_sidecar_mode == PiPNNGpuSubtreeSqWmmaSidecarMode::Rebuild {
             args.gpu_subtree_sq_wmma_sidecar_prefix
                 .clone()
                 .map(|prefix| Self { prefix })
@@ -3374,11 +3465,11 @@ struct Args {
     #[clap(long, default_value_t = PiPNNGpuSubtreeSq8LeafMode::Auto, hide = true)]
     gpu_subtree_sq8_leaf_mode: PiPNNGpuSubtreeSq8LeafMode,
 
-    /// Diagnostic GPU subtree D0 partition mode; canonical runs use rbc-fanout
+    /// D0 partition mode; SQ4+ defaults to budget-kmeans-topk, other modes to rbc-fanout
     #[clap(long, default_value_t = PiPNNGpuSubtreeD0PartitionMode::RbcFanout, hide = true)]
     gpu_subtree_d0_partition_mode: PiPNNGpuSubtreeD0PartitionMode,
 
-    /// Diagnostic Tagore-style D0 partition count
+    /// Explicit fixed Tagore-style diagnostic partition count (unused by budget-kmeans-topk)
     #[clap(long, default_value_t = 32, hide = true)]
     gpu_subtree_d0_tagore_partitions: usize,
 
@@ -3567,6 +3658,22 @@ struct Args {
     #[clap(long, default_value_t = PiPNNGpuSubtreeSqStagingMode::Off, hide = true)]
     gpu_subtree_sq_staging_mode: PiPNNGpuSubtreeSqStagingMode,
 
+    /// Experimental rotated residual SQ8 for D0; D1+ uses raw vectors
+    #[clap(long, hide = true)]
+    gpu_subtree_sq8_rotated_residual_d0: bool,
+
+    /// Use the shared rotated residual SQ8 sidecar for D1+
+    #[clap(long, hide = true)]
+    gpu_subtree_sq8_rotated_residual_d1: bool,
+
+    /// Compute D1+ distances directly from residual INT8 codes and center IDs on GPU
+    #[clap(long, hide = true)]
+    gpu_subtree_sq8_rotated_residual_d1_int8: bool,
+
+    /// FHT-Kac rotation seed for rotated residual SQ8 D0
+    #[clap(long, default_value_t = 42, hide = true)]
+    gpu_subtree_sq8_rotated_residual_seed: u64,
+
     /// Raw rows uploaded per SQ8 GPU-D0 staging shard
     #[clap(long, default_value_t = 524_288, hide = true)]
     gpu_subtree_sq_staging_upload_shard_rows: usize,
@@ -3594,6 +3701,14 @@ struct Args {
     /// Effective SQ code bits for SQ-int8 paths; storage remains i8
     #[clap(long, default_value_t = 8, hide = true)]
     gpu_subtree_sq_bits: usize,
+
+    /// Encode each D1+ child with a shared random rotation and its D0 k-means center
+    #[clap(long)]
+    gpu_subtree_sq4_plus: bool,
+    /// Encode each point once against its nearest D0 center (default for SQ4+); use =false for per-partition codes.
+    #[arg(long, requires = "gpu_subtree_sq4_plus", num_args = 0..=1,
+        require_equals = true, default_missing_value = "true")]
+    gpu_subtree_sq4_primary_center: Option<bool>,
 
     /// Experimental packed SQ4 + native INT4 WMMA path
     #[clap(long, hide = true)]
@@ -3668,17 +3783,17 @@ struct Args {
     )]
     gpu_subtree_d1plus_lazy_split_mode: PiPNNGpuSubtreeD1PlusLazySplitMode,
 
-    /// Experimental D0 child unique-row high-water ratio of resident GPU admission capacity
-    #[clap(long, default_value_t = 0.60, hide = true)]
-    gpu_subtree_d0_capacity_high_ratio: f64,
+    /// Subtree upload admission high-water ratio (SQ4+: 0.50; independent of D0 planning target)
+    #[clap(long, hide = true)]
+    gpu_subtree_d0_capacity_high_ratio: Option<f64>,
 
-    /// Experimental D0 child split-repair target ratio of resident GPU admission capacity
-    #[clap(long, default_value_t = 0.50, hide = true)]
-    gpu_subtree_d0_capacity_target_ratio: f64,
+    /// D0 leader-planning budget and lazy split target ratio (SQ4+: 0.08)
+    #[clap(long, hide = true)]
+    gpu_subtree_d0_capacity_target_ratio: Option<f64>,
 
     /// Experimental D0 small-child telemetry ratio of resident GPU admission capacity
-    #[clap(long, default_value_t = 0.15, hide = true)]
-    gpu_subtree_d0_capacity_low_ratio: f64,
+    #[clap(long, hide = true)]
+    gpu_subtree_d0_capacity_low_ratio: Option<f64>,
 
     /// Experimental minimum efficient rows for standalone GPU subtree telemetry
     #[clap(long, default_value_t = 32 * 1024, hide = true)]
@@ -3975,6 +4090,12 @@ fn main() -> AnnResult<()> {
         .map_err(|err| AnnError::log_index_config_error("pipnn_backend".to_string(), err))?;
 
     let (data_num, data_dim) = load_metadata_from_file(&args.data_path).unwrap();
+    if args.gpu_subtree_sq4_plus && !data_dim.is_power_of_two() {
+        return Err(AnnError::log_index_config_error(
+            "gpu_subtree_sq4_plus".to_string(),
+            "SQ4+ FHT rotation requires a power-of-two dimension".to_string(),
+        ));
+    }
 
     let num_threads = if args.num_threads == 0 {
         std::thread::available_parallelism()
@@ -5765,6 +5886,27 @@ VmRSS:\t  123456 kB\n";
     }
 
     #[test]
+    fn sq4_budget_default_routes_through_capacity_planner() {
+        let args=Args::parse_from(["build_shear_index","--data-type","float","--dist-fn","l2",
+            "--data-path","/tmp/data.bin","--index-path-prefix","/tmp/index","--partitioner","gpu-subtree",
+            "--oom-enable","--pipnn-backend","cuda","--gpu-subtree-sq-wmma-mode","build",
+            "--gpu-subtree-sq-bits","4","--gpu-subtree-sq-native-int4","--gpu-subtree-sq4-plus"]);
+        validate_args(&args).unwrap();
+        let mut p=PiPNNParams::default();apply_gpu_subtree_args(&mut p,&args);
+        assert_eq!(p.gpu_subtree_d0_partition_mode,PiPNNGpuSubtreeD0PartitionMode::BudgetKMeansTopK);
+        assert!(p.gpu_subtree_d0_capacity_enable);assert!(p.gpu_subtree_d0_capacity_root_leader_cap>64);
+        assert_eq!(super::effective_gpu_subtree_d0_capacity_ratios(&args), (0.50,0.08,0.08));
+        assert_eq!((p.gpu_subtree_d0_capacity_high_ratio,p.gpu_subtree_d0_capacity_target_ratio,p.gpu_subtree_d0_capacity_low_ratio),(0.50,0.08,0.08));
+        let mut explicit=args;
+        explicit.gpu_subtree_d0_capacity_high_ratio=Some(0.60);
+        explicit.gpu_subtree_d0_capacity_target_ratio=Some(0.50);
+        explicit.gpu_subtree_d0_capacity_low_ratio=Some(0.15);
+        validate_args(&explicit).unwrap();
+        apply_gpu_subtree_args(&mut p,&explicit);
+        assert_eq!((p.gpu_subtree_d0_capacity_high_ratio,p.gpu_subtree_d0_capacity_target_ratio,p.gpu_subtree_d0_capacity_low_ratio),(0.60,0.50,0.15));
+    }
+
+    #[test]
     fn validate_args_accepts_gpu_kmeans_coarse_with_sq_gpu_d0_staging() {
         let args = Args::parse_from([
             "build_shear_index",
@@ -6192,9 +6334,9 @@ VmRSS:\t  123456 kB\n";
             "off",
         ]);
         assert!(args.gpu_subtree_d0_capacity_enable);
-        assert_eq!(args.gpu_subtree_d0_capacity_high_ratio, 0.82);
-        assert_eq!(args.gpu_subtree_d0_capacity_target_ratio, 0.70);
-        assert_eq!(args.gpu_subtree_d0_capacity_low_ratio, 0.15);
+        assert_eq!(args.gpu_subtree_d0_capacity_high_ratio, Some(0.82));
+        assert_eq!(args.gpu_subtree_d0_capacity_target_ratio, Some(0.70));
+        assert_eq!(args.gpu_subtree_d0_capacity_low_ratio, Some(0.15));
         assert_eq!(args.gpu_subtree_d0_capacity_min_efficient_rows, 65_536);
         assert_eq!(args.gpu_subtree_d0_capacity_quality_min_root_leaders, 128);
         assert_eq!(args.gpu_subtree_d0_capacity_root_leader_cap, 4096);
@@ -6437,9 +6579,7 @@ VmRSS:\t  123456 kB\n";
         assert!(!args.gpu_subtree_d0_capacity_enable);
         assert!(!args.gpu_subtree_d0_capacity_disable);
         assert!(effective_gpu_subtree_d0_capacity_enabled(&args));
-        assert_eq!(args.gpu_subtree_d0_capacity_high_ratio, 0.60);
-        assert_eq!(args.gpu_subtree_d0_capacity_target_ratio, 0.50);
-        assert_eq!(args.gpu_subtree_d0_capacity_low_ratio, 0.15);
+        assert_eq!(super::effective_gpu_subtree_d0_capacity_ratios(&args), (0.60, 0.50, 0.15));
 
         let mut params = PiPNNParams::default();
         super::apply_gpu_subtree_args(&mut params, &args);

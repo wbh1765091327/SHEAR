@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -euo pipefail
 
 usage() {
@@ -66,30 +67,30 @@ if [[ $dataset == smoke ]]; then
 fi
 
 case "$run_root" in
-  /data_staging/wbh/*) ;;
-  *) echo "formal RUN_ROOT must be a new descendant of /data_staging/wbh" >&2; exit 1 ;;
+  ${SHEAR_OUTPUT_ROOT}/*) ;;
+  *) echo "formal RUN_ROOT must be a new descendant of ${SHEAR_OUTPUT_ROOT}" >&2; exit 1 ;;
 esac
 
 case "$dataset" in
   wiki10m)
-    base=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
-    query=/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
-    gt=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
+    base=${SHEAR_DATA_ROOT}/wiki10m/wiki_10m_1024.fbin
+    query=${SHEAR_DATA_ROOT}/wiki-1024-35M/query.fbin
+    gt=${SHEAR_DATA_ROOT}/wiki10m/wiki_10m_gt100.bin
     rows=10000000
     dim=1024
-    rabitq1_sidecar=/data_staging/wbh/unified_graph_rabitq1/sidecars/wiki10m.rabitq1
+    rabitq1_sidecar=${SHEAR_DATA_ROOT}/sidecars/wiki10m.rabitq1
     ;;
   laion100m)
-    base=/data_nvme_kioxia/tyj/data/laion-512-100M/base.fbin
-    query=/data_nvme_kioxia/tyj/data/laion-512-100M/query.fbin
-    gt=/data_nvme_kioxia/tyj/data/laion-512-100M/gt100.bin
+    base=${SHEAR_DATA_ROOT}/laion-512-100M/base.fbin
+    query=${SHEAR_DATA_ROOT}/laion-512-100M/query.fbin
+    gt=${SHEAR_DATA_ROOT}/laion-512-100M/gt100.bin
     rows=100000000
     dim=512
-    rabitq1_sidecar=/data_staging/wbh/unified_graph_rabitq1/sidecars/laion100m.rabitq1
+    rabitq1_sidecar=${SHEAR_DATA_ROOT}/sidecars/laion100m.rabitq1
     ;;
 esac
 
-lock_path=/data_staging/wbh/.shear_experiment.lock
+lock_path=${SHEAR_OUTPUT_ROOT}/.shear_experiment.lock
 exec 9>"$lock_path"
 flock -n 9 || { echo "SHEAR experiment lock is held" >&2; exit 1; }
 command -v nvidia-smi >/dev/null

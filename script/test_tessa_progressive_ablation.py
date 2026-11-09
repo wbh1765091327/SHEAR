@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -105,7 +106,7 @@ class ContractTests(unittest.TestCase):
                 self.assertIn(token, section)
 
     def test_print_2x2_contract_has_only_missing_cells(self):
-        parent = "/data_staging/wbh/tessa_ablation/wiki10m/20260721_011618"
+        parent = str(Path(os.environ.get("SHEAR_OUTPUT_ROOT", REPO / "runs")) / "tessa_ablation/wiki10m/20260721_011618")
         result = subprocess.run(
             ["bash", str(RUNNER), "print-2x2-contract", parent],
             cwd=REPO,

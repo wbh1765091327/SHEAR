@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -6,10 +7,10 @@ MODE=${1:-help}
 SWEEP_VARIANT=${SWEEP_VARIANT:-base}
 case "$SWEEP_VARIANT" in
   base)
-    OUTPUT_BASE=${OUTPUT_BASE:-/data_staging/wbh/hashprune_softtier_row_cap/wiki10m}
+    OUTPUT_BASE=${OUTPUT_BASE:-${SHEAR_OUTPUT_ROOT}/hashprune_softtier_row_cap/wiki10m}
     ;;
   extension)
-    OUTPUT_BASE=${OUTPUT_BASE:-/data_staging/wbh/hashprune_softtier_row_cap_extension/wiki10m}
+    OUTPUT_BASE=${OUTPUT_BASE:-${SHEAR_OUTPUT_ROOT}/hashprune_softtier_row_cap_extension/wiki10m}
     ;;
   *)
     echo "error: unknown SWEEP_VARIANT: $SWEEP_VARIANT" >&2
@@ -18,11 +19,11 @@ case "$SWEEP_VARIANT" in
 esac
 RUN_ID=${RUN_ID:-}
 BATCH_ROOT=${BATCH_ROOT:-}
-BASE=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_1024.fbin
-QUERY=/data_nvme_kioxia/tyj/data/wiki-1024-35M/query.fbin
-GT=/data_staging/wbh/wiki10m_gpu_subtree_measurement/data/wiki_10m_gt100.bin
-RABITQ1_SIDECAR=/data_staging/wbh/unified_graph_rabitq1/sidecars/wiki10m.rabitq1
-RABITQ1_MANIFEST=/data_staging/wbh/unified_graph_rabitq1/sidecars/wiki10m.rabitq1.json
+BASE=${SHEAR_DATA_ROOT}/wiki10m/wiki_10m_1024.fbin
+QUERY=${SHEAR_DATA_ROOT}/wiki-1024-35M/query.fbin
+GT=${SHEAR_DATA_ROOT}/wiki10m/wiki_10m_gt100.bin
+RABITQ1_SIDECAR=${SHEAR_DATA_ROOT}/sidecars/wiki10m.rabitq1
+RABITQ1_MANIFEST=${SHEAR_DATA_ROOT}/sidecars/wiki10m.rabitq1.json
 ROWS=10000000
 DIM=1024
 MEASURED_L=(10 16 25 32 50 100 200)
@@ -226,7 +227,7 @@ acquire_locks() {
   mkdir -p "$OUTPUT_BASE"
   exec 8>"$OUTPUT_BASE/.batch.lock"
   flock -n 8 || die "Wiki10M SoftTier row-cap sweep lock is held"
-  exec 9>/data_staging/wbh/.shear_experiment.lock
+  exec 9>${SHEAR_OUTPUT_ROOT}/.shear_experiment.lock
   flock -n 9 || die "global SHEAR experiment lock is held"
 }
 

@@ -2714,6 +2714,114 @@ pub(crate) fn validate_rabitq_plus_bits(total_bits: usize) -> AnnResult<()> {
     validate_total_bits(total_bits)
 }
 
+/// Prepared shared transform for bulk rotation. The sign sequence and FP32
+/// operation order match `rotate_rabitq_plus_fht_kac_row` exactly.
+pub(crate) struct FhtKacRotationPlan {
+    dim: usize,
+    norm_scale: f32,
+    sign_masks: Vec<u32>,
+}
+
+impl FhtKacRotationPlan {
+    #[cfg(feature = "pipnn_cuda")]
+    pub(crate) fn gpu_parameters(&self) -> (&[u32], f32) {
+        (&self.sign_masks, self.norm_scale)
+    }
+
+    pub(crate) fn new(dim: usize, seed: u64) -> AnnResult<Self> {
+        if !dim.is_power_of_two() {
+            return Err(AnnError::log_index_error(
+                "FHT-Kac rotation requires a power-of-two dimension".to_string(),
+            ));
+        }
+        let sign_masks = (0..4)
+            .flat_map(|round| (0..dim).map(move |axis| rabitq_plus_sign(seed, round, axis)))
+            .map(|positive| if positive { 0 } else { 1_u32 << 31 })
+            .collect();
+        Ok(Self {
+            dim,
+            norm_scale: 1.0 / (dim as f32).sqrt(),
+            sign_masks,
+        })
+    }
+
+    pub(crate) fn rotate_row(&self, input: &[f32], output: &mut [f32]) -> AnnResult<()> {
+        if input.len() != self.dim || output.len() != self.dim || input.iter().any(|v| !v.is_finite()) {
+            return Err(AnnError::log_index_error("Invalid input for FHT-Kac rotation".to_string()));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.dim >= 8 && std::is_x86_feature_detected!("avx") {
+            // The plan and the shape check above guarantee complete eight-float lanes.
+            unsafe { rotate_fht_kac_avx(input, output, &self.sign_masks, self.norm_scale) };
+            return Ok(());
+        }
+        output.copy_from_slice(input);
+        for signs in self.sign_masks.chunks_exact(self.dim) {
+            for (value, &mask) in output.iter_mut().zip(signs) {
+                if mask != 0 {
+                    *value = -*value;
+                }
+            }
+            fwht_in_place(output);
+            for value in output.iter_mut() {
+                *value *= self.norm_scale;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Each AVX register holds eight consecutive axes. The rounds and FP32
+/// operations follow the scalar transform in the same order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn rotate_fht_kac_avx(input: &[f32], output: &mut [f32], signs: &[u32], scale: f32) {
+    use std::arch::x86_64::*;
+    let dim = input.len();
+    debug_assert!(dim >= 8 && dim.is_power_of_two() && output.len() == dim);
+    let dst = output.as_mut_ptr();
+    let scale = _mm256_set1_ps(scale);
+    // All loads/stores below are unaligned. Each slice is exactly dim long,
+    // and each butterfly span divides the power-of-two dimension.
+    unsafe {
+        for (round, masks) in signs.chunks_exact(dim).enumerate() {
+            let src = if round == 0 { input.as_ptr() } else { dst.cast_const() };
+            // Widths 1, 2 and 4 exchange partners within a register. Upper
+            // partners receive left - right, lower partners receive left + right.
+            for axis in (0..dim).step_by(8) {
+                let values = _mm256_loadu_ps(src.add(axis));
+                let mask = _mm256_loadu_si256(masks.as_ptr().add(axis).cast());
+                let mut v = _mm256_xor_ps(values, _mm256_castsi256_ps(mask));
+                let p = _mm256_permute_ps::<0xb1>(v);
+                v = _mm256_blend_ps::<0xaa>(_mm256_add_ps(v, p), _mm256_sub_ps(p, v));
+                let p = _mm256_permute_ps::<0x4e>(v);
+                v = _mm256_blend_ps::<0xcc>(_mm256_add_ps(v, p), _mm256_sub_ps(p, v));
+                let p = _mm256_permute2f128_ps::<0x01>(v, v);
+                v = _mm256_blend_ps::<0xf0>(_mm256_add_ps(v, p), _mm256_sub_ps(p, v));
+                _mm256_storeu_ps(dst.add(axis), v);
+            }
+            let mut width = 8;
+            while width < dim {
+                for base in (0..dim).step_by(2 * width) {
+                    for offset in (0..width).step_by(8) {
+                        let left = dst.add(base + offset);
+                        let right = left.add(width);
+                        let x = _mm256_loadu_ps(left);
+                        let y = _mm256_loadu_ps(right);
+                        _mm256_storeu_ps(left, _mm256_add_ps(x, y));
+                        _mm256_storeu_ps(right, _mm256_sub_ps(x, y));
+                    }
+                }
+                width *= 2;
+            }
+            for axis in (0..dim).step_by(8) {
+                let p = dst.add(axis);
+                _mm256_storeu_ps(p, _mm256_mul_ps(_mm256_loadu_ps(p), scale));
+            }
+        }
+    }
+}
+
 pub(crate) fn rotate_rabitq_plus_fht_kac_row(
     input: &[f32],
     output: &mut [f32],

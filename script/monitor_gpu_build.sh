@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -euo pipefail
 
 usage() {
@@ -8,7 +9,7 @@ Usage:
 
 Options:
   --out-dir DIR       Directory for monitor logs.
-                      Default: /data_staging/wbh/shear_gpu_monitor/<timestamp>_<tag>
+                      Default: ${SHEAR_OUTPUT_ROOT}/shear_gpu_monitor/<timestamp>_<tag>
   --interval SECONDS  Sampling interval for nvidia-smi. Default: 1
   --gpu IDS           Optional GPU id list for nvidia-smi -i, for example 0 or 0,1.
                       Default: all visible GPUs.
@@ -99,7 +100,7 @@ fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
 if [[ -z "$out_dir" ]]; then
-    monitor_root="${GPU_BUILD_MONITOR_ROOT:-/data_staging/wbh/shear_gpu_monitor}"
+    monitor_root="${GPU_BUILD_MONITOR_ROOT:-${SHEAR_OUTPUT_ROOT}/shear_gpu_monitor}"
     out_dir="${monitor_root}/${timestamp}_${safe_tag}"
 fi
 

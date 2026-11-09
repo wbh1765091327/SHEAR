@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MODE=${1:-help}
-OUTPUT_BASE=${OUTPUT_BASE:-/data_staging/wbh/hashprune_softtier_cap6/laion35m_f421}
+OUTPUT_BASE=${OUTPUT_BASE:-${SHEAR_OUTPUT_ROOT}/hashprune_softtier_cap6/laion35m_f421}
 RUN_ID=${RUN_ID:-}
 BATCH_ROOT=${BATCH_ROOT:-}
-BASE=/data_staging/wbh/laion-512-35M/base.fbin
-QUERY=/data_nvme_kioxia/tyj/data/laion-512-100M/query.fbin
-GT=/data_staging/wbh/laion-512-35M/gt100.bin
-RABITQ1_SIDECAR=/data_staging/wbh/unified_graph_rabitq1/sidecars/laion35m.rabitq1
-RABITQ1_MANIFEST=/data_staging/wbh/unified_graph_rabitq1/sidecars/laion35m.rabitq1.json
+BASE=${SHEAR_DATA_ROOT}/laion-512-35M/base.fbin
+QUERY=${SHEAR_DATA_ROOT}/laion-512-100M/query.fbin
+GT=${SHEAR_DATA_ROOT}/laion-512-35M/gt100.bin
+RABITQ1_SIDECAR=${SHEAR_DATA_ROOT}/sidecars/laion35m.rabitq1
+RABITQ1_MANIFEST=${SHEAR_DATA_ROOT}/sidecars/laion35m.rabitq1.json
 ROWS=35000000
 DIM=512
 MEASURED_L=(10 16 25 32 50 100 200)
@@ -512,7 +513,7 @@ acquire_locks() {
   mkdir -p "$OUTPUT_BASE"
   exec 8>"$OUTPUT_BASE/.batch.lock"
   flock -n 8 || die "LAION35M HashPrune cap-3 batch lock is held"
-  exec 9>/data_staging/wbh/.shear_experiment.lock
+  exec 9>${SHEAR_OUTPUT_ROOT}/.shear_experiment.lock
   flock -n 9 || die "global SHEAR experiment lock is held"
 }
 

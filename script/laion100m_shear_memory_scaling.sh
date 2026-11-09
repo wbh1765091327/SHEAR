@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/local_env.sh"
 set -Eeuo pipefail
 shopt -s inherit_errexit
 export LC_ALL=C
@@ -17,11 +18,11 @@ declare -A CAP_BYTES=(
 readonly CAP_ORDER CAP_BYTES
 
 SHEAR_ROOT="${SHEAR_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}"
-DATA_ROOT="${DATA_ROOT:-/data_nvme_kioxia/tyj/data}"
-OUTPUT_BASE="${OUTPUT_BASE:-/data_staging/wbh/laion100m_shear_memory_scaling/runs}"
-BASE="${BASE:-/data_nvme_kioxia/tyj/data/laion-512-100M/base.fbin}"
+DATA_ROOT="${DATA_ROOT:-${SHEAR_DATA_ROOT}}"
+OUTPUT_BASE="${OUTPUT_BASE:-${SHEAR_OUTPUT_ROOT}/laion100m_shear_memory_scaling/runs}"
+BASE="${BASE:-${SHEAR_DATA_ROOT}/laion-512-100M/base.fbin}"
 BATCH_ROOT="${BATCH_ROOT:-}"
-LOCK_PATH="${LOCK_PATH:-/data_staging/wbh/.laion100m_shear_memory_scaling.lock}"
+LOCK_PATH="${LOCK_PATH:-${SHEAR_OUTPUT_ROOT}/.laion100m_shear_memory_scaling.lock}"
 ACTIVE_MONITOR_PIDS=()
 EXPERIMENT_LOCK_FD=""
 SELF_TEST_MODE=0
@@ -177,7 +178,7 @@ run_preflight() {
   verify_binary_cli_contract
 
   local free_bytes active_gpu
-  free_bytes="$(df -B1 --output=avail /data_staging/wbh | tail -n1 | tr -d ' ')"
+  free_bytes="$(df -B1 --output=avail ${SHEAR_OUTPUT_ROOT} | tail -n1 | tr -d ' ')"
   ((free_bytes >= 350000000000)) \
     || die "at least 350 GB free staging space is required"
   active_gpu="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits \
@@ -534,7 +535,7 @@ record_environment() {
     nvidia-smi
     lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS
     mount
-    df -B1 /data_staging/wbh /data_nvme_kioxia
+    df -B1 ${SHEAR_OUTPUT_ROOT} ${SHEAR_DATA_ROOT}
   } >"$cap_root/environment.txt" 2>&1
 }
 
@@ -1194,8 +1195,8 @@ run_self_test() {
   [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] || die "cgroup v2 is required"
   sudo -n true || die "passwordless sudo is required"
   local root success_root oom_root success_script oom_script
-  root="$(mktemp -d /data_staging/wbh/laion100m_shear_memory_scaling-selftest.XXXXXX)"
-  [[ "$root" == /data_staging/wbh/laion100m_shear_memory_scaling-selftest.* ]] \
+  root="$(mktemp -d ${SHEAR_OUTPUT_ROOT}/laion100m_shear_memory_scaling-selftest.XXXXXX)"
+  [[ "$root" == ${SHEAR_OUTPUT_ROOT}/laion100m_shear_memory_scaling-selftest.* ]] \
     || die "unexpected self-test root: $root"
   success_root="$root/success"
   oom_root="$root/oom"
